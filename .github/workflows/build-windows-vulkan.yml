@@ -1,0 +1,98 @@
+name: Build s2.cpp - Windows + Vulkan
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Windows Server 2025 - MSVC - Vulkan
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.1.1
+        with:
+          version: latest
+          cache: true
+
+      - name: Pre-posicionar shaders precompilados
+        shell: pwsh
+        run: |
+          $buildVkDir = "build\ggml\src\ggml-vulkan"
+          New-Item -ItemType Directory -Force -Path $buildVkDir | Out-Null
+
+          Copy-Item "ggml\src\ggml-vulkan\ggml-vulkan-shaders.hpp" "$buildVkDir\ggml-vulkan-shaders.hpp"
+
+          $spvDst = "$buildVkDir\vulkan-shaders.spv"
+          New-Item -ItemType Directory -Force -Path $spvDst | Out-Null
+          Copy-Item "ggml\src\ggml-vulkan\vulkan-shaders.spv\*" $spvDst -Recurse
+
+          Write-Host "HPP presente: $(Test-Path $buildVkDir\ggml-vulkan-shaders.hpp)"
+          Write-Host "SPV count: $((Get-ChildItem $spvDst -Filter *.spv).Count)"
+
+      - name: Reemplazar CMakeLists.txt
+        shell: pwsh
+        run: Copy-Item CMakeLists.windows.cmake CMakeLists.txt -Force
+
+      - name: Cache dependencias FetchContent
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.windows.cmake') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      - name: CMake Configure
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DS2_VULKAN=ON `
+            -DGGML_VULKAN=ON `
+            -DS2_CUDA=OFF `
+            -DS2_METAL=OFF
+
+      - name: CMake Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Verificar ejecutable
+        shell: pwsh
+        run: |
+          $exe = "build\Release\s2.exe"
+          if (-Not (Test-Path $exe)) {
+            Write-Error "ERROR: s2.exe no fue generado."
+            exit 1
+          }
+          $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "OK: s2.exe generado ($sizeMB MB)"
+          & $exe --help
+
+      - name: Empaquetar release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item build\Release\s2.exe release\
+          Get-ChildItem build\Release\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination release\
+          if (Test-Path tokenizer.json) { Copy-Item tokenizer.json release\ }
+          Get-ChildItem release\ | Format-Table Name, Length -AutoSize
+
+      - name: Subir artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2-windows-vulkan
+          path: release\
+          retention-days: 30
+
+      - name: Crear GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release\s2.exe
+          generate_release_notes: true
