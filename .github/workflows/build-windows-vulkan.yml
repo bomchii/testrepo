@@ -66,8 +66,8 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/_deps
-          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: deps-${{ runner.os }}-
+          key: deps-${{ runner.os }}-v4-${{ hashFiles('patch-cmake.ps1') }}
+          restore-keys: deps-${{ runner.os }}-v4-
 
       - name: CMake Configure
         shell: pwsh
