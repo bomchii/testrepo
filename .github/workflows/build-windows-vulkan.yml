@@ -10,14 +10,14 @@ on:
 jobs:
   build:
     name: Windows Server 2025 - MSVC - Vulkan
-    runs-on: windows-latest
+    runs-on: windows-2025
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Instalar Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.1.1
+        uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: latest
           cache: true
