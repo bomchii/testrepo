@@ -84,18 +84,20 @@ set(ASIO_INCLUDE_DIR "${asio_SOURCE_DIR}/asio/include" CACHE PATH "" FORCE)
 # Target de interfaz para propagar Asio a s2
 add_library(asio_iface INTERFACE)
 target_include_directories(asio_iface INTERFACE "${asio_SOURCE_DIR}/asio/include")
-target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE)
+target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE ASIO_NO_SSL)
 
 # ---------------------------------------------------------------------------
 # Crow (servidor HTTP, header-only)
 # ---------------------------------------------------------------------------
 
+set(CROW_ENABLE_SSL OFF CACHE BOOL "" FORCE)
 find_package(Crow QUIET)
 if(NOT Crow_FOUND)
     FetchContent_Declare(crow
         GIT_REPOSITORY https://github.com/CrowCpp/Crow.git
         GIT_TAG        v1.2.0
         GIT_SHALLOW    TRUE)
+    set(CROW_ENABLE_SSL OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(crow)
 endif()
 set(CROW_INCLUDE_DIRS "${crow_SOURCE_DIR}/include")
@@ -153,7 +155,7 @@ endif()
 # Asio standalone para Crow en Windows
 if(TARGET asio_iface)
     target_link_libraries(s2 PRIVATE asio_iface)
-    target_compile_definitions(s2 PRIVATE ASIO_STANDALONE CROW_ENABLE_SSL=0)
+    target_compile_definitions(s2 PRIVATE ASIO_STANDALONE ASIO_NO_SSL CROW_ENABLE_SSL=0)
 endif()
 
 # Platform-specific
