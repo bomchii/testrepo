@@ -53,17 +53,10 @@ jobs:
           Write-Host "Include : $inc"
           Write-Host "Library : $lib"
 
-      - name: Pre-posicionar shaders precompilados
-        shell: pwsh
-        run: |
-          $buildVkDir = "build\ggml\src\ggml-vulkan"
-          New-Item -ItemType Directory -Force -Path $buildVkDir | Out-Null
-          Copy-Item "ggml\src\ggml-vulkan\ggml-vulkan-shaders.hpp" "$buildVkDir\ggml-vulkan-shaders.hpp"
-          $spvDst = "$buildVkDir\vulkan-shaders.spv"
-          New-Item -ItemType Directory -Force -Path $spvDst | Out-Null
-          Copy-Item "ggml\src\ggml-vulkan\vulkan-shaders.spv\*" $spvDst -Recurse
-          Write-Host "HPP: $(Test-Path $buildVkDir\ggml-vulkan-shaders.hpp)"
-          Write-Host "SPV: $((Get-ChildItem $spvDst -Filter *.spv).Count) archivos"
+      # Los shaders se generan desde cero durante el build.
+      # No usamos los precompilados del ZIP porque fueron generados sin
+      # soporte coopmat, y el Vulkan SDK actual los detecta como disponibles,
+      # causando una discrepancia entre el .hpp y el .cpp.
 
       - name: Parchear CMakeLists.txt para Windows
         shell: pwsh
@@ -86,7 +79,10 @@ jobs:
             -DS2_CUDA=OFF `
             -DS2_METAL=OFF `
             -DVulkan_INCLUDE_DIR="$env:Vulkan_INCLUDE_DIR" `
-            -DVulkan_LIBRARY="$env:Vulkan_LIBRARY"
+            -DVulkan_LIBRARY="$env:Vulkan_LIBRARY" `
+            -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=OFF `
+            -DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT=OFF `
+            -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=OFF
 
       - name: CMake Build
         shell: pwsh
