@@ -27,25 +27,22 @@ jobs:
         run: |
           $buildVkDir = "build\ggml\src\ggml-vulkan"
           New-Item -ItemType Directory -Force -Path $buildVkDir | Out-Null
-
           Copy-Item "ggml\src\ggml-vulkan\ggml-vulkan-shaders.hpp" "$buildVkDir\ggml-vulkan-shaders.hpp"
-
           $spvDst = "$buildVkDir\vulkan-shaders.spv"
           New-Item -ItemType Directory -Force -Path $spvDst | Out-Null
           Copy-Item "ggml\src\ggml-vulkan\vulkan-shaders.spv\*" $spvDst -Recurse
+          Write-Host "HPP: $(Test-Path $buildVkDir\ggml-vulkan-shaders.hpp)"
+          Write-Host "SPV: $((Get-ChildItem $spvDst -Filter *.spv).Count) archivos"
 
-          Write-Host "HPP presente: $(Test-Path $buildVkDir\ggml-vulkan-shaders.hpp)"
-          Write-Host "SPV count: $((Get-ChildItem $spvDst -Filter *.spv).Count)"
-
-      - name: Reemplazar CMakeLists.txt
+      - name: Parchear CMakeLists.txt para Windows
         shell: pwsh
-        run: Copy-Item CMakeLists.windows.cmake CMakeLists.txt -Force
+        run: pwsh -File patch-cmake.ps1
 
       - name: Cache dependencias FetchContent
         uses: actions/cache@v4
         with:
           path: build/_deps
-          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.windows.cmake') }}
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
           restore-keys: deps-${{ runner.os }}-
 
       - name: CMake Configure
@@ -67,11 +64,11 @@ jobs:
         run: |
           $exe = "build\Release\s2.exe"
           if (-Not (Test-Path $exe)) {
-            Write-Error "ERROR: s2.exe no fue generado."
+            Write-Error "s2.exe no fue generado."
             exit 1
           }
           $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
-          Write-Host "OK: s2.exe generado ($sizeMB MB)"
+          Write-Host "OK: s2.exe ($sizeMB MB)"
           & $exe --help
 
       - name: Empaquetar release
