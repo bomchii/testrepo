@@ -19,8 +19,39 @@ jobs:
       - name: Instalar Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
-          version: latest
+          version: 1.4.309.0
           cache: true
+
+      - name: Verificar y exportar rutas del Vulkan SDK
+        shell: pwsh
+        run: |
+          # El action escribe VULKAN_SDK al entorno, pero CMake a veces
+          # no lo recoge. Lo exportamos explicitamente con las rutas exactas.
+          $sdk = $env:VULKAN_SDK
+          if (-Not $sdk) {
+            # Fallback: buscar en la ruta tipica de instalacion de LunarG
+            $sdk = Get-ChildItem "C:\VulkanSDK" -Directory |
+                   Sort-Object Name -Descending |
+                   Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-Not $sdk) { Write-Error "VULKAN_SDK no encontrado"; exit 1 }
+
+          Write-Host "VULKAN_SDK = $sdk"
+
+          $inc  = "$sdk\Include"
+          $lib  = "$sdk\Lib\vulkan-1.lib"
+
+          if (-Not (Test-Path $inc))  { Write-Error "Include dir no existe: $inc";  exit 1 }
+          if (-Not (Test-Path $lib))  { Write-Error "vulkan-1.lib no existe: $lib"; exit 1 }
+
+          # Persistir para los steps siguientes
+          "VULKAN_SDK=$sdk"             >> $env:GITHUB_ENV
+          "Vulkan_INCLUDE_DIR=$inc"     >> $env:GITHUB_ENV
+          "Vulkan_LIBRARY=$lib"         >> $env:GITHUB_ENV
+          "$sdk\Bin"                    >> $env:GITHUB_PATH
+
+          Write-Host "Include : $inc"
+          Write-Host "Library : $lib"
 
       - name: Pre-posicionar shaders precompilados
         shell: pwsh
@@ -35,6 +66,66 @@ jobs:
           Write-Host "SPV: $((Get-ChildItem $spvDst -Filter *.spv).Count) archivos"
 
       - name: Parchear CMakeLists.txt para Windows
+        shell: pwsh
+        run: pwsh -File patch-cmake.ps1
+
+      - name: Cache dependencias FetchContent
+        uses: actions/cache@v5
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      - name: CMake Configure
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DS2_VULKAN=ON `
+            -DGGML_VULKAN=ON `
+            -DS2_CUDA=OFF `
+            -DS2_METAL=OFF `
+            -DVulkan_INCLUDE_DIR="$env:Vulkan_INCLUDE_DIR" `
+            -DVulkan_LIBRARY="$env:Vulkan_LIBRARY"
+
+      - name: CMake Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Verificar ejecutable
+        shell: pwsh
+        run: |
+          $exe = "build\Release\s2.exe"
+          if (-Not (Test-Path $exe)) {
+            Write-Error "s2.exe no fue generado."
+            exit 1
+          }
+          $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "OK: s2.exe ($sizeMB MB)"
+          & $exe --help
+
+      - name: Empaquetar release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item build\Release\s2.exe release\
+          Get-ChildItem build\Release\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination release\
+          if (Test-Path tokenizer.json) { Copy-Item tokenizer.json release\ }
+          Get-ChildItem release\ | Format-Table Name, Length -AutoSize
+
+      - name: Subir artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: s2-windows-vulkan
+          path: release\
+          retention-days: 30
+
+      - name: Crear GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release\s2.exe
+          generate_release_notes: true      - name: Parchear CMakeLists.txt para Windows
         shell: pwsh
         run: pwsh -File patch-cmake.ps1
 
