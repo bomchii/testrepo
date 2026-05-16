@@ -51,9 +51,9 @@ if (-Not (Test-Path "$asioDir\asio.hpp")) {
     Write-Host "OK: Asio headers ya presentes (cache)"
 }
 
-# Convertir a rutas absolutas para CMakeLists.txt
-$crowAbs = (Resolve-Path $crowDir).Path
-$asioAbs = (Resolve-Path $asioDir).Path
+# Convertir a rutas absolutas con / para CMakeLists.txt (\ causa errores de escape en CMake)
+$crowAbs = (Resolve-Path $crowDir).Path.Replace('\', '/')
+$asioAbs = (Resolve-Path $asioDir).Path.Replace('\', '/')
 
 Write-Host "Crow: $crowAbs"
 Write-Host "Asio: $asioAbs"
