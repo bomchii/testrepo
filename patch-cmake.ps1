@@ -3,32 +3,44 @@
 
 $content = Get-Content CMakeLists.txt -Raw -Encoding UTF8
 
-# ── 1. Reemplazar find_package(Crow REQUIRED) con FetchContent ──────────────
+# ── 1. Reemplazar find_package(Crow REQUIRED) ────────────────────────────────
+# Orden critico:
+#   1. Descargar Asio primero y setear ASIO_INCLUDE_DIR en cache
+#   2. Solo despues descargar Crow (su Findasio.cmake lo encontrara)
 $oldCrow = 'find_package(Crow REQUIRED)'
 
-$newCrow = 'find_package(Crow QUIET)
+$newCrow = 'include(FetchContent)
+
+# Asio PRIMERO: Crow lo busca internamente con find_package(asio REQUIRED)
+# Si no esta en cache antes de FetchContent_MakeAvailable(crow), falla.
+FetchContent_Declare(asio
+    GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+    GIT_TAG        asio-1-30-2
+    GIT_SHALLOW    TRUE)
+FetchContent_MakeAvailable(asio)
+# Setear ASIO_INCLUDE_DIR en cache para que Findasio.cmake de Crow lo encuentre
+set(ASIO_INCLUDE_DIR "${asio_SOURCE_DIR}/asio/include" CACHE PATH "" FORCE)
+
+# Crow: ahora si puede encontrar Asio
+find_package(Crow QUIET)
 if(NOT Crow_FOUND)
-    include(FetchContent)
     FetchContent_Declare(crow
         GIT_REPOSITORY https://github.com/CrowCpp/Crow.git
         GIT_TAG        v1.2.0
         GIT_SHALLOW    TRUE)
     FetchContent_MakeAvailable(crow)
-    set(CROW_INCLUDE_DIRS "${crow_SOURCE_DIR}/include")
-    set(CROW_LIBRARIES "")
-    FetchContent_Declare(asio
-        GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
-        GIT_TAG        asio-1-30-2
-        GIT_SHALLOW    TRUE)
-    FetchContent_MakeAvailable(asio)
-    add_library(asio_iface INTERFACE)
-    target_include_directories(asio_iface INTERFACE "${asio_SOURCE_DIR}/asio/include")
-    target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE)
-endif()'
+endif()
+set(CROW_INCLUDE_DIRS "${crow_SOURCE_DIR}/include")
+set(CROW_LIBRARIES "")
+
+# Libreria de interfaz para propagar Asio a nuestro target
+add_library(asio_iface INTERFACE)
+target_include_directories(asio_iface INTERFACE "${asio_SOURCE_DIR}/asio/include")
+target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE)'
 
 $content = $content.Replace($oldCrow, $newCrow)
 
-# ── 2. Agregar libs de Windows despues del bloque target_link_libraries ──────
+# ── 2. Agregar libs de Windows al target s2 ───────────────────────────────────
 $oldLibs = 'if(UNIX AND NOT APPLE)
     target_link_libraries(s2 PRIVATE pthread m)
 endif()'
@@ -49,6 +61,6 @@ endif()'
 
 $content = $content.Replace($oldLibs, $newLibs)
 
-# ── 3. Guardar ───────────────────────────────────────────────────────────────
+# ── 3. Guardar ────────────────────────────────────────────────────────────────
 Set-Content CMakeLists.txt -Value $content -Encoding UTF8
 Write-Host "CMakeLists.txt parcheado correctamente."
