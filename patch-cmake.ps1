@@ -1,47 +1,36 @@
 # patch-cmake.ps1
-# Estrategia: descargar Crow y Asio como ZIPs de headers puros.
-# NO se usa FetchContent para Crow — su CMakeLists.txt intenta configurar SSL
-# y buscar OpenSSL aunque se le diga CROW_ENABLE_SSL=OFF.
-# Bajando solo los headers evitamos todo ese problema.
+# Usa crow_all.h (single header oficial de Crow) + Asio standalone.
+# Evita por completo el CMakeLists.txt de Crow y sus dependencias de SSL.
 
 Write-Host "=== Parcheando CMake files para Windows ==="
 
-# ── 0. Directorios de trabajo ─────────────────────────────────────────────────
 $depsDir = "build\_deps"
 New-Item -ItemType Directory -Force -Path $depsDir | Out-Null
 
-# ── 1. Descargar Crow headers ─────────────────────────────────────────────────
-$crowDir = "$depsDir\crow-include"
-if (-Not (Test-Path "$crowDir\crow\crow.h")) {
-    Write-Host "Descargando Crow v1.2.0 headers..."
-    $crowZip = "$depsDir\crow.zip"
-    Invoke-WebRequest -Uri "https://github.com/CrowCpp/Crow/releases/download/v1.2.0/crow-v1.2.0.zip" `
-                      -OutFile $crowZip -UseBasicParsing
-    Expand-Archive -Path $crowZip -DestinationPath "$depsDir\crow-extracted" -Force
-    # El ZIP de release de Crow tiene los headers en include/
-    $crowIncludeSrc = Get-ChildItem "$depsDir\crow-extracted" -Recurse -Filter "crow.h" |
-                      Select-Object -First 1 -ExpandProperty DirectoryName
-    if (-Not $crowIncludeSrc) {
-        # Fallback: buscar en cualquier subdirectorio
-        $crowIncludeSrc = "$depsDir\crow-extracted"
-    }
+# ── 1. Descargar crow_all.h (single header, sin SSL, sin CMake propio) ────────
+$crowDir  = "$depsDir\crow-include"
+$crowFile = "$crowDir\crow.h"
+if (-Not (Test-Path $crowFile)) {
+    Write-Host "Descargando crow_all.h v1.2.0..."
     New-Item -ItemType Directory -Force -Path $crowDir | Out-Null
-    Copy-Item "$crowIncludeSrc\*" $crowDir -Recurse -Force
-    Remove-Item $crowZip -Force
-    Write-Host "OK: Crow headers en $crowDir"
+    Invoke-WebRequest `
+        -Uri "https://github.com/CrowCpp/Crow/releases/download/v1.2.0/crow_all.h" `
+        -OutFile $crowFile -UseBasicParsing
+    Write-Host "OK: crow.h en $crowFile ($([math]::Round((Get-Item $crowFile).Length/1KB,0)) KB)"
 } else {
-    Write-Host "OK: Crow headers ya presentes (cache)"
+    Write-Host "OK: crow.h ya presente (cache)"
 }
 
 # ── 2. Descargar Asio headers ─────────────────────────────────────────────────
-$asioDir = "$depsDir\asio-include"
-if (-Not (Test-Path "$asioDir\asio.hpp")) {
-    Write-Host "Descargando Asio 1.30.2 headers..."
+$asioDir  = "$depsDir\asio-include"
+$asioFile = "$asioDir\asio.hpp"
+if (-Not (Test-Path $asioFile)) {
+    Write-Host "Descargando Asio 1.30.2..."
     $asioZip = "$depsDir\asio.zip"
-    Invoke-WebRequest -Uri "https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.zip" `
-                      -OutFile $asioZip -UseBasicParsing
+    Invoke-WebRequest `
+        -Uri "https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.zip" `
+        -OutFile $asioZip -UseBasicParsing
     Expand-Archive -Path $asioZip -DestinationPath "$depsDir\asio-extracted" -Force
-    # El ZIP de Asio tiene la estructura: asio-asio-1-30-2/asio/include/
     $asioSrc = "$depsDir\asio-extracted\asio-asio-1-30-2\asio\include"
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
@@ -51,19 +40,18 @@ if (-Not (Test-Path "$asioDir\asio.hpp")) {
     Write-Host "OK: Asio headers ya presentes (cache)"
 }
 
-# Convertir a rutas absolutas con / para CMakeLists.txt (\ causa errores de escape en CMake)
+# Rutas con / para CMake (\ causa errores de escape)
 $crowAbs = (Resolve-Path $crowDir).Path.Replace('\', '/')
 $asioAbs = (Resolve-Path $asioDir).Path.Replace('\', '/')
-
-Write-Host "Crow: $crowAbs"
-Write-Host "Asio: $asioAbs"
+Write-Host "Crow include dir : $crowAbs"
+Write-Host "Asio include dir : $asioAbs"
 
 # ── 3. Parchear ggml-vulkan/CMakeLists.txt ────────────────────────────────────
-# Desactiva la deteccion de coopmat/coopmat2 para evitar el race condition
-# entre vulkan-shaders-gen y ggml-vulkan.cpp compilando en paralelo.
+# Desactiva deteccion de coopmat/coopmat2 para evitar race condition entre
+# vulkan-shaders-gen y ggml-vulkan.cpp compilando en paralelo con MSBuild.
 
-$vkCmakePath = "ggml\src\ggml-vulkan\CMakeLists.txt"
-$vkCmake = Get-Content $vkCmakePath -Raw
+$vkPath  = "ggml\src\ggml-vulkan\CMakeLists.txt"
+$vkCmake = Get-Content $vkPath -Raw
 
 if ($vkCmake -match "execute_process") {
     $vkCmake = $vkCmake -replace '(?s)function\(test_shader_extension_support.*?endfunction\(\)', @'
@@ -73,19 +61,16 @@ function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VA
 endfunction()
 '@
     [System.IO.File]::WriteAllText(
-        (Resolve-Path $vkCmakePath).Path,
+        (Resolve-Path $vkPath).Path,
         $vkCmake,
         [System.Text.UTF8Encoding]::new($false)
     )
-    Write-Host "OK: ggml-vulkan CMakeLists.txt parcheado"
+    Write-Host "OK: ggml-vulkan CMakeLists.txt parcheado (coopmat OFF)"
 } else {
     Write-Host "OK: ggml-vulkan CMakeLists.txt ya parcheado"
 }
 
 # ── 4. Reescribir CMakeLists.txt raiz ────────────────────────────────────────
-# Usa las rutas absolutas de Crow y Asio descargados como headers puros.
-# NO se usa FetchContent para Crow — evita por completo la configuracion SSL.
-
 $newCmake = @"
 cmake_minimum_required(VERSION 3.14)
 project(s2cpp LANGUAGES C CXX)
@@ -114,23 +99,24 @@ endif()
 add_subdirectory(ggml)
 
 # ---------------------------------------------------------------------------
-# Crow y Asio como headers puros (sin FetchContent, sin CMake propio)
-# Las rutas son absolutas, inyectadas por patch-cmake.ps1
+# Crow: usamos crow_all.h (single header) descargado por patch-cmake.ps1.
+# NO se usa FetchContent ni el CMakeLists.txt de Crow para evitar que
+# configure SSL y busque OpenSSL.
 # ---------------------------------------------------------------------------
-
 set(CROW_INCLUDE_DIR "$crowAbs")
+
+# ---------------------------------------------------------------------------
+# Asio standalone (requerido por Crow en Windows)
+# ---------------------------------------------------------------------------
 set(ASIO_INCLUDE_DIR "$asioAbs")
 
 add_library(asio_iface INTERFACE)
-target_include_directories(asio_iface INTERFACE "`${ASIO_INCLUDE_DIR}")
-target_compile_definitions(asio_iface INTERFACE
-    ASIO_STANDALONE
-    ASIO_NO_SSL)
+target_include_directories(asio_iface INTERFACE `${ASIO_INCLUDE_DIR})
+target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE ASIO_NO_SSL)
 
 # ---------------------------------------------------------------------------
-# cxxopts
+# cxxopts (unico dep que sigue usando FetchContent, sin problemas de SSL)
 # ---------------------------------------------------------------------------
-
 include(FetchContent)
 find_package(cxxopts QUIET)
 if(NOT cxxopts_FOUND)
@@ -144,7 +130,6 @@ endif()
 # ---------------------------------------------------------------------------
 # s2 executable
 # ---------------------------------------------------------------------------
-
 set(S2_SOURCES
     src/s2_audio.cpp
     src/s2_tokenizer.cpp
