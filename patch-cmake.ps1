@@ -1,7 +1,22 @@
 # patch-cmake.ps1
-# Usa los headers originales de Crow (include/) en vez de crow_all.h.
-# Los headers originales tienen #ifdef CROW_ENABLE_SSL correcto,
-# por lo que CROW_ENABLE_SSL=0 evita completamente asio::ssl.
+# Instala OpenSSL via Chocolatey para satisfacer las dependencias SSL de Crow/Asio,
+# y parchea los CMake files para compilar s2.cpp en Windows con MSVC.
+
+Write-Host "=== Instalando OpenSSL ==="
+choco install openssl --yes --no-progress 2>&1 | Tail -5
+
+# Agregar OpenSSL al PATH para que CMake lo encuentre
+$opensslPath = "C:\Program Files\OpenSSL-Win64"
+if (-Not (Test-Path $opensslPath)) {
+    $opensslPath = "C:\Program Files\OpenSSL"
+}
+if (Test-Path $opensslPath) {
+    $env:PATH = "$opensslPath\bin;$env:PATH"
+    $env:OPENSSL_ROOT_DIR = $opensslPath
+    Write-Host "OK: OpenSSL en $opensslPath"
+} else {
+    Write-Host "AVISO: OpenSSL no encontrado en ruta esperada, continuando..."
+}
 
 Write-Host "=== Parcheando CMake files para Windows ==="
 
@@ -54,13 +69,9 @@ if (-Not (Test-Path $asioFile)) {
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
     Remove-Item $asioZip -Force
-    # Borrar asio/ssl/ SIEMPRE para que openssl_types.hpp no exista en disco
-    Remove-Item "$asioDir\asio\ssl" -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "OK: Asio headers en $asioDir (sin ssl/)"
+    Write-Host "OK: Asio headers en $asioDir"
 } else {
-    # En cache restaurado, borrar ssl/ tambien
-    Remove-Item "$asioDir\asio\ssl" -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "OK: Asio headers ya presentes (sin ssl/)"
+    Write-Host "OK: Asio headers presentes (cache)"
 }
 
 # Rutas con / para CMake (\a, \t etc. son escapes invalidos en CMake)
