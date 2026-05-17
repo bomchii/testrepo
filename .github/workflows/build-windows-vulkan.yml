@@ -79,6 +79,7 @@ jobs:
             -DS2_METAL=OFF `
             -DVulkan_INCLUDE_DIR="$env:Vulkan_INCLUDE_DIR" `
             -DVulkan_LIBRARY="$env:Vulkan_LIBRARY" `
+            -DOPENSSL_ROOT_DIR="$env:OPENSSL_ROOT_DIR" `
             -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=OFF `
             -DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT=OFF `
             -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=OFF
