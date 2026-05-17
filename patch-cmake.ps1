@@ -1,24 +1,43 @@
 # patch-cmake.ps1
-# Usa crow_all.h (single header oficial de Crow) + Asio standalone.
-# Evita por completo el CMakeLists.txt de Crow y sus dependencias de SSL.
+# Usa los headers originales de Crow (include/) en vez de crow_all.h.
+# Los headers originales tienen #ifdef CROW_ENABLE_SSL correcto,
+# por lo que CROW_ENABLE_SSL=0 evita completamente asio::ssl.
 
 Write-Host "=== Parcheando CMake files para Windows ==="
 
 $depsDir = "build\_deps"
 New-Item -ItemType Directory -Force -Path $depsDir | Out-Null
 
-# ── 1. Descargar crow_all.h (single header, sin SSL, sin CMake propio) ────────
+# ── 1. Descargar headers originales de Crow (source tarball) ─────────────────
+# Usamos el source tarball en vez de crow_all.h porque:
+# - crow_all.h incluye asio::ssl incondicionalmente
+# - Los headers originales tienen #ifdef CROW_ENABLE_SSL
 $crowDir  = "$depsDir\crow-include"
-$crowFile = "$crowDir\crow.h"
+$crowFile = "$crowDir\crow\crow.h"   # ruta que genera el source tarball
 if (-Not (Test-Path $crowFile)) {
-    Write-Host "Descargando crow_all.h v1.2.0..."
-    New-Item -ItemType Directory -Force -Path $crowDir | Out-Null
+    Write-Host "Descargando Crow v1.2.0 source tarball..."
+    $crowTar = "$depsDir\crow.tar.gz"
     Invoke-WebRequest `
-        -Uri "https://github.com/CrowCpp/Crow/releases/download/v1.2.0/crow_all.h" `
-        -OutFile $crowFile -UseBasicParsing
-    Write-Host "OK: crow.h en $crowFile ($([math]::Round((Get-Item $crowFile).Length/1KB,0)) KB)"
+        -Uri "https://github.com/CrowCpp/Crow/archive/refs/tags/v1.2.0.tar.gz" `
+        -OutFile $crowTar -UseBasicParsing
+    # Extraer con tar (disponible en Windows 10+ y en todos los runners de GitHub)
+    New-Item -ItemType Directory -Force -Path "$depsDir\crow-extracted" | Out-Null
+    tar -xzf $crowTar -C "$depsDir\crow-extracted"
+    # El tarball extrae como Crow-1.2.0/include/crow/
+    $crowSrc = "$depsDir\crow-extracted\Crow-1.2.0\include"
+    if (-Not (Test-Path $crowSrc)) {
+        # Fallback: buscar include/ en cualquier subdirectorio
+        $crowSrc = Get-ChildItem "$depsDir\crow-extracted" -Recurse -Filter "crow.h" |
+                   Select-Object -First 1 |
+                   ForEach-Object { $_.DirectoryName | Split-Path -Parent }
+    }
+    New-Item -ItemType Directory -Force -Path $crowDir | Out-Null
+    Copy-Item "$crowSrc\*" $crowDir -Recurse -Force
+    Remove-Item $crowTar -Force
+    Write-Host "OK: Crow headers en $crowDir"
+    Write-Host "   crow.h existe: $(Test-Path $crowFile)"
 } else {
-    Write-Host "OK: crow.h ya presente (cache)"
+    Write-Host "OK: Crow headers ya presentes (cache)"
 }
 
 # ── 2. Descargar Asio headers ─────────────────────────────────────────────────
@@ -35,68 +54,28 @@ if (-Not (Test-Path $asioFile)) {
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
     Remove-Item $asioZip -Force
-    # Eliminar asio/ssl/ fisicamente y reemplazar con stubs vacios.
-    # crow_all.h incluye asio/ssl.hpp incondicionalmente aunque no se use HTTPS.
-    # Los stubs satisfacen el #include sin requerir OpenSSL.
-    $sslPath = "$asioDir\asio\ssl"
-    Remove-Item $sslPath -Recurse -Force -ErrorAction SilentlyContinue
-
-    # Crear stubs minimos para que los #include de crow no fallen
-    New-Item -ItemType Directory -Force -Path $sslPath | Out-Null
-    New-Item -ItemType Directory -Force -Path "$sslPath\detail" | Out-Null
-
-    # asio/ssl.hpp — incluido directamente por crow_all.h
-    @'
-#pragma once
-// SSL stub: proyecto no usa HTTPS, OpenSSL no requerido
-'@ | Set-Content "$asioDir\asio\ssl.hpp" -Encoding UTF8
-
-    # Subdirs que asio/ssl.hpp normalmente incluye
-    foreach ($f in @("context.hpp","context_base.hpp","error.hpp","rfc2818_verification.hpp",
-                     "stream.hpp","stream_base.hpp","verify_context.hpp","verify_mode.hpp")) {
-        "@`#pragma once`n// SSL stub" | Set-Content "$sslPath\$f" -Encoding UTF8
-    }
-    # detail/ stubs
-    foreach ($f in @("openssl_types.hpp","openssl_init.hpp","engine.hpp","io.hpp",
-                     "buffered_handshake_op.hpp","connect_op.hpp","handshake_op.hpp",
-                     "read_op.hpp","shutdown_op.hpp","stream_core.hpp","write_op.hpp")) {
-        "@`#pragma once`n// SSL stub" | Set-Content "$sslPath\detail\$f" -Encoding UTF8
-    }
-    Write-Host "OK: asio/ssl/ reemplazado con stubs (sin OpenSSL)"
     Write-Host "OK: Asio headers en $asioDir"
 } else {
-    # En cache restaurado, verificar y crear stubs si faltan
-    $sslStub = "$asioDir\asio\ssl.hpp"
-    if (-Not (Test-Path $sslStub)) {
-        $sslPath = "$asioDir\asio\ssl"
-        Remove-Item $sslPath -Recurse -Force -ErrorAction SilentlyContinue
-        New-Item -ItemType Directory -Force -Path $sslPath | Out-Null
-        New-Item -ItemType Directory -Force -Path "$sslPath\detail" | Out-Null
-        "@`#pragma once`n// SSL stub" | Set-Content $sslStub -Encoding UTF8
-        foreach ($f in @("context.hpp","context_base.hpp","error.hpp","rfc2818_verification.hpp",
-                         "stream.hpp","stream_base.hpp","verify_context.hpp","verify_mode.hpp")) {
-            "@`#pragma once`n// SSL stub" | Set-Content "$sslPath\$f" -Encoding UTF8
-        }
-        foreach ($f in @("openssl_types.hpp","openssl_init.hpp","engine.hpp","io.hpp",
-                         "buffered_handshake_op.hpp","connect_op.hpp","handshake_op.hpp",
-                         "read_op.hpp","shutdown_op.hpp","stream_core.hpp","write_op.hpp")) {
-            "@`#pragma once`n// SSL stub" | Set-Content "$sslPath\detail\$f" -Encoding UTF8
-        }
-        Write-Host "OK: stubs SSL creados en cache"
-    }
     Write-Host "OK: Asio headers ya presentes (cache)"
 }
 
-# Rutas con / para CMake (\ causa errores de escape)
+# Rutas con / para CMake (\a, \t etc. son escapes invalidos en CMake)
 $crowAbs = (Resolve-Path $crowDir).Path.Replace('\', '/')
 $asioAbs = (Resolve-Path $asioDir).Path.Replace('\', '/')
 Write-Host "Crow include dir : $crowAbs"
 Write-Host "Asio include dir : $asioAbs"
 
-# ── 3. Parchear ggml-vulkan/CMakeLists.txt ────────────────────────────────────
-# Desactiva deteccion de coopmat/coopmat2 para evitar race condition entre
-# vulkan-shaders-gen y ggml-vulkan.cpp compilando en paralelo con MSBuild.
+# Verificar que crow.h existe en la ruta correcta
+$crowHeader = "$crowAbs/crow/crow.h"
+if (-Not (Test-Path $crowHeader.Replace('/', '\'))) {
+    Write-Error "ERROR: crow/crow.h no encontrado en $crowAbs"
+    Write-Host "Contenido de $crowAbs :"
+    Get-ChildItem $crowAbs.Replace('/', '\') | Select-Object Name | Format-Table
+    exit 1
+}
+Write-Host "OK: crow/crow.h verificado"
 
+# ── 3. Parchear ggml-vulkan/CMakeLists.txt ────────────────────────────────────
 $vkPath  = "ggml\src\ggml-vulkan\CMakeLists.txt"
 $vkCmake = Get-Content $vkPath -Raw
 
@@ -118,12 +97,17 @@ endfunction()
 }
 
 # ── 4. Reescribir CMakeLists.txt raiz ────────────────────────────────────────
+# main.cpp hace #include <crow.h> — con el include dir apuntando a
+# crow-include/crow/, el compilador encuentra crow-include/crow/crow.h. OK.
+# CROW_ENABLE_SSL=0 evita todo el codigo SSL en los headers originales de Crow.
+
 $newCmake = @"
 cmake_minimum_required(VERSION 3.14)
 project(s2cpp LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(S2_VULKAN  "Build with Vulkan backend"  OFF)
@@ -146,23 +130,25 @@ endif()
 add_subdirectory(ggml)
 
 # ---------------------------------------------------------------------------
-# Crow: usamos crow_all.h (single header) descargado por patch-cmake.ps1.
-# NO se usa FetchContent ni el CMakeLists.txt de Crow para evitar que
-# configure SSL y busque OpenSSL.
+# Crow: headers originales del source tarball (NO crow_all.h).
+# Los headers originales tienen #ifdef CROW_ENABLE_SSL, por lo que
+# definir CROW_ENABLE_SSL=0 evita completamente asio::ssl y OpenSSL.
+# include_directories apunta a crow-include/ para que #include <crow/crow.h>
+# funcione, y tambien a crow-include/crow/ para que #include <crow.h> funcione.
 # ---------------------------------------------------------------------------
 set(CROW_INCLUDE_DIR "$crowAbs")
 
 # ---------------------------------------------------------------------------
-# Asio standalone (requerido por Crow en Windows)
+# Asio standalone
 # ---------------------------------------------------------------------------
 set(ASIO_INCLUDE_DIR "$asioAbs")
 
 add_library(asio_iface INTERFACE)
 target_include_directories(asio_iface INTERFACE `${ASIO_INCLUDE_DIR})
-target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE ASIO_NO_SSL)
+target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE)
 
 # ---------------------------------------------------------------------------
-# cxxopts (unico dep que sigue usando FetchContent, sin problemas de SSL)
+# cxxopts
 # ---------------------------------------------------------------------------
 include(FetchContent)
 find_package(cxxopts QUIET)
@@ -197,6 +183,7 @@ target_include_directories(s2 PRIVATE
     `${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
     `${CMAKE_CURRENT_SOURCE_DIR}/ggml/src
     `${CROW_INCLUDE_DIR}
+    `${CROW_INCLUDE_DIR}/crow
 )
 
 target_link_libraries(s2 PRIVATE
@@ -216,8 +203,7 @@ if(WIN32)
         NOMINMAX
         _WIN32_WINNT=0x0A00
         CROW_ENABLE_SSL=0
-        ASIO_STANDALONE
-        ASIO_NO_SSL)
+        ASIO_STANDALONE)
     if(MSVC)
         target_compile_options(s2 PRIVATE /W3 /wd4996 /wd4267 /wd4244 /MP)
     endif()
