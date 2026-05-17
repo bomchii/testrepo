@@ -54,9 +54,13 @@ if (-Not (Test-Path $asioFile)) {
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
     Remove-Item $asioZip -Force
-    Write-Host "OK: Asio headers en $asioDir"
+    # Borrar asio/ssl/ SIEMPRE para que openssl_types.hpp no exista en disco
+    Remove-Item "$asioDir\asio\ssl" -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "OK: Asio headers en $asioDir (sin ssl/)"
 } else {
-    Write-Host "OK: Asio headers ya presentes (cache)"
+    # En cache restaurado, borrar ssl/ tambien
+    Remove-Item "$asioDir\asio\ssl" -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "OK: Asio headers ya presentes (sin ssl/)"
 }
 
 # Rutas con / para CMake (\a, \t etc. son escapes invalidos en CMake)
@@ -204,7 +208,16 @@ if(WIN32)
         CROW_ENABLE_SSL=0
         ASIO_STANDALONE)
     if(MSVC)
-        target_compile_options(s2 PRIVATE /W3 /wd4996 /wd4267 /wd4244 /MP)
+        # /FI fuerza un include al inicio de cada TU — garantiza que
+        # CROW_ENABLE_SSL=0 y ASIO_STANDALONE se definen ANTES de cualquier
+        # #include en el codigo fuente, incluyendo crow.h
+        target_compile_options(s2 PRIVATE
+            /W3 /wd4996 /wd4267 /wd4244 /MP
+            /DCROW_ENABLE_SSL=0
+            /DASIO_STANDALONE
+            /DNOMINMAX
+            /DWIN32_LEAN_AND_MEAN
+        )
     endif()
 elseif(UNIX AND NOT APPLE)
     target_link_libraries(s2 PRIVATE pthread m)
