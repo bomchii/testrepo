@@ -13,7 +13,7 @@ New-Item -ItemType Directory -Force -Path $depsDir | Out-Null
 # - crow_all.h incluye asio::ssl incondicionalmente
 # - Los headers originales tienen #ifdef CROW_ENABLE_SSL
 $crowDir  = "$depsDir\crow-include"
-$crowFile = "$crowDir\crow\crow.h"   # ruta que genera el source tarball
+$crowFile = "$crowDir\crow.h"   # el tarball pone crow.h directamente en include/
 if (-Not (Test-Path $crowFile)) {
     Write-Host "Descargando Crow v1.2.0 source tarball..."
     $crowTar = "$depsDir\crow.tar.gz"
@@ -66,14 +66,14 @@ Write-Host "Crow include dir : $crowAbs"
 Write-Host "Asio include dir : $asioAbs"
 
 # Verificar que crow.h existe en la ruta correcta
-$crowHeader = "$crowAbs/crow/crow.h"
+$crowHeader = "$crowAbs/crow.h"
 if (-Not (Test-Path $crowHeader.Replace('/', '\'))) {
-    Write-Error "ERROR: crow/crow.h no encontrado en $crowAbs"
+    Write-Error "ERROR: crow.h no encontrado en $crowAbs"
     Write-Host "Contenido de $crowAbs :"
     Get-ChildItem $crowAbs.Replace('/', '\') | Select-Object Name | Format-Table
     exit 1
 }
-Write-Host "OK: crow/crow.h verificado"
+Write-Host "OK: crow.h verificado"
 
 # ── 3. Parchear ggml-vulkan/CMakeLists.txt ────────────────────────────────────
 $vkPath  = "ggml\src\ggml-vulkan\CMakeLists.txt"
@@ -183,7 +183,6 @@ target_include_directories(s2 PRIVATE
     `${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
     `${CMAKE_CURRENT_SOURCE_DIR}/ggml/src
     `${CROW_INCLUDE_DIR}
-    `${CROW_INCLUDE_DIR}/crow
 )
 
 target_link_libraries(s2 PRIVATE
