@@ -58,6 +58,16 @@ jobs:
       # soporte coopmat, y el Vulkan SDK actual los detecta como disponibles,
       # causando una discrepancia entre el .hpp y el .cpp.
 
+      - name: Instalar OpenSSL
+        shell: pwsh
+        run: |
+          choco install openssl --yes --no-progress
+          $path = "C:\Program Files\OpenSSL-Win64"
+          if (-Not (Test-Path $path)) { $path = "C:\Program Files\OpenSSL" }
+          echo "OPENSSL_ROOT_DIR=$path" >> $env:GITHUB_ENV
+          echo "$path\bin" >> $env:GITHUB_PATH
+          Write-Host "OK: OpenSSL en $path"
+
       - name: Parchear CMakeLists.txt para Windows
         shell: pwsh
         run: pwsh -File patch-cmake.ps1
