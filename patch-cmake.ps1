@@ -196,6 +196,9 @@ endif()
 
 if(WIN32)
     target_link_libraries(s2 PRIVATE ws2_32 mswsock)
+    # Linkear OpenSSL (requerido por Asio SSL que Crow incluye)
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(s2 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(s2 PRIVATE
         WIN32_LEAN_AND_MEAN
         NOMINMAX
