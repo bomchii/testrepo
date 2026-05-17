@@ -35,8 +35,21 @@ if (-Not (Test-Path $asioFile)) {
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
     Remove-Item $asioZip -Force
+    # Eliminar asio/ssl/ fisicamente: ASIO_NO_SSL no borra los archivos,
+    # y crow_all.h puede incluir asio/ssl.hpp directamente.
+    $sslPath = "$asioDir\asio\ssl"
+    if (Test-Path $sslPath) {
+        Remove-Item $sslPath -Recurse -Force
+        Write-Host "OK: asio/ssl/ eliminado para evitar dependencia de OpenSSL"
+    }
     Write-Host "OK: Asio headers en $asioDir"
 } else {
+    # Tambien limpiar ssl en cache existente por si acaso
+    $sslPath = "$asioDir\asio\ssl"
+    if (Test-Path $sslPath) {
+        Remove-Item $sslPath -Recurse -Force
+        Write-Host "OK: asio/ssl/ eliminado del cache"
+    }
     Write-Host "OK: Asio headers ya presentes (cache)"
 }
 
