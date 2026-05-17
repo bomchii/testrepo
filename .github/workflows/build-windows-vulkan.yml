@@ -136,9 +136,46 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
+
+          # Ejecutable principal
           Copy-Item build\Release\s2.exe release\
-          Get-ChildItem build\Release\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination release\
-          if (Test-Path tokenizer.json) { Copy-Item tokenizer.json release\ }
+
+          # DLLs de ggml (ggml-base, ggml-cpu, ggml-vulkan, etc.)
+          Get-ChildItem build\Release\*.dll -ErrorAction SilentlyContinue |
+              Copy-Item -Destination release\
+          Get-ChildItem build\bin\Release\*.dll -ErrorAction SilentlyContinue |
+              Copy-Item -Destination release\
+
+          # DLLs de OpenSSL (libssl-1_1-x64.dll, libcrypto-1_1-x64.dll)
+          $opensslBin = "$env:OPENSSL_ROOT_DIR\bin"
+          if (Test-Path $opensslBin) {
+              Get-ChildItem "$opensslBin\*.dll" | Copy-Item -Destination release\
+              Write-Host "OK: DLLs de OpenSSL copiadas desde $opensslBin"
+          }
+
+          # MSVC runtime redistributable (vcruntime140.dll, msvcp140.dll, etc.)
+          # Buscar en la instalacion de Visual Studio del runner
+          $msvcDir = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+              -latest -find "VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" 2>$null |
+              Select-Object -Last 1
+          if ($msvcDir -and (Test-Path $msvcDir)) {
+              Get-ChildItem "$msvcDir\*.dll" | Copy-Item -Destination release\
+              Write-Host "OK: MSVC runtime copiado desde $msvcDir"
+          } else {
+              # Fallback: buscar vcruntime140.dll en System32
+              $vcrt = "C:\Windows\System32\vcruntime140.dll"
+              if (Test-Path $vcrt) {
+                  Copy-Item $vcrt release\
+                  Write-Host "OK: vcruntime140.dll copiado desde System32"
+              }
+          }
+
+          # tokenizer.json si existe en la raiz
+          if (Test-Path tokenizer.json) {
+              Copy-Item tokenizer.json release\
+          }
+
+          Write-Host "`nContenido del paquete:"
           Get-ChildItem release\ | Format-Table Name, Length -AutoSize
 
       - name: Subir artifact
