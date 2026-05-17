@@ -1,22 +1,6 @@
 # patch-cmake.ps1
-# Instala OpenSSL via Chocolatey para satisfacer las dependencias SSL de Crow/Asio,
-# y parchea los CMake files para compilar s2.cpp en Windows con MSVC.
-
-Write-Host "=== Instalando OpenSSL ==="
-choco install openssl --yes --no-progress 2>&1 | Tail -5
-
-# Agregar OpenSSL al PATH para que CMake lo encuentre
-$opensslPath = "C:\Program Files\OpenSSL-Win64"
-if (-Not (Test-Path $opensslPath)) {
-    $opensslPath = "C:\Program Files\OpenSSL"
-}
-if (Test-Path $opensslPath) {
-    $env:PATH = "$opensslPath\bin;$env:PATH"
-    $env:OPENSSL_ROOT_DIR = $opensslPath
-    Write-Host "OK: OpenSSL en $opensslPath"
-} else {
-    Write-Host "AVISO: OpenSSL no encontrado en ruta esperada, continuando..."
-}
+# Parchea los CMake files para compilar s2.cpp en Windows con MSVC.
+# OpenSSL se instala en un step previo del workflow via Chocolatey.
 
 Write-Host "=== Parcheando CMake files para Windows ==="
 
