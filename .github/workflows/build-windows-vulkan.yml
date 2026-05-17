@@ -61,8 +61,8 @@ jobs:
       - name: Instalar OpenSSL
         shell: pwsh
         run: |
-          choco install openssl --yes --no-progress
-          # Buscar donde choco instalo OpenSSL
+          # OpenSSL 3.x rompe Asio (asn1_string_st opaco). Usar OpenSSL 1.1.
+          choco install openssl --version=1.1.1.2100 --yes --no-progress
           $candidates = @(
             "C:\Program Files\OpenSSL-Win64",
             "C:\Program Files\OpenSSL",
@@ -71,20 +71,18 @@ jobs:
           )
           $found = $candidates | Where-Object { Test-Path "$_\include\openssl\conf.h" } | Select-Object -First 1
           if (-Not $found) {
-            # Busqueda amplia
             $found = Get-ChildItem "C:\" -Recurse -Filter "conf.h" -ErrorAction SilentlyContinue |
                      Where-Object { $_.FullName -match "openssl" } |
                      Select-Object -First 1 |
-                     ForEach-Object { $_.FullName -replace "\\openssl\\conf.h","" -replace "\\include.*","" }
+                     ForEach-Object { $_.DirectoryName -replace "\\openssl$","" }
           }
           if ($found) {
-            Write-Host "OK: OpenSSL encontrado en $found"
-            echo "OPENSSL_ROOT_DIR=$found"          >> $env:GITHUB_ENV
+            Write-Host "OK: OpenSSL 1.1 en $found"
+            echo "OPENSSL_ROOT_DIR=$found"            >> $env:GITHUB_ENV
             echo "OPENSSL_INCLUDE_DIR=$found\include" >> $env:GITHUB_ENV
-            echo "$found\bin"                        >> $env:GITHUB_PATH
+            echo "$found\bin"                          >> $env:GITHUB_PATH
           } else {
-            Write-Error "OpenSSL no encontrado tras instalacion"
-            exit 1
+            Write-Error "OpenSSL no encontrado"; exit 1
           }
 
       - name: Parchear CMakeLists.txt para Windows
