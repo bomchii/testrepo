@@ -35,20 +35,54 @@ if (-Not (Test-Path $asioFile)) {
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
     Remove-Item $asioZip -Force
-    # Eliminar asio/ssl/ fisicamente: ASIO_NO_SSL no borra los archivos,
-    # y crow_all.h puede incluir asio/ssl.hpp directamente.
+    # Eliminar asio/ssl/ fisicamente y reemplazar con stubs vacios.
+    # crow_all.h incluye asio/ssl.hpp incondicionalmente aunque no se use HTTPS.
+    # Los stubs satisfacen el #include sin requerir OpenSSL.
     $sslPath = "$asioDir\asio\ssl"
-    if (Test-Path $sslPath) {
-        Remove-Item $sslPath -Recurse -Force
-        Write-Host "OK: asio/ssl/ eliminado para evitar dependencia de OpenSSL"
+    Remove-Item $sslPath -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Crear stubs minimos para que los #include de crow no fallen
+    New-Item -ItemType Directory -Force -Path $sslPath | Out-Null
+    New-Item -ItemType Directory -Force -Path "$sslPath\detail" | Out-Null
+
+    # asio/ssl.hpp — incluido directamente por crow_all.h
+    @'
+#pragma once
+// SSL stub: proyecto no usa HTTPS, OpenSSL no requerido
+'@ | Set-Content "$asioDir\asio\ssl.hpp" -Encoding UTF8
+
+    # Subdirs que asio/ssl.hpp normalmente incluye
+    foreach ($f in @("context.hpp","context_base.hpp","error.hpp","rfc2818_verification.hpp",
+                     "stream.hpp","stream_base.hpp","verify_context.hpp","verify_mode.hpp")) {
+        "@`#pragma once`n// SSL stub" | Set-Content "$sslPath\$f" -Encoding UTF8
     }
+    # detail/ stubs
+    foreach ($f in @("openssl_types.hpp","openssl_init.hpp","engine.hpp","io.hpp",
+                     "buffered_handshake_op.hpp","connect_op.hpp","handshake_op.hpp",
+                     "read_op.hpp","shutdown_op.hpp","stream_core.hpp","write_op.hpp")) {
+        "@`#pragma once`n// SSL stub" | Set-Content "$sslPath\detail\$f" -Encoding UTF8
+    }
+    Write-Host "OK: asio/ssl/ reemplazado con stubs (sin OpenSSL)"
     Write-Host "OK: Asio headers en $asioDir"
 } else {
-    # Tambien limpiar ssl en cache existente por si acaso
-    $sslPath = "$asioDir\asio\ssl"
-    if (Test-Path $sslPath) {
-        Remove-Item $sslPath -Recurse -Force
-        Write-Host "OK: asio/ssl/ eliminado del cache"
+    # En cache restaurado, verificar y crear stubs si faltan
+    $sslStub = "$asioDir\asio\ssl.hpp"
+    if (-Not (Test-Path $sslStub)) {
+        $sslPath = "$asioDir\asio\ssl"
+        Remove-Item $sslPath -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $sslPath | Out-Null
+        New-Item -ItemType Directory -Force -Path "$sslPath\detail" | Out-Null
+        "@`#pragma once`n// SSL stub" | Set-Content $sslStub -Encoding UTF8
+        foreach ($f in @("context.hpp","context_base.hpp","error.hpp","rfc2818_verification.hpp",
+                         "stream.hpp","stream_base.hpp","verify_context.hpp","verify_mode.hpp")) {
+            "@`#pragma once`n// SSL stub" | Set-Content "$sslPath\$f" -Encoding UTF8
+        }
+        foreach ($f in @("openssl_types.hpp","openssl_init.hpp","engine.hpp","io.hpp",
+                         "buffered_handshake_op.hpp","connect_op.hpp","handshake_op.hpp",
+                         "read_op.hpp","shutdown_op.hpp","stream_core.hpp","write_op.hpp")) {
+            "@`#pragma once`n// SSL stub" | Set-Content "$sslPath\detail\$f" -Encoding UTF8
+        }
+        Write-Host "OK: stubs SSL creados en cache"
     }
     Write-Host "OK: Asio headers ya presentes (cache)"
 }
