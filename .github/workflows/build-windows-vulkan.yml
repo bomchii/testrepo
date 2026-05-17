@@ -62,11 +62,30 @@ jobs:
         shell: pwsh
         run: |
           choco install openssl --yes --no-progress
-          $path = "C:\Program Files\OpenSSL-Win64"
-          if (-Not (Test-Path $path)) { $path = "C:\Program Files\OpenSSL" }
-          echo "OPENSSL_ROOT_DIR=$path" >> $env:GITHUB_ENV
-          echo "$path\bin" >> $env:GITHUB_PATH
-          Write-Host "OK: OpenSSL en $path"
+          # Buscar donde choco instalo OpenSSL
+          $candidates = @(
+            "C:\Program Files\OpenSSL-Win64",
+            "C:\Program Files\OpenSSL",
+            "C:\OpenSSL-Win64",
+            "C:\OpenSSL"
+          )
+          $found = $candidates | Where-Object { Test-Path "$_\include\openssl\conf.h" } | Select-Object -First 1
+          if (-Not $found) {
+            # Busqueda amplia
+            $found = Get-ChildItem "C:\" -Recurse -Filter "conf.h" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -match "openssl" } |
+                     Select-Object -First 1 |
+                     ForEach-Object { $_.FullName -replace "\\openssl\\conf.h","" -replace "\\include.*","" }
+          }
+          if ($found) {
+            Write-Host "OK: OpenSSL encontrado en $found"
+            echo "OPENSSL_ROOT_DIR=$found"          >> $env:GITHUB_ENV
+            echo "OPENSSL_INCLUDE_DIR=$found\include" >> $env:GITHUB_ENV
+            echo "$found\bin"                        >> $env:GITHUB_PATH
+          } else {
+            Write-Error "OpenSSL no encontrado tras instalacion"
+            exit 1
+          }
 
       - name: Parchear CMakeLists.txt para Windows
         shell: pwsh
@@ -90,6 +109,8 @@ jobs:
             -DVulkan_INCLUDE_DIR="$env:Vulkan_INCLUDE_DIR" `
             -DVulkan_LIBRARY="$env:Vulkan_LIBRARY" `
             -DOPENSSL_ROOT_DIR="$env:OPENSSL_ROOT_DIR" `
+            -DOPENSSL_INCLUDE_DIR="$env:OPENSSL_INCLUDE_DIR" `
+            "-DCMAKE_CXX_FLAGS=/I`"$env:OPENSSL_INCLUDE_DIR`"" `
             -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=OFF `
             -DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT=OFF `
             -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=OFF
