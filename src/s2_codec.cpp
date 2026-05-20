@@ -1155,4 +1155,103 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// decode_chunked()  — igual que decode() pero procesa en ventanas para
+// evitar OOM en GPUs con VRAM limitada (ej. RTX 3050 4 GB).
+//
+// Estrategia:
+//   - chunk_frames  : cuántos frames procesar por llamada a decode()
+//   - overlap       : frames del chunk anterior que se re-procesan al inicio
+//                     del siguiente para "calentar" el transformer y las
+//                     convoluciones dilatadas sin artefactos de borde.
+//                     Se descarta del output de cada chunk (excepto el primero).
+//
+// El overlap adecuado es max(rvq_transformer_window_size, 64).
+// Con chunk_frames=0 se elige automáticamente basándose en window_size.
+// ---------------------------------------------------------------------------
+
+bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t n_threads,
+                                 std::vector<float> & audio_out, int32_t chunk_frames) {
+    if (n_frames <= 0) return false;
+
+    const int32_t num_cb  = impl_->quantizer_residual_codebooks + 1;
+    const int32_t win     = impl_->rvq_transformer_window_size;
+
+    // Overlap: suficiente para el transformer (window_size) y las dilated convs (~64 frames).
+    // Se toma el máximo y se redondea a 32 para alineación limpia.
+    const int32_t overlap_raw = std::max(win > 0 ? win : 64, 64);
+    const int32_t overlap     = ((overlap_raw + 31) / 32) * 32;
+
+    // Tamaño de chunk automático si no se especifica: ~120 frames (~2.7 s a 44100/512).
+    // Suficientemente pequeño para caber en ~1 GB de activaciones en Vulkan.
+    if (chunk_frames <= 0) {
+        chunk_frames = std::max(overlap * 2, 120);
+    }
+    // Garantizar que el chunk sea mayor que el overlap
+    if (chunk_frames <= overlap) chunk_frames = overlap * 2;
+
+    std::cerr << "[Codec::decode_chunked] n_frames=" << n_frames
+              << " chunk=" << chunk_frames << " overlap=" << overlap
+              << " num_codebooks=" << num_cb << std::endl;
+
+    audio_out.clear();
+
+    int32_t frame_pos = 0;   // posición actual en el stream de codes
+    bool first_chunk  = true;
+
+    while (frame_pos < n_frames) {
+        // Determinar ventana con overlap del chunk anterior
+        const int32_t chunk_start_with_overlap = first_chunk
+            ? frame_pos
+            : std::max(0, frame_pos - overlap);
+        const int32_t chunk_end = std::min(frame_pos + chunk_frames, n_frames);
+        const int32_t chunk_len = chunk_end - chunk_start_with_overlap;
+
+        // Copiar chunk de codes a buffer contiguo (num_cb, chunk_len) row-major
+        // El layout original es (num_cb, n_frames) — cada codebook ocupa n_frames slots.
+        std::vector<int32_t> chunk_codes(static_cast<size_t>(num_cb) * chunk_len);
+        for (int32_t cb = 0; cb < num_cb; ++cb) {
+            const int32_t * src = codes + static_cast<size_t>(cb) * n_frames + chunk_start_with_overlap;
+            int32_t *       dst = chunk_codes.data() + static_cast<size_t>(cb) * chunk_len;
+            std::copy(src, src + chunk_len, dst);
+        }
+
+        // Decodificar el chunk completo (incluyendo overlap)
+        std::vector<float> chunk_audio;
+        if (!decode(chunk_codes.data(), chunk_len, n_threads, chunk_audio)) {
+            std::cerr << "[Codec::decode_chunked] decode() failed at frame_pos=" << frame_pos << std::endl;
+            return false;
+        }
+
+        // Calcular cuántos samples de audio corresponden al overlap que hay que descartar.
+        // El factor de upsample total = product(decoder_rates) * product(quantizer_downsample_factor).
+        // Más simple: lo inferimos del ratio chunk_audio.size() / chunk_len.
+        const int32_t samples_per_frame = (chunk_len > 0)
+            ? static_cast<int32_t>(chunk_audio.size() / chunk_len)
+            : 512;
+
+        int32_t discard_samples = 0;
+        if (!first_chunk) {
+            discard_samples = overlap * samples_per_frame;
+        }
+
+        // Append al output descartando el overlap inicial
+        if (discard_samples < static_cast<int32_t>(chunk_audio.size())) {
+            audio_out.insert(audio_out.end(),
+                             chunk_audio.begin() + discard_samples,
+                             chunk_audio.end());
+        }
+
+        std::cerr << "[Codec::decode_chunked] chunk [" << chunk_start_with_overlap
+                  << ".." << chunk_end << ") -> " << chunk_audio.size()
+                  << " samples, discarded=" << discard_samples
+                  << ", total_so_far=" << audio_out.size() << std::endl;
+
+        frame_pos   = chunk_end;
+        first_chunk = false;
+    }
+
+    return true;
+}
+
 } // namespace s2

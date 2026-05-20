@@ -205,20 +205,14 @@ std::vector<int32_t> Tokenizer::bpe_encode_word(const std::string & word) const 
 }
 
 // ---------------------------------------------------------------------------
-// Load tokenizer.json
+// Implementacion interna compartida por load() y load_from_memory()
 // ---------------------------------------------------------------------------
-bool Tokenizer::load(const std::string & path) {
-    std::ifstream f(path);
-    if (!f.is_open()) {
-        std::fprintf(stderr, "[s2_tokenizer] failed to open: %s\n", path.c_str());
-        return false;
-    }
-
+bool Tokenizer::load_from_memory(const char * data, size_t size) {
     json j;
     try {
-        f >> j;
+        j = json::parse(data, data + size);
     } catch (const json::parse_error & e) {
-        std::fprintf(stderr, "[s2_tokenizer] JSON parse error: %s\n", e.what());
+        std::fprintf(stderr, "[s2_tokenizer] JSON parse error (memory): %s\n", e.what());
         return false;
     }
 
@@ -288,6 +282,20 @@ bool Tokenizer::load(const std::string & path) {
     config_.eos_id            = token_to_id("<|im_end|>");
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Load tokenizer.json desde disco — wrapper de load_from_memory()
+// ---------------------------------------------------------------------------
+bool Tokenizer::load(const std::string & path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        std::fprintf(stderr, "[s2_tokenizer] failed to open: %s\n", path.c_str());
+        return false;
+    }
+    std::string data((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+    return load_from_memory(data.data(), data.size());
 }
 
 // ---------------------------------------------------------------------------

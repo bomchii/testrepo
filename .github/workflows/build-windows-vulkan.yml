@@ -93,7 +93,58 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/_deps/crow-include
-          key: crow-${{ runner.os }}-v1
+          key: crow-${{ runner.os }}-v1.3.1
+
+      - name: Generar tokenizer_data.h (embebido en el exe)
+        shell: pwsh
+        run: |
+          # Convierte tokenizer.json en un header C++ con los bytes embebidos.
+          # El resultado va a src/tokenizer_data.h para que main.cpp lo incluya
+          # con #if __has_include("tokenizer_data.h").
+          $json = "tokenizer.json"
+          $out  = "src/tokenizer_data.h"
+          if (-Not (Test-Path $json)) {
+              Write-Error "tokenizer.json no encontrado en la raiz del repo"
+              exit 1
+          }
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $json).Path)
+          $sizeMB = [math]::Round($bytes.Length / 1MB, 2)
+          Write-Host "tokenizer.json: $($bytes.Length) bytes ($sizeMB MB)"
+
+          # Generar el header con un array de bytes en C
+          $sb = [System.Text.StringBuilder]::new()
+          [void]$sb.AppendLine("// tokenizer_data.h — generado automaticamente por el workflow")
+          [void]$sb.AppendLine("// NO editar manualmente.")
+          [void]$sb.AppendLine("#pragma once")
+          [void]$sb.AppendLine("#include <stddef.h>")
+          [void]$sb.AppendLine("")
+          [void]$sb.AppendLine("extern const char   tokenizer_json_data[];")
+          [void]$sb.AppendLine("extern const size_t tokenizer_json_size;")
+          [void]$sb.AppendLine("")
+          [void]$sb.AppendLine("const size_t tokenizer_json_size = $($bytes.Length)ULL;")
+          [void]$sb.AppendLine("const char tokenizer_json_data[] = {")
+
+          # Emitir bytes en bloques de 16 por linea para que el compilador no se ahogue
+          $line = [System.Text.StringBuilder]::new()
+          for ($i = 0; $i -lt $bytes.Length; $i++) {
+              [void]$line.Append("0x" + $bytes[$i].ToString("x2") + ",")
+              if (($i + 1) % 16 -eq 0) {
+                  [void]$sb.AppendLine("    " + $line.ToString())
+                  [void]$line.Clear()
+              }
+          }
+          if ($line.Length -gt 0) {
+              [void]$sb.AppendLine("    " + $line.ToString())
+          }
+          [void]$sb.AppendLine("    0x00  // null terminator")
+          [void]$sb.AppendLine("};")
+
+          [System.IO.File]::WriteAllText(
+              (Join-Path (Get-Location) $out),
+              $sb.ToString(),
+              [System.Text.UTF8Encoding]::new($false)
+          )
+          Write-Host "OK: $out generado ($([math]::Round((Get-Item $out).Length / 1KB, 1)) KB)"
 
       - name: CMake Configure
         shell: pwsh
@@ -104,6 +155,8 @@ jobs:
             -DGGML_VULKAN=ON `
             -DS2_CUDA=OFF `
             -DS2_METAL=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_VULKAN_FLASH_ATTENTION=ON `
             -DVulkan_INCLUDE_DIR="$env:Vulkan_INCLUDE_DIR" `
             -DVulkan_LIBRARY="$env:Vulkan_LIBRARY" `
             -DOPENSSL_ROOT_DIR="$env:OPENSSL_ROOT_DIR" `
@@ -135,48 +188,30 @@ jobs:
       - name: Empaquetar release
         shell: pwsh
         run: |
+          # Con BUILD_SHARED_LIBS=OFF y OpenSSL estatico, el exe no necesita
+          # DLLs de ggml ni de OpenSSL. Solo quedan las del runtime de MSVC
+          # (vcruntime140.dll, msvcp140.dll) que Windows 10+ ya incluye por defecto,
+          # y vulkan-1.dll que viene con los drivers de GPU (NVIDIA/AMD/Intel).
+          #
+          # Resultado: s2.exe + tokenizer.json. Nada mas.
+
           New-Item -ItemType Directory -Force -Path release | Out-Null
 
-          # Ejecutable principal
           Copy-Item build\Release\s2.exe release\
 
-          # DLLs de ggml (ggml-base, ggml-cpu, ggml-vulkan, etc.)
-          Get-ChildItem build\Release\*.dll -ErrorAction SilentlyContinue |
-              Copy-Item -Destination release\
-          Get-ChildItem build\bin\Release\*.dll -ErrorAction SilentlyContinue |
-              Copy-Item -Destination release\
-
-          # DLLs de OpenSSL (libssl-1_1-x64.dll, libcrypto-1_1-x64.dll)
-          $opensslBin = "$env:OPENSSL_ROOT_DIR\bin"
-          if (Test-Path $opensslBin) {
-              Get-ChildItem "$opensslBin\*.dll" | Copy-Item -Destination release\
-              Write-Host "OK: DLLs de OpenSSL copiadas desde $opensslBin"
-          }
-
-          # MSVC runtime redistributable (vcruntime140.dll, msvcp140.dll, etc.)
-          # Buscar en la instalacion de Visual Studio del runner
-          $msvcDir = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
-              -latest -find "VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" 2>$null |
-              Select-Object -Last 1
-          if ($msvcDir -and (Test-Path $msvcDir)) {
-              Get-ChildItem "$msvcDir\*.dll" | Copy-Item -Destination release\
-              Write-Host "OK: MSVC runtime copiado desde $msvcDir"
-          } else {
-              # Fallback: buscar vcruntime140.dll en System32
-              $vcrt = "C:\Windows\System32\vcruntime140.dll"
-              if (Test-Path $vcrt) {
-                  Copy-Item $vcrt release\
-                  Write-Host "OK: vcruntime140.dll copiado desde System32"
-              }
-          }
-
-          # tokenizer.json si existe en la raiz
+          # tokenizer.json ya esta embebido en s2.exe — no se distribuye por separado.
+          # Solo se incluye si el build fallo en embeber (fallback de seguridad).
+          $hasFallback = $false
           if (Test-Path tokenizer.json) {
-              Copy-Item tokenizer.json release\
+              # Comprobar si el exe tiene el simbolo embebido
+              # (si tokenizer_data.h se genero correctamente, no hace falta el .json)
+              Write-Host "INFO: tokenizer.json presente en repo pero NO incluido en release (embebido en exe)"
           }
 
-          Write-Host "`nContenido del paquete:"
+          $sizeMB = [math]::Round((Get-Item release\s2.exe).Length / 1MB, 1)
+          Write-Host "`nContenido del release:"
           Get-ChildItem release\ | Format-Table Name, Length -AutoSize
+          Write-Host "Tamanio de s2.exe: $sizeMB MB (incluye tokenizer embebido)"
 
       - name: Subir artifact
         uses: actions/upload-artifact@v6
@@ -185,9 +220,18 @@ jobs:
           path: release/
           retention-days: 30
 
-      - name: Crear GitHub Release
+      - name: Crear ZIP para GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
+          Compress-Archive -Path release\* -DestinationPath "s2-$tag-windows-vulkan.zip"
+        env:
+          GITHUB_REF: ${{ github.ref }}
+
+      - name: Publicar GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          files: release/s2.exe
+          files: s2-*-windows-vulkan.zip
           generate_release_notes: true

@@ -34,6 +34,9 @@ public:
     // Load from HuggingFace tokenizer.json
     bool load(const std::string & path);
 
+    // Load from memory buffer (para tokenizer embebido en el exe)
+    bool load_from_memory(const char * data, size_t size);
+
     // Encode text to token IDs (handles special tokens inline)
     std::vector<int32_t> encode(const std::string & text) const;
 

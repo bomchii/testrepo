@@ -14,16 +14,16 @@ New-Item -ItemType Directory -Force -Path $depsDir | Out-Null
 $crowDir  = "$depsDir\crow-include"
 $crowFile = "$crowDir\crow.h"   # el tarball pone crow.h directamente en include/
 if (-Not (Test-Path $crowFile)) {
-    Write-Host "Descargando Crow v1.2.0 source tarball..."
+    Write-Host "Descargando Crow v1.3.1 source tarball..."
     $crowTar = "$depsDir\crow.tar.gz"
     Invoke-WebRequest `
-        -Uri "https://github.com/CrowCpp/Crow/archive/refs/tags/v1.2.0.tar.gz" `
+        -Uri "https://github.com/CrowCpp/Crow/archive/refs/tags/v1.3.1.tar.gz" `
         -OutFile $crowTar -UseBasicParsing
     # Extraer con tar (disponible en Windows 10+ y en todos los runners de GitHub)
     New-Item -ItemType Directory -Force -Path "$depsDir\crow-extracted" | Out-Null
     tar -xzf $crowTar -C "$depsDir\crow-extracted"
-    # El tarball extrae como Crow-1.2.0/include/crow/
-    $crowSrc = "$depsDir\crow-extracted\Crow-1.2.0\include"
+    # El tarball extrae como Crow-1.3.1/include/crow/
+    $crowSrc = "$depsDir\crow-extracted\Crow-1.3.1\include"
     if (-Not (Test-Path $crowSrc)) {
         # Fallback: buscar include/ en cualquier subdirectorio
         $crowSrc = Get-ChildItem "$depsDir\crow-extracted" -Recurse -Filter "crow.h" |
@@ -195,10 +195,20 @@ if(S2_VULKAN)
 endif()
 
 if(WIN32)
-    target_link_libraries(s2 PRIVATE ws2_32 mswsock)
-    # Linkear OpenSSL (requerido por Asio SSL que Crow incluye)
+    target_link_libraries(s2 PRIVATE ws2_32 mswsock crypt32)
+    # OpenSSL estatico: libssl.lib + libcrypto.lib no requieren DLLs en runtime.
+    # OpenSSL 1.1 instalado via Chocolatey deja las libs estaticas en %OPENSSL_ROOT_DIR%\lib\
     find_package(OpenSSL REQUIRED)
-    target_link_libraries(s2 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    set(_OSSL_LIB \"\$ENV{OPENSSL_ROOT_DIR}/lib\")
+    if(EXISTS \"\${_OSSL_LIB}/libssl.lib\")
+        message(STATUS \"OpenSSL estatico: \${_OSSL_LIB}\")
+        target_link_libraries(s2 PRIVATE
+            \"\${_OSSL_LIB}/libssl.lib\"
+            \"\${_OSSL_LIB}/libcrypto.lib\")
+    else()
+        message(STATUS \"OpenSSL fallback dinamico\")
+        target_link_libraries(s2 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    endif()
     target_compile_definitions(s2 PRIVATE
         WIN32_LEAN_AND_MEAN
         NOMINMAX
