@@ -196,17 +196,19 @@ endif()
 
 if(WIN32)
     target_link_libraries(s2 PRIVATE ws2_32 mswsock crypt32)
-    # OpenSSL estatico: libssl.lib + libcrypto.lib no requieren DLLs en runtime.
-    # OpenSSL 1.1 instalado via Chocolatey deja las libs estaticas en %OPENSSL_ROOT_DIR%\lib\
+    # OpenSSL estatico: usar OPENSSL_LIBRARIES que find_package resuelve
+    # a las libs correctas segun OPENSSL_ROOT_DIR pasado al configure.
     find_package(OpenSSL REQUIRED)
-    set(_OSSL_LIB \"\$ENV{OPENSSL_ROOT_DIR}/lib\")
-    if(EXISTS \"\${_OSSL_LIB}/libssl.lib\")
-        message(STATUS \"OpenSSL estatico: \${_OSSL_LIB}\")
+    # Preferir linkado estatico si existen las .lib estaticas
+    set(_OSSL_STATIC_SSL   "${env:OPENSSL_ROOT_DIR}/lib/libssl.lib")
+    set(_OSSL_STATIC_CRYPT "${env:OPENSSL_ROOT_DIR}/lib/libcrypto.lib")
+    if(EXISTS "${env:OPENSSL_ROOT_DIR}/lib/libssl.lib")
+        message(STATUS "OpenSSL estatico: ${env:OPENSSL_ROOT_DIR}/lib")
         target_link_libraries(s2 PRIVATE
-            \"\${_OSSL_LIB}/libssl.lib\"
-            \"\${_OSSL_LIB}/libcrypto.lib\")
+            "${env:OPENSSL_ROOT_DIR}/lib/libssl.lib"
+            "${env:OPENSSL_ROOT_DIR}/lib/libcrypto.lib")
     else()
-        message(STATUS \"OpenSSL fallback dinamico\")
+        message(STATUS "OpenSSL dinamico (fallback)")
         target_link_libraries(s2 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     endif()
     target_compile_definitions(s2 PRIVATE
