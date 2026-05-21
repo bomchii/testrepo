@@ -98,83 +98,63 @@ jobs:
       - name: Generar tokenizer_data embebido en el exe
         shell: pwsh
         run: |
-          # Estrategia: generar DOS archivos:
-          #   src/tokenizer_data.h   — solo declaraciones extern (include en main.cpp)
-          #   src/tokenizer_data.cpp — definicion del array (compilado UNA SOLA VEZ)
-          #
-          # Tipo: unsigned char[] en vez de char[] — evita C4838/C4309 en MSVC
-          # (narrowing int->char y truncation) que con 12MB generan millones de warnings.
-          # El .cpp se añade automaticamente a S2_SOURCES en CMakeLists.txt via patch-cmake.ps1.
-
           $json = "tokenizer.json"
-          if (-Not (Test-Path $json)) {
-              Write-Error "tokenizer.json no encontrado"
-              exit 1
-          }
+          if (-Not (Test-Path $json)) { Write-Error "tokenizer.json no encontrado"; exit 1 }
 
           $bytes  = [System.IO.File]::ReadAllBytes((Resolve-Path $json).Path)
           $nBytes = $bytes.Length
-          $sizeMB = [math]::Round($nBytes / 1MB, 2)
-          Write-Host "tokenizer.json: $nBytes bytes ($sizeMB MB)"
+          Write-Host "tokenizer.json: $nBytes bytes ($([math]::Round($nBytes/1MB,2)) MB)"
 
-          # ── tokenizer_data.h — solo declaraciones ──────────────────────────
-          $hdr = @"
-
-#pragma once
-#include <stddef.h>
-#ifdef __cplusplus
-extern "C" {
-#endif
-extern const unsigned char tokenizer_json_data[];
-extern const unsigned long long tokenizer_json_size;
-#ifdef __cplusplus
-}
-#endif
-"@
-          [System.IO.File]::WriteAllText(
+          # tokenizer_data.h — solo declaraciones extern
+          # Escribir linea a linea para evitar conflictos YAML/heredoc con comillas
+          $hLines = [System.Collections.Generic.List[string]]::new()
+          $hLines.Add("// tokenizer_data.h -- generado por el workflow. NO editar.")
+          $hLines.Add("#pragma once")
+          $hLines.Add("#include <stddef.h>")
+          $hLines.Add("#ifdef __cplusplus")
+          $hLines.Add("extern `"C`" {")
+          $hLines.Add("#endif")
+          $hLines.Add("extern const unsigned char tokenizer_json_data[];")
+          $hLines.Add("extern const unsigned long long tokenizer_json_size;")
+          $hLines.Add("#ifdef __cplusplus")
+          $hLines.Add("}")
+          $hLines.Add("#endif")
+          [System.IO.File]::WriteAllLines(
               (Join-Path (Get-Location) "src/tokenizer_data.h"),
-              $hdr,
+              $hLines,
               [System.Text.UTF8Encoding]::new($false))
-          Write-Host "OK: src/tokenizer_data.h ($($hdr.Length) bytes)"
+          Write-Host "OK: src/tokenizer_data.h"
 
-          # ── tokenizer_data.cpp — definicion del array ──────────────────────
-          # Usamos unsigned char para evitar warnings de narrowing en MSVC.
-          # #pragma warning disable cubre C4838 y C4309 como seguro adicional.
+          # tokenizer_data.cpp — definicion del array (unsigned char, pragma warnings)
           $sb = [System.Text.StringBuilder]::new($nBytes * 6)
+          $sb.AppendLine("// tokenizer_data.cpp -- generado por el workflow. NO editar.") | Out-Null
+          $sb.AppendLine("#ifdef _MSC_VER")                                               | Out-Null
+          $sb.AppendLine("#  pragma warning(push)")                                        | Out-Null
+          $sb.AppendLine("#  pragma warning(disable: 4838 4309 4365 4267)")                | Out-Null
+          $sb.AppendLine("#endif")                                                         | Out-Null
+          $sb.AppendLine("#include <stddef.h>")                                            | Out-Null
+          $sb.AppendLine("const unsigned long long tokenizer_json_size = ${nBytes}ULL;")   | Out-Null
+          $sb.AppendLine("const unsigned char tokenizer_json_data[] = {")                  | Out-Null
 
-          [void]$sb.AppendLine("// tokenizer_data.cpp — generado por el workflow. NO editar.")
-          [void]$sb.AppendLine("#ifdef _MSC_VER")
-          [void]$sb.AppendLine("#  pragma warning(push)")
-          [void]$sb.AppendLine("#  pragma warning(disable: 4838 4309 4365)")
-          [void]$sb.AppendLine("#endif")
-          [void]$sb.AppendLine("#include <stddef.h>")
-          [void]$sb.AppendLine("// NOLINTBEGIN")
-          [void]$sb.AppendLine("const unsigned long long tokenizer_json_size = ${nBytes}ULL;")
-          [void]$sb.AppendLine("const unsigned char tokenizer_json_data[] = {")
-
-          # Emitir 32 bytes por linea (menos lineas = compilador mas rapido)
           $COLS = 32
           for ($i = 0; $i -lt $nBytes; $i += $COLS) {
-              $end  = [Math]::Min($i + $COLS, $nBytes)
-              $chunk = $bytes[$i..($end-1)]
+              $end   = [Math]::Min($i + $COLS, $nBytes)
+              $chunk = $bytes[$i..($end - 1)]
               $hexes = ($chunk | ForEach-Object { "0x{0:x2}u" -f $_ }) -join ","
-              [void]$sb.AppendLine("    $hexes,")
+              $sb.AppendLine("    $hexes,") | Out-Null
           }
 
-          [void]$sb.AppendLine("    0x00u")
-          [void]$sb.AppendLine("};")
-          [void]$sb.AppendLine("// NOLINTEND")
-          [void]$sb.AppendLine("#ifdef _MSC_VER")
-          [void]$sb.AppendLine("#  pragma warning(pop)")
-          [void]$sb.AppendLine("#endif")
+          $sb.AppendLine("    0x00u")   | Out-Null
+          $sb.AppendLine("};")          | Out-Null
+          $sb.AppendLine("#ifdef _MSC_VER")   | Out-Null
+          $sb.AppendLine("#  pragma warning(pop)") | Out-Null
+          $sb.AppendLine("#endif")      | Out-Null
 
           [System.IO.File]::WriteAllText(
               (Join-Path (Get-Location) "src/tokenizer_data.cpp"),
               $sb.ToString(),
               [System.Text.UTF8Encoding]::new($false))
-
-          $cppKB = [math]::Round((Get-Item "src/tokenizer_data.cpp").Length / 1KB, 1)
-          Write-Host "OK: src/tokenizer_data.cpp ($cppKB KB, $([math]::Round($nBytes/$COLS)) lineas)"
+          Write-Host "OK: src/tokenizer_data.cpp ($([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1KB,1)) KB)"
 
       - name: CMake Configure
         shell: pwsh
