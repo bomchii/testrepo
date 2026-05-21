@@ -127,8 +127,8 @@ jobs:
           $sb.AppendLine("#  pragma warning(disable: 4838 4309 4365 4267)")                | Out-Null
           $sb.AppendLine("#endif")                                                         | Out-Null
           $sb.AppendLine("#include <stddef.h>")                                            | Out-Null
-          $sb.AppendLine("const unsigned long long tokenizer_json_size = ${nBytes}ULL;")   | Out-Null
-          $sb.AppendLine("const unsigned char tokenizer_json_data[] = {")                  | Out-Null
+          $sb.AppendLine("extern const unsigned long long tokenizer_json_size = ${nBytes}ULL;")   | Out-Null
+          $sb.AppendLine("extern const unsigned char tokenizer_json_data[] = {")                  | Out-Null
 
           $COLS = 32
           for ($i = 0; $i -lt $nBytes; $i += $COLS) {
