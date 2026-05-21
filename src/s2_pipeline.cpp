@@ -20,6 +20,9 @@
 
 namespace s2 {
 
+Pipeline::Pipeline()  = default;
+Pipeline::~Pipeline() = default;
+
 // ---------------------------------------------------------------------------
 // TempPcmFile — archivo temporal de PCM crudo en %TEMP% (o /tmp en Linux).
 //

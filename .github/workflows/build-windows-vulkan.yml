@@ -111,14 +111,8 @@ jobs:
           $hLines.Add("// tokenizer_data.h -- generado por el workflow. NO editar.")
           $hLines.Add("#pragma once")
           $hLines.Add("#include <stddef.h>")
-          $hLines.Add("#ifdef __cplusplus")
-          $hLines.Add("extern `"C`" {")
-          $hLines.Add("#endif")
           $hLines.Add("extern const unsigned char tokenizer_json_data[];")
           $hLines.Add("extern const unsigned long long tokenizer_json_size;")
-          $hLines.Add("#ifdef __cplusplus")
-          $hLines.Add("}")
-          $hLines.Add("#endif")
           [System.IO.File]::WriteAllLines(
               (Join-Path (Get-Location) "src/tokenizer_data.h"),
               $hLines,
