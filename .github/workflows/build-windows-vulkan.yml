@@ -119,7 +119,7 @@ jobs:
 
           # ── tokenizer_data.h — solo declaraciones ──────────────────────────
           $hdr = @"
-// tokenizer_data.h — generado por el workflow. NO editar.
+
 #pragma once
 #include <stddef.h>
 #ifdef __cplusplus
