@@ -10,7 +10,9 @@
 #include <gguf.h>
 
 #ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
 #  include <windows.h>
 #else
 #  include <unistd.h>
@@ -633,8 +635,6 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
     // wav_tmp.fp se cierra al destruir — el archivo queda en disco
     return true;
 }
-
-} // namespace s2
 
 // ---------------------------------------------------------------------------
 // float_to_int16 — convierte muestras float32 [-1,1] a int16

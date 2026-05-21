@@ -268,7 +268,7 @@ $opensslLinkBlock
         # CROW_ENABLE_SSL=0 y ASIO_STANDALONE se definen ANTES de cualquier
         # #include en el codigo fuente, incluyendo crow.h
         target_compile_options(s2 PRIVATE
-            /W3 /wd4996 /wd4267 /wd4244 /wd4566 /MP /utf-8
+            /W3 /wd4996 /wd4267 /wd4244 /wd4566 /MP /utf-8 /EHsc
             /DCROW_ENABLE_SSL=0
             /DASIO_STANDALONE
             /DNOMINMAX
