@@ -34,8 +34,9 @@ struct PipelineParams {
     int32_t vulkan_device       = -1;
     int32_t codec_vulkan_device = -1;
 
-    bool    segment_sentences  = false;
-    int32_t codec_chunk_frames = 0;
+    bool    segment_sentences      = false;
+    int32_t codec_chunk_frames     = 0;
+    int32_t max_tokens_per_segment = 300;  // límite de KV cache por segmento; 0 = usar gen.max_new_tokens
 };
 
 struct VoiceCache {

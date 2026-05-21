@@ -1184,11 +1184,21 @@ bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t
 
     // Tamaño de chunk automático si no se especifica: ~120 frames (~2.7 s a 44100/512).
     // Suficientemente pequeño para caber en ~1 GB de activaciones en Vulkan.
-    if (chunk_frames <= 0) {
+    const bool chunk_explicit = (chunk_frames > 0);
+    if (!chunk_explicit) {
         chunk_frames = std::max(overlap * 2, 120);
     }
-    // Garantizar que el chunk sea mayor que el overlap
-    if (chunk_frames <= overlap) chunk_frames = overlap * 2;
+    // Si el usuario especificó un chunk pequeño (p.ej. --codec-chunk 32 para VRAM ajustada),
+    // respetar ese valor y reducir el overlap proporcionalmente en lugar de elevar el chunk.
+    // Si el chunk es automático y resulta <= overlap, sí lo elevamos.
+    if (chunk_frames <= overlap) {
+        if (chunk_explicit) {
+            // Ajustar overlap para dejar al menos 1 frame de avance por chunk
+            overlap = std::max(0, chunk_frames - 1);
+        } else {
+            chunk_frames = overlap * 2;
+        }
+    }
 
     std::cerr << "[Codec::decode_chunked] n_frames=" << n_frames
               << " chunk=" << chunk_frames << " overlap=" << overlap

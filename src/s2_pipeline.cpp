@@ -279,8 +279,14 @@ bool Pipeline::synthesize_segment(
         ref_codes.empty() ? nullptr : ref_codes.data(),
         num_cb, T_prompt);
 
-    // KV cache: reutilizar si cabe
-    int32_t max_seq = prompt.cols + params.gen.max_new_tokens;
+    // KV cache: reutilizar si cabe.
+    // En modo segmentado, limitar max_new_tokens al mínimo necesario para el segmento
+    // para evitar OOM en GPUs con VRAM ajustada (RTX 3050 4GB con modelo+codec en VRAM).
+    int32_t seg_max_tokens = params.gen.max_new_tokens;
+    if (params.max_tokens_per_segment > 0 && params.max_tokens_per_segment < seg_max_tokens) {
+        seg_max_tokens = params.max_tokens_per_segment;
+    }
+    int32_t max_seq = prompt.cols + seg_max_tokens;
     if (!kv_cache_initialized_ || max_seq > kv_cache_max_len_) {
         std::cout << "[KV] Init cache max_seq=" << max_seq << "\n";
         if (!model_.init_kv_cache(max_seq)) {
@@ -292,7 +298,9 @@ bool Pipeline::synthesize_segment(
     }
     model_.reset();
 
-    GenerateResult res = generate(model_, tokenizer_.config(), prompt, params.gen);
+    GenerateParams seg_gen = params.gen;
+    seg_gen.max_new_tokens = seg_max_tokens;
+    GenerateResult res = generate(model_, tokenizer_.config(), prompt, seg_gen);
     if (res.n_frames == 0) {
         std::cerr << "Pipeline error: generate() → 0 frames.\n";
         return false;

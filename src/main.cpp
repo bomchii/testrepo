@@ -90,6 +90,8 @@ int main(int argc, char** argv) {
             params.segment_sentences = true;
         } else if (arg == "--codec-chunk" && i + 1 < argc) {
             params.codec_chunk_frames = std::stoi(argv[++i]);
+        } else if (arg == "--max-seg-tokens" && i + 1 < argc) {
+            params.max_tokens_per_segment = std::stoi(argv[++i]);
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
             port = std::stoi(argv[++i]);
         } else if ((arg == "-threads" || arg == "--threads") && i + 1 < argc) {
@@ -131,6 +133,8 @@ OPCIONES:
   Rendimiento:
          --threads <N>         Hilos CPU para operaciones en CPU (default: 4)
          --max-tokens <N>      Tokens máximos a generar por request (default: 1024)
+         --max-seg-tokens <N>  Tokens máximos por segmento en modo --segment (default: 300)
+                                Reduce el KV cache en GPUs con VRAM ajustada.
 
   Memoria (opciones avanzadas, todas OFF por defecto):
          --segment             Divide el texto en oraciones antes de generar.
@@ -199,6 +203,7 @@ EJEMPLO HTTP:
               << "  Puerto:       " << port << "\n"
               << "  Hilos CPU:    " << params.gen.n_threads << "\n"
               << "  Max tokens:   " << params.gen.max_new_tokens << "\n"
+              << "  Seg tokens:   " << params.max_tokens_per_segment << " (por segmento)\n"
               << "  Segmentacion: " << (params.segment_sentences ? "ON" : "OFF (usa --segment para activar)") << "\n"
               << "  Codec chunk:  " << (params.codec_chunk_frames == 0 ? "auto" : std::to_string(params.codec_chunk_frames) + " frames") << "\n";
 
