@@ -95,56 +95,86 @@ jobs:
           path: build/_deps/crow-include
           key: crow-${{ runner.os }}-v1.3.1
 
-      - name: Generar tokenizer_data.h (embebido en el exe)
+      - name: Generar tokenizer_data embebido en el exe
         shell: pwsh
         run: |
-          # Convierte tokenizer.json en un header C++ con los bytes embebidos.
-          # El resultado va a src/tokenizer_data.h para que main.cpp lo incluya
-          # con #if __has_include("tokenizer_data.h").
+          # Estrategia: generar DOS archivos:
+          #   src/tokenizer_data.h   — solo declaraciones extern (include en main.cpp)
+          #   src/tokenizer_data.cpp — definicion del array (compilado UNA SOLA VEZ)
+          #
+          # Tipo: unsigned char[] en vez de char[] — evita C4838/C4309 en MSVC
+          # (narrowing int->char y truncation) que con 12MB generan millones de warnings.
+          # El .cpp se añade automaticamente a S2_SOURCES en CMakeLists.txt via patch-cmake.ps1.
+
           $json = "tokenizer.json"
-          $out  = "src/tokenizer_data.h"
           if (-Not (Test-Path $json)) {
-              Write-Error "tokenizer.json no encontrado en la raiz del repo"
+              Write-Error "tokenizer.json no encontrado"
               exit 1
           }
-          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $json).Path)
-          $sizeMB = [math]::Round($bytes.Length / 1MB, 2)
-          Write-Host "tokenizer.json: $($bytes.Length) bytes ($sizeMB MB)"
 
-          # Generar el header con un array de bytes en C
-          $sb = [System.Text.StringBuilder]::new()
-          [void]$sb.AppendLine("// tokenizer_data.h — generado automaticamente por el workflow")
-          [void]$sb.AppendLine("// NO editar manualmente.")
-          [void]$sb.AppendLine("#pragma once")
+          $bytes  = [System.IO.File]::ReadAllBytes((Resolve-Path $json).Path)
+          $nBytes = $bytes.Length
+          $sizeMB = [math]::Round($nBytes / 1MB, 2)
+          Write-Host "tokenizer.json: $nBytes bytes ($sizeMB MB)"
+
+          # ── tokenizer_data.h — solo declaraciones ──────────────────────────
+          $hdr = @"
+// tokenizer_data.h — generado por el workflow. NO editar.
+#pragma once
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern const unsigned char tokenizer_json_data[];
+extern const unsigned long long tokenizer_json_size;
+#ifdef __cplusplus
+}
+#endif
+"@
+          [System.IO.File]::WriteAllText(
+              (Join-Path (Get-Location) "src/tokenizer_data.h"),
+              $hdr,
+              [System.Text.UTF8Encoding]::new($false))
+          Write-Host "OK: src/tokenizer_data.h ($($hdr.Length) bytes)"
+
+          # ── tokenizer_data.cpp — definicion del array ──────────────────────
+          # Usamos unsigned char para evitar warnings de narrowing en MSVC.
+          # #pragma warning disable cubre C4838 y C4309 como seguro adicional.
+          $sb = [System.Text.StringBuilder]::new($nBytes * 6)
+
+          [void]$sb.AppendLine("// tokenizer_data.cpp — generado por el workflow. NO editar.")
+          [void]$sb.AppendLine("#ifdef _MSC_VER")
+          [void]$sb.AppendLine("#  pragma warning(push)")
+          [void]$sb.AppendLine("#  pragma warning(disable: 4838 4309 4365)")
+          [void]$sb.AppendLine("#endif")
           [void]$sb.AppendLine("#include <stddef.h>")
-          [void]$sb.AppendLine("")
-          [void]$sb.AppendLine("extern const char   tokenizer_json_data[];")
-          [void]$sb.AppendLine("extern const size_t tokenizer_json_size;")
-          [void]$sb.AppendLine("")
-          [void]$sb.AppendLine("const size_t tokenizer_json_size = $($bytes.Length)ULL;")
-          [void]$sb.AppendLine("const char tokenizer_json_data[] = {")
+          [void]$sb.AppendLine("// NOLINTBEGIN")
+          [void]$sb.AppendLine("const unsigned long long tokenizer_json_size = ${nBytes}ULL;")
+          [void]$sb.AppendLine("const unsigned char tokenizer_json_data[] = {")
 
-          # Emitir bytes en bloques de 16 por linea para que el compilador no se ahogue
-          $line = [System.Text.StringBuilder]::new()
-          for ($i = 0; $i -lt $bytes.Length; $i++) {
-              [void]$line.Append("0x" + $bytes[$i].ToString("x2") + ",")
-              if (($i + 1) % 16 -eq 0) {
-                  [void]$sb.AppendLine("    " + $line.ToString())
-                  [void]$line.Clear()
-              }
+          # Emitir 32 bytes por linea (menos lineas = compilador mas rapido)
+          $COLS = 32
+          for ($i = 0; $i -lt $nBytes; $i += $COLS) {
+              $end  = [Math]::Min($i + $COLS, $nBytes)
+              $chunk = $bytes[$i..($end-1)]
+              $hexes = ($chunk | ForEach-Object { "0x{0:x2}u" -f $_ }) -join ","
+              [void]$sb.AppendLine("    $hexes,")
           }
-          if ($line.Length -gt 0) {
-              [void]$sb.AppendLine("    " + $line.ToString())
-          }
-          [void]$sb.AppendLine("    0x00  // null terminator")
+
+          [void]$sb.AppendLine("    0x00u")
           [void]$sb.AppendLine("};")
+          [void]$sb.AppendLine("// NOLINTEND")
+          [void]$sb.AppendLine("#ifdef _MSC_VER")
+          [void]$sb.AppendLine("#  pragma warning(pop)")
+          [void]$sb.AppendLine("#endif")
 
           [System.IO.File]::WriteAllText(
-              (Join-Path (Get-Location) $out),
+              (Join-Path (Get-Location) "src/tokenizer_data.cpp"),
               $sb.ToString(),
-              [System.Text.UTF8Encoding]::new($false)
-          )
-          Write-Host "OK: $out generado ($([math]::Round((Get-Item $out).Length / 1KB, 1)) KB)"
+              [System.Text.UTF8Encoding]::new($false))
+
+          $cppKB = [math]::Round((Get-Item "src/tokenizer_data.cpp").Length / 1KB, 1)
+          Write-Host "OK: src/tokenizer_data.cpp ($cppKB KB, $([math]::Round($nBytes/$COLS)) lineas)"
 
       - name: CMake Configure
         shell: pwsh

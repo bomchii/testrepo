@@ -206,8 +206,8 @@ EJEMPLO HTTP:
 #ifdef S2_TOKENIZER_EMBEDDED
     // Tokenizer embebido: usar los bytes del array generado por el workflow.
     // No se necesita tokenizer.json en disco.
-    params.tokenizer_data      = tokenizer_json_data;
-    params.tokenizer_data_size = tokenizer_json_size;
+    params.tokenizer_data      = reinterpret_cast<const char*>(tokenizer_json_data);
+    params.tokenizer_data_size = static_cast<size_t>(tokenizer_json_size);
     std::cout << "  Tokenizer:    [embebido en el exe, "
               << tokenizer_json_size << " bytes]" << std::endl;
 #else

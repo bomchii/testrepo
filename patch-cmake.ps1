@@ -218,7 +218,23 @@ set(S2_SOURCES
     src/main.cpp
 )
 
+# tokenizer_data.cpp generado por el workflow (unsigned char[], ~12MB).
+# Se incluye solo si existe — build local sin workflow usa tokenizer.json en disco.
+if(EXISTS "`${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer_data.cpp")
+    list(APPEND S2_SOURCES src/tokenizer_data.cpp)
+    message(STATUS "tokenizer embebido: src/tokenizer_data.cpp incluido")
+else()
+    message(STATUS "tokenizer: se usara tokenizer.json en disco (build local)")
+endif()
+
 add_executable(s2 `${S2_SOURCES})
+
+# Suprimir warnings C4838/C4309/C4365 solo para tokenizer_data.cpp
+# (narrowing/truncation en el array de bytes — son inofensivos con unsigned char)
+if(MSVC AND EXISTS "`${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer_data.cpp")
+    set_source_files_properties(src/tokenizer_data.cpp PROPERTIES
+        COMPILE_FLAGS "/wd4838 /wd4309 /wd4365 /wd4267")
+endif()
 
 target_include_directories(s2 PRIVATE
     `${CMAKE_CURRENT_SOURCE_DIR}/include
