@@ -58,33 +58,6 @@ jobs:
       # soporte coopmat, y el Vulkan SDK actual los detecta como disponibles,
       # causando una discrepancia entre el .hpp y el .cpp.
 
-      - name: Instalar OpenSSL
-        shell: pwsh
-        run: |
-          # OpenSSL 3.x rompe Asio (asn1_string_st opaco). Usar OpenSSL 1.1.
-          choco install openssl --version=1.1.1.2100 --yes --no-progress
-          $candidates = @(
-            "C:\Program Files\OpenSSL-Win64",
-            "C:\Program Files\OpenSSL",
-            "C:\OpenSSL-Win64",
-            "C:\OpenSSL"
-          )
-          $found = $candidates | Where-Object { Test-Path "$_\include\openssl\conf.h" } | Select-Object -First 1
-          if (-Not $found) {
-            $found = Get-ChildItem "C:\" -Recurse -Filter "conf.h" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.FullName -match "openssl" } |
-                     Select-Object -First 1 |
-                     ForEach-Object { $_.DirectoryName -replace "\\openssl$","" }
-          }
-          if ($found) {
-            Write-Host "OK: OpenSSL 1.1 en $found"
-            echo "OPENSSL_ROOT_DIR=$found"            >> $env:GITHUB_ENV
-            echo "OPENSSL_INCLUDE_DIR=$found\include" >> $env:GITHUB_ENV
-            echo "$found\bin"                          >> $env:GITHUB_PATH
-          } else {
-            Write-Error "OpenSSL no encontrado"; exit 1
-          }
-
       - name: Parchear CMakeLists.txt para Windows
         shell: pwsh
         run: pwsh -File patch-cmake.ps1
@@ -163,9 +136,6 @@ jobs:
             -DGGML_VULKAN_FLASH_ATTENTION=ON `
             -DVulkan_INCLUDE_DIR="$env:Vulkan_INCLUDE_DIR" `
             -DVulkan_LIBRARY="$env:Vulkan_LIBRARY" `
-            -DOPENSSL_ROOT_DIR="$env:OPENSSL_ROOT_DIR" `
-            -DOPENSSL_INCLUDE_DIR="$env:OPENSSL_INCLUDE_DIR" `
-            "-DCMAKE_CXX_FLAGS=/I`"$env:OPENSSL_INCLUDE_DIR`"" `
             -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=OFF `
             -DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT=OFF `
             -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=OFF
@@ -192,12 +162,12 @@ jobs:
       - name: Empaquetar release
         shell: pwsh
         run: |
-          # Con BUILD_SHARED_LIBS=OFF y OpenSSL estatico, el exe no necesita
+          # Con BUILD_SHARED_LIBS=OFF y CROW_ENABLE_SSL=0, el exe no necesita
           # DLLs de ggml ni de OpenSSL. Solo quedan las del runtime de MSVC
           # (vcruntime140.dll, msvcp140.dll) que Windows 10+ ya incluye por defecto,
           # y vulkan-1.dll que viene con los drivers de GPU (NVIDIA/AMD/Intel).
           #
-          # Resultado: s2.exe + tokenizer.json. Nada mas.
+          # Resultado: s2.exe standalone. Sin DLLs adicionales.
 
           New-Item -ItemType Directory -Force -Path release | Out-Null
 

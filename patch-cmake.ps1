@@ -100,49 +100,9 @@ endfunction()
 # crow-include/crow/, el compilador encuentra crow-include/crow/crow.h. OK.
 # CROW_ENABLE_SSL=0 evita todo el codigo SSL en los headers originales de Crow.
 
-# Resolver linkado de OpenSSL ANTES de escribir el CMakeLists.txt
-# Usamos .Replace() de .NET (literal, no regex) para convertir backslashes
-# -replace en PowerShell usa regex donde \P es escape invalido con "Program Files"
-$opensslRoot  = $env:OPENSSL_ROOT_DIR.Replace('\', '/')
-
-# Chocolatey instala OpenSSL con libs en dos posibles ubicaciones:
-#   lib/VC/x64/MD/libssl.lib   (OpenSSL 1.1 via choco)
-#   lib/libssl.lib              (otras instalaciones)
-$sslLibMD     = "$opensslRoot/lib/VC/x64/MD/libssl.lib"
-$cryptoLibMD  = "$opensslRoot/lib/VC/x64/MD/libcrypto.lib"
-$sslLibFlat   = "$opensslRoot/lib/libssl.lib"
-$cryptoLibFlat= "$opensslRoot/lib/libcrypto.lib"
-
-Write-Host "OpenSSL root: $opensslRoot"
-
-if ((Test-Path $sslLibMD) -and (Test-Path $cryptoLibMD)) {
-    $sslLib    = $sslLibMD
-    $cryptoLib = $cryptoLibMD
-    Write-Host "OK: OpenSSL estatico (VC/x64/MD) -> $sslLib"
-} elseif ((Test-Path $sslLibFlat) -and (Test-Path $cryptoLibFlat)) {
-    $sslLib    = $sslLibFlat
-    $cryptoLib = $cryptoLibFlat
-    Write-Host "OK: OpenSSL estatico (lib/) -> $sslLib"
-} else {
-    $sslLib    = $null
-    $cryptoLib = $null
-    Write-Host "WARN: libssl.lib no encontrado — usando OpenSSL dinamico"
-}
-
-if ($sslLib) {
-    $opensslLinkBlock = @"
-    # OpenSSL estatico (resuelto por patch-cmake.ps1 — choco install openssl)
-    target_link_libraries(s2 PRIVATE
-        "$sslLib"
-        "$cryptoLib")
-"@
-} else {
-    $opensslLinkBlock = @"
-    # OpenSSL dinamico (fallback — libssl.lib no encontrado)
-    find_package(OpenSSL REQUIRED)
-    target_link_libraries(s2 PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-"@
-}
+# Con CROW_ENABLE_SSL=0, Crow/Asio no generan ninguna referencia a OpenSSL.
+# No se necesita linkar contra libssl ni libcrypto.
+$opensslLinkBlock = ""
 
 $newCmake = @"
 cmake_minimum_required(VERSION 3.14)
