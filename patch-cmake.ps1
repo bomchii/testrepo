@@ -53,20 +53,42 @@ if (-Not (Test-Path $asioFile)) {
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
     Remove-Item $asioZip -Force
-    # Eliminar asio/ssl/ — contiene openssl_types.hpp que requiere OpenSSL instalado.
-    # Con CROW_ENABLE_SSL=0 y ASIO_STANDALONE no se necesita SSL en Asio.
-    if (Test-Path "$asioDir\asio\ssl") {
-        Remove-Item "$asioDir\asio\ssl" -Recurse -Force
-        Write-Host "OK: asio/ssl/ eliminado (no necesario con CROW_ENABLE_SSL=0)"
+    # Reemplazar asio/ssl.hpp y asio/ssl/ con stubs vacíos.
+    # Crow puede incluir asio/ssl.hpp aunque CROW_ENABLE_SSL=0 esté definido,
+    # porque algunos headers de Crow lo incluyen antes de que la macro sea visible.
+    # Un stub vacío con include guard evita el error C1083 sin romper nada.
+    $sslStubDir = "$asioDir\asio\ssl"
+    New-Item -ItemType Directory -Force -Path $sslStubDir | Out-Null
+    # asio/ssl.hpp stub
+    @"
+#pragma once
+// Stub: SSL deshabilitado (CROW_ENABLE_SSL=0, sin OpenSSL)
+"@ | Set-Content -Encoding UTF8 "$asioDir\asio\ssl.hpp"
+    # Stubs para los headers individuales que ssl.hpp incluye
+    foreach ($stub in @("context.hpp","stream.hpp","error.hpp","rfc2818_verification.hpp","verify_mode.hpp")) {
+        @"
+#pragma once
+// Stub: SSL deshabilitado
+"@ | Set-Content -Encoding UTF8 "$sslStubDir\$stub"
     }
+    Write-Host "OK: asio/ssl/ reemplazado con stubs vacios"
     Write-Host "OK: Asio headers en $asioDir"
 } else {
     Write-Host "OK: Asio headers presentes (cache)"
-    # Limpiar ssl/ si quedó de una descarga anterior (puede aparecer en cache)
-    if (Test-Path "$asioDir\asio\ssl") {
-        Remove-Item "$asioDir\asio\ssl" -Recurse -Force
-        Write-Host "OK: asio/ssl/ eliminado del cache"
+    # Garantizar stubs incluso en cache (por si el cache tiene los originales)
+    $sslStubDir = "$asioDir\asio\ssl"
+    New-Item -ItemType Directory -Force -Path $sslStubDir | Out-Null
+    @"
+#pragma once
+// Stub: SSL deshabilitado (CROW_ENABLE_SSL=0, sin OpenSSL)
+"@ | Set-Content -Encoding UTF8 "$asioDir\asio\ssl.hpp"
+    foreach ($stub in @("context.hpp","stream.hpp","error.hpp","rfc2818_verification.hpp","verify_mode.hpp")) {
+        @"
+#pragma once
+// Stub: SSL deshabilitado
+"@ | Set-Content -Encoding UTF8 "$sslStubDir\$stub"
     }
+    Write-Host "OK: asio/ssl/ stubs garantizados en cache"
 }
 
 # Rutas con / para CMake (\a, \t etc. son escapes invalidos en CMake)
