@@ -1180,7 +1180,7 @@ bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t
     // Overlap: suficiente para el transformer (window_size) y las dilated convs (~64 frames).
     // Se toma el máximo y se redondea a 32 para alineación limpia.
     const int32_t overlap_raw = std::max(win > 0 ? win : 64, 64);
-    const int32_t overlap     = ((overlap_raw + 31) / 32) * 32;
+    int32_t       overlap     = ((overlap_raw + 31) / 32) * 32;
 
     // Tamaño de chunk automático si no se especifica: ~120 frames (~2.7 s a 44100/512).
     // Suficientemente pequeño para caber en ~1 GB de activaciones en Vulkan.
