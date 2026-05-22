@@ -62,7 +62,7 @@ if (-Not (Test-Path $asioFile)) {
     # asio/ssl.hpp stub
     @"
 #pragma once
-// Stub: SSL deshabilitado (CROW_ENABLE_SSL=0, sin OpenSSL)
+// Stub: SSL deshabilitado (sin OpenSSL — CROW_ENABLE_SSL no definido)
 "@ | Set-Content -Encoding UTF8 "$asioDir\asio\ssl.hpp"
     # Stubs para los headers individuales que ssl.hpp incluye
     foreach ($stub in @("context.hpp","stream.hpp","error.hpp","rfc2818_verification.hpp","verify_mode.hpp")) {
@@ -80,7 +80,7 @@ if (-Not (Test-Path $asioFile)) {
     New-Item -ItemType Directory -Force -Path $sslStubDir | Out-Null
     @"
 #pragma once
-// Stub: SSL deshabilitado (CROW_ENABLE_SSL=0, sin OpenSSL)
+// Stub: SSL deshabilitado (sin OpenSSL — CROW_ENABLE_SSL no definido)
 "@ | Set-Content -Encoding UTF8 "$asioDir\asio\ssl.hpp"
     foreach ($stub in @("context.hpp","stream.hpp","error.hpp","rfc2818_verification.hpp","verify_mode.hpp")) {
         @"
@@ -131,9 +131,10 @@ endfunction()
 # ── 4. Reescribir CMakeLists.txt raiz ────────────────────────────────────────
 # main.cpp hace #include <crow.h> — con el include dir apuntando a
 # crow-include/crow/, el compilador encuentra crow-include/crow/crow.h. OK.
-# CROW_ENABLE_SSL=0 evita todo el codigo SSL en los headers originales de Crow.
+# Crow usa #ifdef CROW_ENABLE_SSL para activar SSL. La forma correcta de
+# desactivarlo es NO definir la macro — definirla con valor 0 la activa igualmente.
 
-# Con CROW_ENABLE_SSL=0, Crow/Asio no generan ninguna referencia a OpenSSL.
+# Sin CROW_ENABLE_SSL definido, Crow/Asio no generan referencias a OpenSSL.
 # No se necesita linkar contra libssl ni libcrypto.
 $opensslLinkBlock = ""
 
@@ -254,15 +255,14 @@ $opensslLinkBlock
         WIN32_LEAN_AND_MEAN
         NOMINMAX
         _WIN32_WINNT=0x0A00
-        CROW_ENABLE_SSL=0
         ASIO_STANDALONE)
     if(MSVC)
         # /FI fuerza un include al inicio de cada TU — garantiza que
-        # CROW_ENABLE_SSL=0 y ASIO_STANDALONE se definen ANTES de cualquier
-        # #include en el codigo fuente, incluyendo crow.h
+        # ASIO_STANDALONE se define ANTES de cualquier #include en el codigo fuente.
+        # CROW_ENABLE_SSL no se define — con #ifdef, definirlo con valor 0
+        # activa el bloque SSL igualmente. La ausencia de la macro lo desactiva.
         target_compile_options(s2 PRIVATE
             /W3 /wd4996 /wd4267 /wd4244 /wd4566 /MP /utf-8 /EHsc
-            /DCROW_ENABLE_SSL=0
             /DASIO_STANDALONE
             /DNOMINMAX
             /DWIN32_LEAN_AND_MEAN
