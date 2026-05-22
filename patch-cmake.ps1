@@ -53,9 +53,20 @@ if (-Not (Test-Path $asioFile)) {
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
     Remove-Item $asioZip -Force
+    # Eliminar asio/ssl/ — contiene openssl_types.hpp que requiere OpenSSL instalado.
+    # Con CROW_ENABLE_SSL=0 y ASIO_STANDALONE no se necesita SSL en Asio.
+    if (Test-Path "$asioDir\asio\ssl") {
+        Remove-Item "$asioDir\asio\ssl" -Recurse -Force
+        Write-Host "OK: asio/ssl/ eliminado (no necesario con CROW_ENABLE_SSL=0)"
+    }
     Write-Host "OK: Asio headers en $asioDir"
 } else {
     Write-Host "OK: Asio headers presentes (cache)"
+    # Limpiar ssl/ si quedó de una descarga anterior (puede aparecer en cache)
+    if (Test-Path "$asioDir\asio\ssl") {
+        Remove-Item "$asioDir\asio\ssl" -Recurse -Force
+        Write-Host "OK: asio/ssl/ eliminado del cache"
+    }
 }
 
 # Rutas con / para CMake (\a, \t etc. son escapes invalidos en CMake)
