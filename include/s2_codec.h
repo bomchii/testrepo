@@ -25,6 +25,10 @@ public:
     // Load codec from GGUF (unified or standalone). vulkan_device=-1 = CPU only.
     bool load(const std::string & gguf_path, int32_t vulkan_device = -1);
 
+    // Libera backend, pesos y buffer — necesario antes de recargar en otro device
+    // para evitar memory leak de VRAM cuando el backend anterior no se destruye.
+    void unload();
+
     // Encode mono float32 audio to VQ codes. Returns (num_codebooks, T) flattened row-major.
     bool encode(const float * audio, int32_t n_samples, int32_t n_threads,
                 std::vector<int32_t> & codes_out, int32_t & n_frames_out);

@@ -689,6 +689,17 @@ AudioCodec::~AudioCodec() {
 }
 
 // ---------------------------------------------------------------------------
+// unload()
+// ---------------------------------------------------------------------------
+
+void AudioCodec::unload() {
+    if (!impl_) return;
+    if (impl_->ctx_w)     { ggml_free(impl_->ctx_w);                  impl_->ctx_w     = nullptr; }
+    if (impl_->model_buf) { ggml_backend_buffer_free(impl_->model_buf); impl_->model_buf = nullptr; }
+    if (impl_->backend)   { ggml_backend_free(impl_->backend);          impl_->backend   = nullptr; }
+}
+
+// ---------------------------------------------------------------------------
 // load()
 // ---------------------------------------------------------------------------
 
@@ -1180,25 +1191,15 @@ bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t
     // Overlap: suficiente para el transformer (window_size) y las dilated convs (~64 frames).
     // Se toma el máximo y se redondea a 32 para alineación limpia.
     const int32_t overlap_raw = std::max(win > 0 ? win : 64, 64);
-    int32_t       overlap     = ((overlap_raw + 31) / 32) * 32;
+    const int32_t overlap     = ((overlap_raw + 31) / 32) * 32;
 
     // Tamaño de chunk automático si no se especifica: ~120 frames (~2.7 s a 44100/512).
     // Suficientemente pequeño para caber en ~1 GB de activaciones en Vulkan.
-    const bool chunk_explicit = (chunk_frames > 0);
-    if (!chunk_explicit) {
+    if (chunk_frames <= 0) {
         chunk_frames = std::max(overlap * 2, 120);
     }
-    // Si el usuario especificó un chunk pequeño (p.ej. --codec-chunk 32 para VRAM ajustada),
-    // respetar ese valor y reducir el overlap proporcionalmente en lugar de elevar el chunk.
-    // Si el chunk es automático y resulta <= overlap, sí lo elevamos.
-    if (chunk_frames <= overlap) {
-        if (chunk_explicit) {
-            // Ajustar overlap para dejar al menos 1 frame de avance por chunk
-            overlap = std::max(0, chunk_frames - 1);
-        } else {
-            chunk_frames = overlap * 2;
-        }
-    }
+    // Garantizar que el chunk sea mayor que el overlap
+    if (chunk_frames <= overlap) chunk_frames = overlap * 2;
 
     std::cerr << "[Codec::decode_chunked] n_frames=" << n_frames
               << " chunk=" << chunk_frames << " overlap=" << overlap

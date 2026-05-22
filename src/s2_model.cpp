@@ -831,3 +831,23 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
 }
 
 } // namespace s2
+
+// ---------------------------------------------------------------------------
+// free_kv_cache() — implementación añadida por s2.cpp fork
+// Libera el buffer de KV cache de VRAM/RAM para dar espacio al codec decode.
+// Declarada en s2_model.h pero no implementada en el original de mach92432.
+// ---------------------------------------------------------------------------
+namespace s2 {
+void SlowARModel::free_kv_cache() {
+    if (kv_buf_) {
+        ggml_backend_buffer_free(kv_buf_);
+        kv_buf_ = nullptr;
+    }
+    if (ctx_kv_) {
+        ggml_free(ctx_kv_);
+        ctx_kv_ = nullptr;
+    }
+    memory_k_ = nullptr;
+    memory_v_ = nullptr;
+}
+} // namespace s2

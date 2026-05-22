@@ -311,12 +311,20 @@ bool Pipeline::synthesize_segment(
         return false;
     }
 
+    // Liberar el KV cache inmediatamente después de generate() para recuperar
+    // VRAM antes de que decode_chunked() intente allocar sus activaciones.
+    // El siguiente segmento lo reinicializará con init_kv_cache().
+    model_.free_kv_cache();
+    kv_cache_initialized_ = false;
+    kv_cache_max_len_     = 0;
+
     if (!codec_.decode_chunked(res.codes.data(), res.n_frames,
                                params.gen.n_threads, audio_out,
                                params.codec_chunk_frames)) {
         // Si el codec estaba en GPU y falló (OOM), intentar una sola vez en CPU.
         if (!codec_on_cpu_) {
-            std::cerr << "[Codec] GPU decode failed — recargando en CPU y reintentando...\n";
+            std::cerr << "[Codec] GPU decode failed — liberando VRAM y recargando en CPU...\n";
+            codec_.unload();  // libera backend Vulkan + VRAM antes de crear backend CPU
             if (codec_.load(codec_path_, -1)) {
                 codec_on_cpu_ = true;
                 std::cout << "[Codec] Recargado en CPU.\n";
