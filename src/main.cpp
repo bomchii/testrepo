@@ -314,24 +314,24 @@ HTTP EXAMPLE:
         return d < 0 ? "CPU" : ("GPU " + std::to_string(d));
     };
 
-    std::cout << "\nConfiguracion:\n"
-              << "  Modelo:       " << params.model_path << "\n"
-              << "  Codec:        " << (params.codec_model_path.empty() ? params.model_path : params.codec_model_path) << "\n"
-              << "  Modelo GPU:   " << gpu_str(params.vulkan_device) << "\n"
-              << "  Codec GPU:    " << gpu_str(params.codec_vulkan_device) << "\n"
-              << "  Puerto:       " << port << "\n"
-              << "  Hilos CPU:    " << params.gen.n_threads << "\n"
-              << "  Max tokens:   " << params.gen.max_new_tokens << "\n"
-              << "  Seg tokens:   " << params.max_tokens_per_segment << " (por segmento)\n"
-              << "  Segmentacion: " << (params.segment_sentences ? "ON" : "OFF (usa --segment para activar)") << "\n"
-              << "  Codec chunk:  " << (params.codec_chunk_frames == 0 ? "auto" : std::to_string(params.codec_chunk_frames) + " frames") << "\n"
-              << "  Codec overlap:" << params.codec_overlap_frames << " frames\n"
-              << "  Min seg chars:" << (params.min_seg_chars == 0 ? "off" : std::to_string(params.min_seg_chars) + " chars") << "\n"
-              << "  Temperature:  " << params.gen.temperature << "\n"
+    std::cout << "\nConfiguration:\n"
+              << "  Model:         " << params.model_path << "\n"
+              << "  Codec:         " << (params.codec_model_path.empty() ? params.model_path : params.codec_model_path) << "\n"
+              << "  Model GPU:     " << gpu_str(params.vulkan_device) << "\n"
+              << "  Codec GPU:     " << gpu_str(params.codec_vulkan_device) << "\n"
+              << "  Port:          " << port << "\n"
+              << "  CPU threads:   " << params.gen.n_threads << "\n"
+              << "  Max tokens:    " << params.gen.max_new_tokens << "\n"
+              << "  Seg tokens:    " << params.max_tokens_per_segment << " (per segment)\n"
+              << "  Segmentation:  " << (params.segment_sentences ? "ON" : "OFF (use --segment to enable)") << "\n"
+              << "  Codec chunk:   " << (params.codec_chunk_frames == 0 ? "auto" : std::to_string(params.codec_chunk_frames) + " frames") << "\n"
+              << "  Codec overlap: " << params.codec_overlap_frames << " frames\n"
+              << "  Min seg chars: " << (params.min_seg_chars == 0 ? "off" : std::to_string(params.min_seg_chars) + " chars") << "\n"
+              << "  Temperature:   " << params.gen.temperature << "\n"
               << "  Top-p:        " << params.gen.top_p << "\n"
               << "  Top-k:        " << params.gen.top_k << "\n"
-              << "  RAS window:   " << params.gen.ras_window_size << " tokens\n"
-              << "  RAS temp:     " << params.gen.ras_high_temp << "\n";
+              << "  RAS window:    " << params.gen.ras_window_size << " tokens\n"
+              << "  RAS temp:      " << params.gen.ras_high_temp << "\n";
 
     // --- Charger le modèle ---
     s2::Pipeline pipeline;
@@ -341,7 +341,7 @@ HTTP EXAMPLE:
     // No se necesita tokenizer.json en disco.
     params.tokenizer_data      = reinterpret_cast<const char*>(tokenizer_json_data);
     params.tokenizer_data_size = static_cast<size_t>(tokenizer_json_size);
-    std::cout << "  Tokenizer:    [embebido en el exe, "
+    std::cout << "  Tokenizer:     [embedded in exe, "
               << tokenizer_json_size << " bytes]" << std::endl;
 #else
     std::cout << "  Tokenizer:    " << params.tokenizer_path << std::endl;
@@ -435,7 +435,7 @@ HTTP EXAMPLE:
             std::thread([path_copy]() {
                 std::this_thread::sleep_for(std::chrono::seconds(5));
                 std::remove(path_copy.c_str());
-                std::cout << "[Cleanup] Borrado temp: " << path_copy << "\n";
+                std::cout << "[Cleanup] Deleted temp: " << path_copy << "\n";
             }).detach();
         }
 
@@ -539,10 +539,10 @@ HTTP EXAMPLE:
     // ================================================================
     CROW_WEBSOCKET_ROUTE(app, "/ws/tts")
     .onopen([](crow::websocket::connection& conn) {
-        std::cout << "[WS] Cliente conectado: " << conn.get_remote_ip() << "\n";
+        std::cout << "[WS] Client connected: " << conn.get_remote_ip() << "\n";
     })
     .onclose([](crow::websocket::connection& conn, const std::string& reason, uint16_t) {
-        std::cout << "[WS] Cliente desconectado: " << reason << "\n";
+        std::cout << "[WS] Client disconnected: " << reason << "\n";
     })
     .onmessage([&](crow::websocket::connection& conn,
                    const std::string& data,
@@ -592,7 +592,7 @@ HTTP EXAMPLE:
                 segment_count++;
                 return true; // continuar generando
             } catch (...) {
-                std::cerr << "[WS] Error enviando segmento — cliente desconectado?\n";
+                std::cerr << "[WS] Error sending segment — client disconnected?\n";
                 return false; // abortar generación
             }
         };
@@ -618,9 +618,9 @@ HTTP EXAMPLE:
               << "  POST /v1/audio/speech  (OpenAI compatible)\n"
               << "  GET  /v1/models\n"
               << "  GET  /health\n"
-              << "  WS   /ws/tts           (streaming por segmentos — latencia minima)\n\n";
+              << "  WS   /ws/tts           (streaming — minimum latency)\n\n";
 
-    std::cout << "Servidor en puerto " << port << "...\n";
+    std::cout << "Server listening on port " << port << "...\n";
     app.port(port).multithreaded().run();
     return 0;
 }

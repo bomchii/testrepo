@@ -40,8 +40,17 @@ struct TempPcmFile {
 #ifdef _WIN32
         wchar_t tmp_dir[MAX_PATH];
         GetTempPathW(MAX_PATH, tmp_dir);
+        // GetTempFileNameW crea un archivo con extensión .tmp — lo renombramos
+        // a .wav para que Crow sirva el MIME type correcto (audio/wav).
+        wchar_t tmp_base[MAX_PATH];
+        GetTempFileNameW(tmp_dir, L"s2_", 0, tmp_base);
+        // Construir ruta .wav: reemplazar extensión .tmp por .wav
         wchar_t tmp_file[MAX_PATH];
-        GetTempFileNameW(tmp_dir, L"s2_", 0, tmp_file);
+        wcsncpy_s(tmp_file, tmp_base, MAX_PATH);
+        wchar_t * ext = wcsrchr(tmp_file, L'.');
+        if (ext) wcscpy_s(ext, 5, L".wav");
+        // Renombrar el archivo que Windows ya creó
+        _wrename(tmp_base, tmp_file);
         // Convertir a UTF-8 para almacenar
         int n = WideCharToMultiByte(CP_UTF8, 0, tmp_file, -1, nullptr, 0, nullptr, nullptr);
         path.resize(n - 1);
@@ -182,7 +191,7 @@ std::vector<std::string> Pipeline::split_sentences(const std::string & text,
 // init
 // ---------------------------------------------------------------------------
 bool Pipeline::init(const PipelineParams & params) {
-    std::cout << "--- Pipeline Init ---" << std::endl;
+    std::cout << "--- Pipeline init ---" << std::endl;
 
     int model_gpu = params.vulkan_device;
     int codec_gpu = params.codec_vulkan_device;
@@ -221,7 +230,7 @@ bool Pipeline::init(const PipelineParams & params) {
         codec_ok = true;
     }
     if (!codec_ok && codec_.load(codec_path, -1)) {
-        std::cout << "Codec loaded (CPU fallback).\n";
+        std::cout << "Codec loaded (CPU).\n";
         codec_ok = true;
     }
     if (!codec_ok) {
@@ -310,7 +319,7 @@ bool Pipeline::synthesize_segment(
     seg_gen.max_new_tokens = seg_max_tokens;
     GenerateResult res = generate(model_, tokenizer_.config(), prompt, seg_gen);
     if (res.n_frames == 0) {
-        std::cerr << "Pipeline error: generate() → 0 frames.\n";
+        std::cerr << "Pipeline error: generate() returned 0 frames.\n";
         return false;
     }
 
@@ -327,8 +336,8 @@ bool Pipeline::synthesize_segment(
                                params.codec_overlap_frames)) {
         // El codec q4_k_m no es compatible con backend CPU (GGML_ASSERT F16 en ops.cpp).
         // Si falla en GPU es OOM — reportar directamente sin intentar fallback CPU.
-        std::cerr << "Pipeline error: decode_chunked() failed (OOM en GPU).\n";
-        std::cerr << "  Intenta reducir --codec-chunk o usar --codec-vulkan -1 con codec f16/f32.\n";
+        std::cerr << "Pipeline error: decode_chunked() failed (GPU OOM).\n";
+        std::cerr << "  Try reducing --codec-chunk, or use --codec-vulkan -1 with an f16/f32 codec.\n";
         return false;
     }
     return true;
@@ -371,10 +380,10 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
     }
 
     // 4. Encodear y guardar en caché
-    std::cout << "[VoiceCache] MISS — encodando: " << params.prompt_audio_path << "\n";
+    std::cout << "[VoiceCache] MISS — encoding: " << params.prompt_audio_path << "\n";
     AudioData ra;
     if (!load_audio(params.prompt_audio_path, ra, codec_.sample_rate())) {
-        std::cerr << "[VoiceCache] Error cargando audio: " << params.prompt_audio_path << "\n";
+        std::cerr << "[VoiceCache] Error loading audio: " << params.prompt_audio_path << "\n";
         out_codes.clear(); out_T_prompt = 0;
         return true; // no es fatal — genera sin referencia
     }
@@ -383,7 +392,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
     int32_t T_prompt = 0;
     if (!codec_.encode(ra.samples.data(), (int32_t)ra.samples.size(),
                        params.gen.n_threads, codes, T_prompt)) {
-        std::cerr << "[VoiceCache] Error encodando audio de referencia.\n";
+        std::cerr << "[VoiceCache] Error encoding reference audio.\n";
         out_codes.clear(); out_T_prompt = 0;
         return true;
     }
@@ -402,7 +411,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
     voice_cache_[params.prompt_audio_path] = std::move(entry);
     voice_cache_order_.push_back(params.prompt_audio_path);
 
-    std::cout << "[VoiceCache] Cacheado (" << voice_cache_.size()
+    std::cout << "[VoiceCache] Cached (" << voice_cache_.size()
               << "/" << VOICE_CACHE_MAX << "): " << params.prompt_audio_path << "\n";
 
     out_codes    = codes;
@@ -422,7 +431,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
     // Siempre usar TempPcmFile para save_audio: RAM = 1 segmento a la vez
     TempPcmFile tmp;
     if (!tmp.open()) {
-        std::cerr << "Pipeline error: no se pudo abrir archivo temporal.\n";
+        std::cerr << "Pipeline error: could not open temp file.\n";
         return false;
     }
 
@@ -435,11 +444,11 @@ bool Pipeline::synthesize(const PipelineParams & params) {
 
     if (params.segment_sentences) {
         auto segs = split_sentences(params.text, params.min_seg_chars);
-        std::cout << "[Segment] " << segs.size() << " oraciones.\n";
+        std::cout << "[Segment] " << segs.size() << " sentences.\n";
         for (size_t i = 0; i < segs.size(); ++i) {
             std::cout << "[" << (i+1) << "/" << segs.size() << "] \"" << segs[i] << "\"\n";
             if (!process_segment(segs[i]))
-                std::cerr << "Segmento " << (i+1) << " falló — continuando.\n";
+                std::cerr << "Segment " << (i+1) << " failed — continuing.\n";
         }
     } else {
         if (!process_segment(params.text)) return false;
@@ -449,7 +458,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
     std::rewind(tmp.fp);
     std::ofstream out(params.output_path, std::ios::binary);
     if (!out.is_open()) {
-        std::cerr << "Pipeline error: no se pudo crear " << params.output_path << "\n";
+        std::cerr << "Pipeline error: could not create " << params.output_path << "\n";
         return false;
     }
 
@@ -501,7 +510,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
     // Abrir archivo temporal para PCM crudo
     TempPcmFile tmp;
     if (!tmp.open()) {
-        std::cerr << "Pipeline error: GetTempFileName falló.\n";
+        std::cerr << "Pipeline error: GetTempFileName failed.\n";
         return false;
     }
     std::cout << "[TempPCM] " << tmp.path << "\n";
@@ -514,7 +523,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
         if (!synthesize_segment(params, seg, ref_codes, T_prompt, audio)) return false;
         float dur_s = audio.size() / (float)codec_.sample_rate();
         if (!tmp.write_segment(audio)) {
-            std::cerr << "Error escribiendo segmento a disco.\n";
+            std::cerr << "Error writing segment to disk.\n";
             return false;
         }
         // audio se destruye aquí → RAM liberada
@@ -528,26 +537,26 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
 
     if (params.segment_sentences) {
         auto segs = split_sentences(params.text, params.min_seg_chars);
-        std::cout << "[Segment] " << segs.size() << " oraciones detectadas.\n";
+        std::cout << "[Segment] " << segs.size() << " sentences detected.\n";
         for (size_t i = 0; i < segs.size(); ++i) {
             std::cout << "[" << (i+1) << "/" << segs.size() << "] \""
                       << segs[i] << "\"\n";
             if (!process_segment(segs[i]))
-                std::cerr << "Segmento " << (i+1) << " falló — skipping.\n";
+                std::cerr << "Segment " << (i+1) << " failed — skipping.\n";
         }
     } else {
         if (!process_segment(params.text)) return false;
     }
 
     if (tmp.total_samps == 0) {
-        std::cerr << "Pipeline error: sin audio generado.\n";
+        std::cerr << "Pipeline error: no audio generated.\n";
         return false;
     }
 
     auto t1 = std::chrono::steady_clock::now();
     float total_audio_s = tmp.total_samps / (float)codec_.sample_rate();
     float total_inf_s   = std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count()/1000.f;
-    std::cout << "[Timing] " << total_audio_s << "s audio total en "
+    std::cout << "[Timing] " << total_audio_s << "s audio total in "
               << total_inf_s << "s (" << (total_audio_s/std::max(total_inf_s,0.001f)) << "x RT)\n";
 
     // Construir output_buffer: cabecera WAV (44B) + leer PCM desde disco
@@ -561,11 +570,11 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
     std::rewind(tmp.fp);
     size_t read = std::fread(output_buffer.data() + 44, 1, data_bytes, tmp.fp);
     if (read != data_bytes) {
-        std::cerr << "Pipeline warning: leídos " << read << "/" << data_bytes << " bytes del temp.\n";
+        std::cerr << "Pipeline warning: read " << read << "/" << data_bytes << " bytes del temp.\n";
     }
     // tmp se destruye aquí → archivo temporal borrado automáticamente
 
-    std::cout << "[Buffer] WAV listo: " << output_buffer.size() / 1024 << " KB\n";
+    std::cout << "[Buffer] WAV ready: " << output_buffer.size() / 1024 << " KB\n";
     return true;
 }
 
@@ -594,7 +603,7 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
     // Escribir PCM crudo al TempPcmFile
     TempPcmFile tmp;
     if (!tmp.open()) {
-        std::cerr << "Pipeline error: no se pudo crear archivo temporal PCM.\n";
+        std::cerr << "Pipeline error: could not create archivo temporal PCM.\n";
         return false;
     }
 
@@ -607,25 +616,25 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
         // audio destruido aquí — RAM liberada
         auto te = std::chrono::steady_clock::now();
         float inf_s = std::chrono::duration_cast<std::chrono::milliseconds>(te-ts).count()/1000.f;
-        std::cout << "  → " << dur_s << "s audio en " << inf_s << "s ("
+        std::cout << "  → " << dur_s << "s audio in " << inf_s << "s ("
                   << (dur_s/std::max(inf_s,0.001f)) << "x RT)\n";
         return ok;
     };
 
     if (params.segment_sentences) {
         auto segs = split_sentences(params.text, params.min_seg_chars);
-        std::cout << "[Segment] " << segs.size() << " oraciones.\n";
+        std::cout << "[Segment] " << segs.size() << " sentences.\n";
         for (size_t i = 0; i < segs.size(); ++i) {
             std::cout << "[" << (i+1) << "/" << segs.size() << "] \"" << segs[i] << "\"\n";
             if (!process_seg(segs[i]))
-                std::cerr << "Segmento " << (i+1) << " falló — skipping.\n";
+                std::cerr << "Segment " << (i+1) << " failed — skipping.\n";
         }
     } else {
         if (!process_seg(params.text)) return false;
     }
 
     if (tmp.total_samps == 0) {
-        std::cerr << "Pipeline error: sin audio generado.\n";
+        std::cerr << "Pipeline error: no audio generated.\n";
         return false;
     }
 
@@ -634,7 +643,7 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
     // archivo WAV completo para que Crow lo sirva con Content-Type correcto.
     TempPcmFile wav_tmp;
     if (!wav_tmp.open()) {
-        std::cerr << "Pipeline error: no se pudo crear archivo temporal WAV.\n";
+        std::cerr << "Pipeline error: could not create archivo temporal WAV.\n";
         return false;
     }
 
@@ -654,7 +663,7 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
     auto t1 = std::chrono::steady_clock::now();
     float total_s   = tmp.total_samps / (float)codec_.sample_rate();
     float elapsed_s = std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count()/1000.f;
-    std::cout << "[Timing] " << total_s << "s audio en " << elapsed_s << "s ("
+    std::cout << "[Timing] " << total_s << "s audio in " << elapsed_s << "s ("
               << (total_s/std::max(elapsed_s,0.001f)) << "x RT)\n";
     std::cout << "[File] WAV: " << wav_tmp.path
               << " (" << (44 + tmp.total_samps*2)/1024 << " KB)\n";
@@ -692,7 +701,7 @@ void Pipeline::float_to_int16(const std::vector<float> & in,
 bool Pipeline::synthesize_streaming(const PipelineParams & params,
                                      StreamCallback         callback) {
     if (!initialized_) { std::cerr << "Pipeline not initialized.\n"; return false; }
-    if (!callback)      { std::cerr << "synthesize_streaming: callback nulo.\n"; return false; }
+    if (!callback)      { std::cerr << "synthesize_streaming: null callback.\n"; return false; }
 
     std::vector<int32_t> ref_codes; int32_t T_prompt = 0;
     get_ref_codes(params, ref_codes, T_prompt);
@@ -702,7 +711,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
         std::vector<int16_t> pcm;
 
         if (!synthesize_segment(params, seg, ref_codes, T_prompt, audio)) {
-            std::cerr << "[Stream] synthesize_segment falló: \"" << seg << "\"\n";
+            std::cerr << "[Stream] synthesize_segment failed: \"" << seg << "\"\n";
             // En modo streaming continuamos con el siguiente segmento si falla uno
             return true;
         }
@@ -713,7 +722,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
         audio.shrink_to_fit();
 
         float dur_s = pcm.size() / (float)codec_.sample_rate();
-        std::cout << "[Stream] Enviando " << pcm.size() << " samples ("
+        std::cout << "[Stream] Sending " << pcm.size() << " samples ("
                   << dur_s << "s)" << (is_last ? " [LAST]" : "") << "\n";
 
         return callback(pcm.data(), pcm.size(), is_last);
@@ -721,13 +730,13 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
 
     if (params.segment_sentences) {
         auto segs = split_sentences(params.text, params.min_seg_chars);
-        std::cout << "[Stream] " << segs.size() << " segmentos.\n";
+        std::cout << "[Stream] " << segs.size() << " segments.\n";
         for (size_t i = 0; i < segs.size(); ++i) {
             bool is_last = (i == segs.size() - 1);
             std::cout << "[Stream " << (i+1) << "/" << segs.size()
                       << "] \"" << segs[i] << "\"\n";
             if (!process_and_send(segs[i], is_last)) {
-                std::cout << "[Stream] Callback abortó la generación.\n";
+                std::cout << "[Stream] Callback aborted generation.\n";
                 return false;
             }
         }
