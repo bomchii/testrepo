@@ -316,7 +316,8 @@ bool Pipeline::synthesize_segment(
 
     if (!codec_.decode_chunked(res.codes.data(), res.n_frames,
                                params.gen.n_threads, audio_out,
-                               params.codec_chunk_frames)) {
+                               params.codec_chunk_frames,
+                               params.codec_overlap_frames)) {
         // El codec q4_k_m no es compatible con backend CPU (GGML_ASSERT F16 en ops.cpp).
         // Si falla en GPU es OOM — reportar directamente sin intentar fallback CPU.
         std::cerr << "Pipeline error: decode_chunked() failed (OOM en GPU).\n";

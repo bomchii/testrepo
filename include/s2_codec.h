@@ -41,7 +41,8 @@ public:
     // Igual que decode() pero en chunks para evitar OOM en GPUs con VRAM limitada.
     // chunk_frames=0 → tamaño automático (~120 frames).
     bool decode_chunked(const int32_t * codes, int32_t n_frames, int32_t n_threads,
-                        std::vector<float> & audio_out, int32_t chunk_frames = 0);
+                        std::vector<float> & audio_out, int32_t chunk_frames = 0,
+                        int32_t overlap_frames = 0);
 
     int32_t sample_rate()     const { return sample_rate_; }
     int32_t hop_length()      const { return hop_length_; }

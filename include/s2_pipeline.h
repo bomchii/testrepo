@@ -36,6 +36,7 @@ struct PipelineParams {
 
     bool    segment_sentences      = false;
     int32_t codec_chunk_frames     = 0;
+    int32_t codec_overlap_frames   = 0;   // overlap entre chunks del codec; 0 = sin overlap (recomendado con VRAM ajustada)
     int32_t max_tokens_per_segment = 300;  // límite de KV cache por segmento; 0 = usar gen.max_new_tokens
 };
 

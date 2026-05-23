@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
     params.gen.top_k            = 30;
     params.segment_sentences    = false; // OFF por defecto — el usuario activa con --segment
     params.codec_chunk_frames   = 0;     // 0 = automático (se calcula en runtime)
+    params.codec_overlap_frames  = 0;     // 0 = sin overlap (recomendado con VRAM ajustada)
     params.base_dir             = exe_dir;
 
     int port = 8080;
@@ -90,6 +91,8 @@ int main(int argc, char** argv) {
             params.segment_sentences = true;
         } else if (arg == "--codec-chunk" && i + 1 < argc) {
             params.codec_chunk_frames = std::stoi(argv[++i]);
+        } else if (arg == "--codec-overlap" && i + 1 < argc) {
+            params.codec_overlap_frames = std::stoi(argv[++i]);
         } else if (arg == "--max-seg-tokens" && i + 1 < argc) {
             params.max_tokens_per_segment = std::stoi(argv[++i]);
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
@@ -144,6 +147,9 @@ OPCIONES:
                                También se puede activar por request:
                                  { "text": "...", "segment": true }
          --codec-chunk <N>     Frames por chunk en el decode del codec.
+         --codec-overlap <N>   Overlap entre chunks (default: 0).
+                                Aumenta calidad en uniones pero escala la VRAM necesaria.
+                                Con RTX 3050 4GB usar 0. Con codec solo en GPU se puede subir a 16-32.
                                0 = automático (recomendado).
                                Bajar si hay OOM en el codec; subir si hay
                                artefactos de audio en los cortes.
@@ -205,7 +211,8 @@ EJEMPLO HTTP:
               << "  Max tokens:   " << params.gen.max_new_tokens << "\n"
               << "  Seg tokens:   " << params.max_tokens_per_segment << " (por segmento)\n"
               << "  Segmentacion: " << (params.segment_sentences ? "ON" : "OFF (usa --segment para activar)") << "\n"
-              << "  Codec chunk:  " << (params.codec_chunk_frames == 0 ? "auto" : std::to_string(params.codec_chunk_frames) + " frames") << "\n";
+              << "  Codec chunk:  " << (params.codec_chunk_frames == 0 ? "auto" : std::to_string(params.codec_chunk_frames) + " frames") << "\n"
+              << "  Codec overlap:" << params.codec_overlap_frames << " frames\n";
 
     // --- Charger le modèle ---
     s2::Pipeline pipeline;
@@ -255,7 +262,8 @@ EJEMPLO HTTP:
         if (json.has("top_k"))       synth_params.gen.top_k = json["top_k"].i();
         if (json.has("threads"))     synth_params.gen.n_threads = json["threads"].i();
         if (json.has("segment"))     synth_params.segment_sentences = json["segment"].b();
-        if (json.has("codec_chunk")) synth_params.codec_chunk_frames = json["codec_chunk"].i();
+        if (json.has("codec_chunk"))   synth_params.codec_chunk_frames   = json["codec_chunk"].i();
+        if (json.has("codec_overlap")) synth_params.codec_overlap_frames = json["codec_overlap"].i();
 
         // Paramètres Fish Audio (ignorés gracieusement si non pertinents)
         // reference_id, chunk_length, normalize, format, mp3_bitrate, opus_bitrate, latency
@@ -433,7 +441,8 @@ EJEMPLO HTTP:
         if (json.has("top_p"))            ws_params.gen.top_p          = json["top_p"].d();
         if (json.has("top_k"))            ws_params.gen.top_k          = json["top_k"].i();
         if (json.has("reference_audio"))  ws_params.prompt_audio_path  = json["reference_audio"].s();
-        if (json.has("codec_chunk"))      ws_params.codec_chunk_frames = json["codec_chunk"].i();
+        if (json.has("codec_chunk"))      ws_params.codec_chunk_frames   = json["codec_chunk"].i();
+        if (json.has("codec_overlap"))    ws_params.codec_overlap_frames = json["codec_overlap"].i();
 
         std::cout << "[WS] Sintetizando: \"" << ws_params.text << "\""
                   << (ws_params.segment_sentences ? " [segmentado]" : "") << "\n";

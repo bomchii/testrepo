@@ -1182,29 +1182,26 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
 // ---------------------------------------------------------------------------
 
 bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t n_threads,
-                                 std::vector<float> & audio_out, int32_t chunk_frames) {
+                                 std::vector<float> & audio_out, int32_t chunk_frames,
+                                 int32_t overlap_frames) {
     if (n_frames <= 0) return false;
 
     const int32_t num_cb  = impl_->quantizer_residual_codebooks + 1;
     const int32_t win     = impl_->rvq_transformer_window_size;
 
-    // Overlap: suficiente para el transformer (window_size) y las dilated convs (~64 frames).
-    // Se toma el máximo y se redondea a 32 para alineación limpia.
-    const int32_t overlap_raw = std::max(win > 0 ? win : 64, 64);
-    int32_t       overlap     = ((overlap_raw + 31) / 32) * 32;
+    // Overlap entre chunks: con overlap > 0 el codec re-procesa N frames del chunk
+    // anterior para suavizar las uniones. ADVERTENCIA: en el codec Firefly GAN el
+    // grafo de ggml escala con chunk_len = chunk_frames + overlap — con overlap=31
+    // y chunk=32 el segundo chunk necesita ~373 MB (OOM en RTX 3050 con transformer
+    // en VRAM). Default=0 (sin overlap): todos los chunks tienen el mismo grafo.
+    // Usar overlap > 0 solo si la VRAM lo permite (codec solo en GPU sin transformer).
+    const int32_t overlap = (overlap_frames > 0)
+        ? std::min(overlap_frames, chunk_frames - 1)  // overlap < chunk siempre
+        : 0;
 
     // Tamaño de chunk: si el usuario especificó uno explícito (> 0), respetarlo.
-    // Si chunk_explicit < overlap, reducir overlap en lugar de elevar el chunk.
-    const bool chunk_explicit = (chunk_frames > 0);
-    if (!chunk_explicit) {
-        chunk_frames = std::max(overlap * 2, 120);
-    }
-    if (chunk_frames <= overlap) {
-        if (chunk_explicit) {
-            overlap = std::max(0, chunk_frames - 1);
-        } else {
-            chunk_frames = overlap * 2;
-        }
+    if (chunk_frames <= 0) {
+        chunk_frames = 120;  // ~2.7 s a 44100/512, cabe en VRAM con modelo en GPU
     }
 
     std::cerr << "[Codec::decode_chunked] n_frames=" << n_frames
