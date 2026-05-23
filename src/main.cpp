@@ -128,104 +128,178 @@ int main(int argc, char** argv) {
             params.gen.max_new_tokens = std::stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout <<
-R"(s2.exe — Fish Speech TTS server (Windows + Vulkan)
+R"(s2.exe — Fish Speech TTS inference server  (Windows / Vulkan)
+A local HTTP+WebSocket server that converts text to speech using Fish Speech models.
 
-USO BASICO (CPU, funciona en cualquier PC):
-  s2.exe
+QUICK START:
+  CPU only (works everywhere):
+    s2.exe --model model.gguf --model-codec codec.gguf
 
-USO CON GPU (RTX 3050 / cualquier GPU Vulkan):
-  s2.exe -v 0 --codec-vulkan 0
+  Single GPU (desktop, plenty of VRAM):
+    s2.exe --model model.gguf --model-codec codec.gguf -v 0 --codec-vulkan 0
 
-PARA AUDIOS LARGOS CON POCA VRAM (4 GB):
-  s2.exe -v 1 --codec-vulkan 1 --segment
+  Laptop with iGPU + dGPU, limited VRAM (e.g. RTX 3050 4 GB):
+    s2.exe --model model.gguf --model-codec codec.gguf \
+           -v 1 --codec-vulkan 1 --segment --codec-chunk 32 \
+           --max-seg-tokens 300 --min-seg-chars 60
 
-OPCIONES:
-  Modelos:
-    -m,  --model <ruta>        Modelo principal GGUF
-                               (default: model.gguf junto al exe)
-         --model-codec <ruta>  Modelo codec separado GGUF (opcional)
-    -t,  --tokenizer <ruta>    tokenizer.json
-                               (default: embebido en el exe)
+OPTIONS:
 
-  GPU:
-    -v,  --vulkan <N>          GPU Vulkan para el modelo principal
-                                 -1 = CPU (default, funciona en todo)
-                                  0 = primera GPU
-                                  1 = segunda GPU (RTX en laptops con iGPU)
-         --codec-vulkan <N>    GPU Vulkan para el codec (mismos valores)
-                               Tip: si hay OOM, pon el codec en CPU (-1)
+  Models:
+    -m,  --model <path>         Path to the transformer GGUF model file.
+                                Default: model.gguf next to the executable.
+         --model-codec <path>   Path to the codec GGUF model file.
+                                Default: codec.gguf next to the executable.
+    -t,  --tokenizer <path>     Path to tokenizer.json.
+                                Default: version embedded inside the executable.
 
-  Servidor:
-    -p,  --port <N>            Puerto HTTP (default: 8080)
+  GPU / device selection:
+    -v,  --vulkan <N>           Vulkan device index for the transformer model.
+                                  -1  CPU (default — works on any machine)
+                                   0  first GPU
+                                   1  second GPU (use this on laptops where
+                                      index 0 is the Intel/AMD iGPU)
+         --codec-vulkan <N>     Vulkan device index for the codec model.
+                                Same values as --vulkan.
+                                The codec and transformer can run on different
+                                devices. If you get OOM on the codec, set this
+                                to -1 to run it on CPU (only works with f16/f32
+                                codec weights, NOT with q4_k_m quantization).
 
-  Rendimiento:
-         --threads <N>         Hilos CPU para operaciones en CPU (default: 4)
-         --max-tokens <N>      Tokens máximos a generar por request (default: 1024)
-         --max-seg-tokens <N>  Tokens máximos por segmento en modo --segment (default: 300)
-                                Reduce el KV cache en GPUs con VRAM ajustada.
+  Server:
+    -p,  --port <N>             HTTP port to listen on. Default: 8080.
 
-  Memoria (opciones avanzadas, todas OFF por defecto):
-         --segment             Divide el texto en oraciones antes de generar.
-                               Limita el pico de VRAM al tamaño de la oración
-                               más larga en vez de al texto completo.
-                               Recomendado para textos largos con poca VRAM.
-                               También se puede activar por request:
-                                 { "text": "...", "segment": true }
-         --codec-chunk <N>     Frames por chunk en el decode del codec.
-         --codec-overlap <N>   Overlap entre chunks (default: 0).
-                                Aumenta calidad en uniones pero escala la VRAM necesaria.
-                                Con RTX 3050 4GB usar 0. Con codec solo en GPU se puede subir a 16-32.
-         --min-seg-chars <N>   Longitud minima de segmento en chars (default: 0 = sin filtro).
-                                Segmentos mas cortos se fusionan con el siguiente.
-                                Recomendado: 60-90 para evitar artefactos en frases muy cortas.
+  Generation limits:
+         --threads <N>          Number of CPU threads for CPU-bound ops.
+                                Default: 4.
+         --max-tokens <N>       Maximum tokens the model may generate per
+                                request (whole text, no --segment).
+                                Default: 1024.  One token ≈ one codec frame
+                                ≈ ~11 ms of audio at 44100 Hz / hop 512.
+         --max-seg-tokens <N>   Maximum tokens per sentence when --segment is
+                                active. Controls KV-cache size per segment.
+                                Lower values use less VRAM.
+                                Default: 300 (~3.3 s of audio per sentence).
 
-       Sampleo del transformer:
-         --temperature <F>     Temperatura de muestreo (default: 0.7). Mas alto = mas variado.
-         --top-p <F>           Top-p nucleus sampling (default: 0.7).
-         --top-k <N>           Top-k sampling (default: 30).
-         --min-end-tokens <N>  Tokens minimos antes de permitir EOS (default: 64).
+  Segmentation (recommended for long texts or limited VRAM):
+         --segment              Split the input text into sentences before
+                                generating. Each sentence is synthesized
+                                independently, which caps VRAM usage to the
+                                longest sentence instead of the full text.
+                                Audio segments are concatenated into one WAV.
+                                Can also be enabled per-request:
+                                  { "text": "...", "segment": true }
+         --min-seg-chars <N>    Minimum character length for a sentence segment.
+                                Segments shorter than N are merged with the next
+                                one before synthesis, preventing very short
+                                clips that tend to sound unnatural or cut off.
+                                Default: 0 (no minimum — keep all segments).
+                                Recommended: 60-90 for most use cases.
 
-       RAS (anti-repeticion):
-         --ras-window <N>      Ventana de tokens recientes para detectar repeticion (default: 10).
-         --ras-temp <F>        Temperatura al remuestrear token repetido (default: 1.0).
-         --ras-top-p <F>       Top-p al remuestrear token repetido (default: 0.9).
-                               0 = automático (recomendado).
-                               Bajar si hay OOM en el codec; subir si hay
-                               artefactos de audio en los cortes.
+  Codec chunking (advanced — tune for your VRAM budget):
+         --codec-chunk <N>      Number of codec frames to decode per GPU call.
+                                Each chunk is decoded independently. Smaller
+                                values use less peak VRAM at the cost of
+                                slightly more overhead.
+                                Default: 0 (auto, ~120 frames per chunk).
+                                With 4 GB VRAM and the transformer loaded,
+                                use 32.
+         --codec-overlap <N>    Number of frames of overlap between consecutive
+                                codec chunks. Overlap smooths the audio at chunk
+                                boundaries but increases the VRAM cost of every
+                                chunk after the first (the graph grows with
+                                chunk_len + overlap). On a 4 GB GPU with the
+                                transformer already in VRAM, keep this at 0.
+                                Default: 0.
 
-  Otros:
-    -h,  --help                Muestra esta ayuda
+  Sampling (controls voice variability and expressiveness):
+         --temperature <F>      Sampling temperature for the transformer.
+                                Higher = more expressive and varied, but less
+                                stable. Lower = more monotone but consistent.
+                                Default: 0.7.  Range: 0.1 – 1.5.
+         --top-p <F>            Nucleus (top-p) sampling threshold.
+                                The model samples only from the smallest set of
+                                tokens whose cumulative probability exceeds p.
+                                Default: 0.7.  Range: 0.1 – 1.0.
+         --top-k <N>            Top-k sampling. Only the k most likely tokens
+                                are kept as candidates before applying top-p.
+                                Default: 30.
+         --min-end-tokens <N>   Minimum tokens to generate before the model is
+                                allowed to emit the end-of-sequence token.
+                                Prevents the model from producing very short
+                                or empty clips for short input texts.
+                                Default: 64.
 
-ENDPOINTS HTTP:
-  POST /v1/tts          (compatible Fish Audio)
-  POST /v1/audio/speech (compatible OpenAI)
-  POST /synthesize      (legacy)
-  GET  /v1/models
-  GET  /health
+  RAS — Repetition Aware Sampling (anti-repetition):
+    RAS detects when the model is looping (repeating the same semantic token
+    recently seen) and resamples that token with a higher temperature to break
+    the loop. Relevant when the model gets stuck repeating a syllable or sound.
 
-ENDPOINT WEBSOCKET (streaming — latencia minima):
-  WS /ws/tts
+         --ras-window <N>       Number of recent tokens to watch for repetition.
+                                If the current token appears in this window,
+                                RAS triggers a resample.
+                                Default: 10.
+         --ras-temp <F>         Temperature used when resampling a repeated token.
+                                Should be higher than --temperature to escape loops.
+                                Default: 1.0.
+         --ras-top-p <F>        Top-p used when resampling a repeated token.
+                                Default: 0.9.
 
-  El cliente manda un JSON con el texto y recibe mensajes binarios
-  con el audio PCM int16 por oración, sin esperar a que termine todo.
-  Ideal para reproduccion en tiempo real.
+  Other:
+    -h,  --help                 Show this help and exit.
 
-  Ejemplo con Python:
-    import websockets, asyncio, json
+HTTP ENDPOINTS:
+  POST /v1/tts                  Fish Audio-compatible synthesis endpoint.
+  POST /v1/audio/speech         OpenAI-compatible synthesis endpoint.
+  POST /synthesize              Legacy endpoint.
+  GET  /v1/models               List available models.
+  GET  /health                  Health check.
+
+  Request body (JSON):
+    {
+      "text":            "Text to synthesize.",
+      "format":          "wav",           // output format (wav only for now)
+      "segment":         true,            // enable sentence segmentation
+      "temperature":     0.7,
+      "top_p":           0.7,
+      "top_k":           30,
+      "min_end_tokens":  64,
+      "ras_window":      10,
+      "ras_temp":        1.0,
+      "ras_top_p":       0.9,
+      "codec_chunk":     32,
+      "codec_overlap":   0,
+      "min_seg_chars":   60
+    }
+
+WEBSOCKET ENDPOINT — /ws/tts  (streaming, minimum latency):
+  Send a JSON message with the text; receive binary audio frames as each
+  sentence finishes, without waiting for the full synthesis to complete.
+  Each binary message: [2-byte flags LE][PCM int16 LE, mono, 44100 Hz]
+  A final JSON message {"done": true, "segments": N} signals completion.
+
+  Python example:
+    import asyncio, json, websockets
+
     async def tts():
-        async with websockets.connect("ws://localhost:8080/ws/tts") as ws:
-            await ws.send(json.dumps({"text": "Hola mundo", "segment": True}))
+        uri = "ws://localhost:8080/ws/tts"
+        async with websockets.connect(uri) as ws:
+            await ws.send(json.dumps({
+                "text": "Hello world. How are you?",
+                "segment": True
+            }))
             while True:
                 msg = await ws.recv()
-                if isinstance(msg, str):  # {"done": true, ...}
+                if isinstance(msg, str):       # final status message
+                    print(json.loads(msg))
                     break
-                pcm_data = msg[2:]  # primeros 2 bytes son flags
-                # reproducir pcm_data directamente (int16, mono, 44100Hz)
+                pcm = msg[2:]                  # skip 2-byte flags header
+                # feed pcm (int16 mono 44100 Hz) to your audio output
 
-EJEMPLO HTTP:
+HTTP EXAMPLE:
   curl -X POST http://localhost:8080/v1/tts \
        -H "Content-Type: application/json" \
-       -d '{"text": "Hola mundo", "segment": true}' \
+       -d '{"text": "Hello world.", "segment": true}' \
        --output audio.wav
 )";
             return 0;
