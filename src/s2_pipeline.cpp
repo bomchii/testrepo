@@ -211,14 +211,10 @@ bool Pipeline::init(const PipelineParams & params) {
     bool codec_ok = false;
     if (codec_gpu >= 0 && codec_.load(codec_path, codec_gpu)) {
         std::cout << "Codec loaded (GPU " << codec_gpu << ").\n";
-        codec_gpu_requested_ = codec_gpu;
-        codec_on_cpu_        = false;
         codec_ok = true;
     }
     if (!codec_ok && codec_.load(codec_path, -1)) {
         std::cout << "Codec loaded (CPU fallback).\n";
-        codec_gpu_requested_ = -1;
-        codec_on_cpu_        = true;
         codec_ok = true;
     }
     if (!codec_ok) {
@@ -321,27 +317,11 @@ bool Pipeline::synthesize_segment(
     if (!codec_.decode_chunked(res.codes.data(), res.n_frames,
                                params.gen.n_threads, audio_out,
                                params.codec_chunk_frames)) {
-        // Si el codec estaba en GPU y falló (OOM), intentar una sola vez en CPU.
-        if (!codec_on_cpu_) {
-            std::cerr << "[Codec] GPU decode failed — liberando VRAM y recargando en CPU...\n";
-            codec_.unload();  // libera backend Vulkan + VRAM antes de crear backend CPU
-            if (codec_.load(codec_path_, -1)) {
-                codec_on_cpu_ = true;
-                std::cout << "[Codec] Recargado en CPU.\n";
-                if (!codec_.decode_chunked(res.codes.data(), res.n_frames,
-                                           params.gen.n_threads, audio_out,
-                                           params.codec_chunk_frames)) {
-                    std::cerr << "Pipeline error: decode_chunked() failed incluso en CPU.\n";
-                    return false;
-                }
-            } else {
-                std::cerr << "Pipeline error: no se pudo recargar el codec en CPU.\n";
-                return false;
-            }
-        } else {
-            std::cerr << "Pipeline error: decode_chunked() failed (codec ya en CPU).\n";
-            return false;
-        }
+        // El codec q4_k_m no es compatible con backend CPU (GGML_ASSERT F16 en ops.cpp).
+        // Si falla en GPU es OOM — reportar directamente sin intentar fallback CPU.
+        std::cerr << "Pipeline error: decode_chunked() failed (OOM en GPU).\n";
+        std::cerr << "  Intenta reducir --codec-chunk o usar --codec-vulkan -1 con codec f16/f32.\n";
+        return false;
     }
     return true;
 }

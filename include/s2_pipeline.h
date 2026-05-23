@@ -104,10 +104,8 @@ private:
     bool        kv_cache_initialized_ = false;
     int32_t     kv_cache_max_len_     = 0;
 
-    // Para fallback CPU del codec en caso de OOM en GPU
-    std::string codec_path_;              // guardado en init()
-    int32_t     codec_gpu_requested_  = -1; // device con el que se intentó cargar
-    bool        codec_on_cpu_         = false; // true si ya cayó a CPU (no reintentar)
+    // Para recargar el codec si hace falta (path guardado en init())
+    std::string codec_path_;
 
     bool        reference_loaded_     = false;
     std::string reference_embedding_;
