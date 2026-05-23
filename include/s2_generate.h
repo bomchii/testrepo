@@ -23,6 +23,13 @@ struct GenerateParams {
     int32_t min_tokens_before_end   = 64;
     int32_t n_threads               = 4;
     bool    verbose                 = true;
+
+    // RAS (Repetition Aware Sampling): previene loops de tokens repetidos.
+    // Si el token actual ya aparece en la ventana reciente, se remuestrea
+    // con temperatura alta para salir del bucle.
+    int32_t ras_window_size         = 10;   // tokens recientes a vigilar
+    float   ras_high_temp           = 1.0f; // temperatura del remuestreo
+    float   ras_high_top_p          = 0.9f; // top_p del remuestreo
 };
 
 // Generate VQ codes autoregressively.

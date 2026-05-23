@@ -118,7 +118,8 @@ static void build_wav_header(char * hdr, uint32_t n_samples, int32_t sample_rate
 // ---------------------------------------------------------------------------
 // split_sentences — divide texto en oraciones respetando abreviaturas
 // ---------------------------------------------------------------------------
-std::vector<std::string> Pipeline::split_sentences(const std::string & text) {
+std::vector<std::string> Pipeline::split_sentences(const std::string & text,
+                                                    int32_t min_chars) {
     std::vector<std::string> sentences;
     if (text.empty()) return sentences;
 
@@ -134,8 +135,14 @@ std::vector<std::string> Pipeline::split_sentences(const std::string & text) {
     auto flush = [&]() {
         size_t s = current.find_first_not_of(" \t\n\r");
         size_t e = current.find_last_not_of(" \t\n\r");
-        if (s != std::string::npos && (e - s) >= 3)
-            sentences.push_back(current.substr(s, e - s + 1));
+        if (s != std::string::npos && (e - s) >= 3) {
+            int32_t seg_len = static_cast<int32_t>(e - s + 1);
+            if (min_chars <= 0 || seg_len >= min_chars)
+                sentences.push_back(current.substr(s, e - s + 1));
+            // Si el segmento es demasiado corto, se fusiona con el siguiente
+            // dejando current sin limpiar para acumular más texto.
+            else { current = current.substr(s, e - s + 1) + " "; return; }
+        }
         current.clear();
     };
 
@@ -427,7 +434,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
     };
 
     if (params.segment_sentences) {
-        auto segs = split_sentences(params.text);
+        auto segs = split_sentences(params.text, params.min_seg_chars);
         std::cout << "[Segment] " << segs.size() << " oraciones.\n";
         for (size_t i = 0; i < segs.size(); ++i) {
             std::cout << "[" << (i+1) << "/" << segs.size() << "] \"" << segs[i] << "\"\n";
@@ -520,7 +527,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
     };
 
     if (params.segment_sentences) {
-        auto segs = split_sentences(params.text);
+        auto segs = split_sentences(params.text, params.min_seg_chars);
         std::cout << "[Segment] " << segs.size() << " oraciones detectadas.\n";
         for (size_t i = 0; i < segs.size(); ++i) {
             std::cout << "[" << (i+1) << "/" << segs.size() << "] \""
@@ -606,7 +613,7 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
     };
 
     if (params.segment_sentences) {
-        auto segs = split_sentences(params.text);
+        auto segs = split_sentences(params.text, params.min_seg_chars);
         std::cout << "[Segment] " << segs.size() << " oraciones.\n";
         for (size_t i = 0; i < segs.size(); ++i) {
             std::cout << "[" << (i+1) << "/" << segs.size() << "] \"" << segs[i] << "\"\n";
@@ -713,7 +720,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
     };
 
     if (params.segment_sentences) {
-        auto segs = split_sentences(params.text);
+        auto segs = split_sentences(params.text, params.min_seg_chars);
         std::cout << "[Stream] " << segs.size() << " segmentos.\n";
         for (size_t i = 0; i < segs.size(); ++i) {
             bool is_last = (i == segs.size() - 1);

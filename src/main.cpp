@@ -70,6 +70,15 @@ int main(int argc, char** argv) {
     params.segment_sentences    = false; // OFF por defecto — el usuario activa con --segment
     params.codec_chunk_frames   = 0;     // 0 = automático (se calcula en runtime)
     params.codec_overlap_frames  = 0;     // 0 = sin overlap (recomendado con VRAM ajustada)
+    params.min_seg_chars         = 0;     // 0 = sin filtro de longitud mínima
+    // GenerateParams defaults (también en s2_generate.h)
+    params.gen.temperature       = 0.7f;
+    params.gen.top_p             = 0.7f;
+    params.gen.top_k             = 30;
+    params.gen.min_tokens_before_end = 64;
+    params.gen.ras_window_size   = 10;
+    params.gen.ras_high_temp     = 1.0f;
+    params.gen.ras_high_top_p    = 0.9f;
     params.base_dir             = exe_dir;
 
     int port = 8080;
@@ -93,6 +102,22 @@ int main(int argc, char** argv) {
             params.codec_chunk_frames = std::stoi(argv[++i]);
         } else if (arg == "--codec-overlap" && i + 1 < argc) {
             params.codec_overlap_frames = std::stoi(argv[++i]);
+        } else if (arg == "--min-seg-chars" && i + 1 < argc) {
+            params.min_seg_chars = std::stoi(argv[++i]);
+        } else if ((arg == "--temperature" || arg == "--temp") && i + 1 < argc) {
+            params.gen.temperature = std::stof(argv[++i]);
+        } else if (arg == "--top-p" && i + 1 < argc) {
+            params.gen.top_p = std::stof(argv[++i]);
+        } else if (arg == "--top-k" && i + 1 < argc) {
+            params.gen.top_k = std::stoi(argv[++i]);
+        } else if (arg == "--min-end-tokens" && i + 1 < argc) {
+            params.gen.min_tokens_before_end = std::stoi(argv[++i]);
+        } else if (arg == "--ras-window" && i + 1 < argc) {
+            params.gen.ras_window_size = std::stoi(argv[++i]);
+        } else if (arg == "--ras-temp" && i + 1 < argc) {
+            params.gen.ras_high_temp = std::stof(argv[++i]);
+        } else if (arg == "--ras-top-p" && i + 1 < argc) {
+            params.gen.ras_high_top_p = std::stof(argv[++i]);
         } else if (arg == "--max-seg-tokens" && i + 1 < argc) {
             params.max_tokens_per_segment = std::stoi(argv[++i]);
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
@@ -150,6 +175,20 @@ OPCIONES:
          --codec-overlap <N>   Overlap entre chunks (default: 0).
                                 Aumenta calidad en uniones pero escala la VRAM necesaria.
                                 Con RTX 3050 4GB usar 0. Con codec solo en GPU se puede subir a 16-32.
+         --min-seg-chars <N>   Longitud minima de segmento en chars (default: 0 = sin filtro).
+                                Segmentos mas cortos se fusionan con el siguiente.
+                                Recomendado: 60-90 para evitar artefactos en frases muy cortas.
+
+       Sampleo del transformer:
+         --temperature <F>     Temperatura de muestreo (default: 0.7). Mas alto = mas variado.
+         --top-p <F>           Top-p nucleus sampling (default: 0.7).
+         --top-k <N>           Top-k sampling (default: 30).
+         --min-end-tokens <N>  Tokens minimos antes de permitir EOS (default: 64).
+
+       RAS (anti-repeticion):
+         --ras-window <N>      Ventana de tokens recientes para detectar repeticion (default: 10).
+         --ras-temp <F>        Temperatura al remuestrear token repetido (default: 1.0).
+         --ras-top-p <F>       Top-p al remuestrear token repetido (default: 0.9).
                                0 = automático (recomendado).
                                Bajar si hay OOM en el codec; subir si hay
                                artefactos de audio en los cortes.
@@ -212,7 +251,13 @@ EJEMPLO HTTP:
               << "  Seg tokens:   " << params.max_tokens_per_segment << " (por segmento)\n"
               << "  Segmentacion: " << (params.segment_sentences ? "ON" : "OFF (usa --segment para activar)") << "\n"
               << "  Codec chunk:  " << (params.codec_chunk_frames == 0 ? "auto" : std::to_string(params.codec_chunk_frames) + " frames") << "\n"
-              << "  Codec overlap:" << params.codec_overlap_frames << " frames\n";
+              << "  Codec overlap:" << params.codec_overlap_frames << " frames\n"
+              << "  Min seg chars:" << (params.min_seg_chars == 0 ? "off" : std::to_string(params.min_seg_chars) + " chars") << "\n"
+              << "  Temperature:  " << params.gen.temperature << "\n"
+              << "  Top-p:        " << params.gen.top_p << "\n"
+              << "  Top-k:        " << params.gen.top_k << "\n"
+              << "  RAS window:   " << params.gen.ras_window_size << " tokens\n"
+              << "  RAS temp:     " << params.gen.ras_high_temp << "\n";
 
     // --- Charger le modèle ---
     s2::Pipeline pipeline;
@@ -263,7 +308,12 @@ EJEMPLO HTTP:
         if (json.has("threads"))     synth_params.gen.n_threads = json["threads"].i();
         if (json.has("segment"))     synth_params.segment_sentences = json["segment"].b();
         if (json.has("codec_chunk"))   synth_params.codec_chunk_frames   = json["codec_chunk"].i();
-        if (json.has("codec_overlap")) synth_params.codec_overlap_frames = json["codec_overlap"].i();
+        if (json.has("codec_overlap"))    synth_params.codec_overlap_frames        = json["codec_overlap"].i();
+        if (json.has("min_seg_chars"))    synth_params.min_seg_chars               = json["min_seg_chars"].i();
+        if (json.has("min_end_tokens"))   synth_params.gen.min_tokens_before_end   = json["min_end_tokens"].i();
+        if (json.has("ras_window"))       synth_params.gen.ras_window_size         = json["ras_window"].i();
+        if (json.has("ras_temp"))         synth_params.gen.ras_high_temp           = (float)json["ras_temp"].d();
+        if (json.has("ras_top_p"))        synth_params.gen.ras_high_top_p          = (float)json["ras_top_p"].d();
 
         // Paramètres Fish Audio (ignorés gracieusement si non pertinents)
         // reference_id, chunk_length, normalize, format, mp3_bitrate, opus_bitrate, latency
@@ -442,7 +492,12 @@ EJEMPLO HTTP:
         if (json.has("top_k"))            ws_params.gen.top_k          = json["top_k"].i();
         if (json.has("reference_audio"))  ws_params.prompt_audio_path  = json["reference_audio"].s();
         if (json.has("codec_chunk"))      ws_params.codec_chunk_frames   = json["codec_chunk"].i();
-        if (json.has("codec_overlap"))    ws_params.codec_overlap_frames = json["codec_overlap"].i();
+        if (json.has("codec_overlap"))    ws_params.codec_overlap_frames          = json["codec_overlap"].i();
+        if (json.has("min_seg_chars"))    ws_params.min_seg_chars                 = json["min_seg_chars"].i();
+        if (json.has("min_end_tokens"))   ws_params.gen.min_tokens_before_end     = json["min_end_tokens"].i();
+        if (json.has("ras_window"))       ws_params.gen.ras_window_size           = json["ras_window"].i();
+        if (json.has("ras_temp"))         ws_params.gen.ras_high_temp             = (float)json["ras_temp"].d();
+        if (json.has("ras_top_p"))        ws_params.gen.ras_high_top_p            = (float)json["ras_top_p"].d();
 
         std::cout << "[WS] Sintetizando: \"" << ws_params.text << "\""
                   << (ws_params.segment_sentences ? " [segmentado]" : "") << "\n";

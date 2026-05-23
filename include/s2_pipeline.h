@@ -37,7 +37,8 @@ struct PipelineParams {
     bool    segment_sentences      = false;
     int32_t codec_chunk_frames     = 0;
     int32_t codec_overlap_frames   = 0;   // overlap entre chunks del codec; 0 = sin overlap (recomendado con VRAM ajustada)
-    int32_t max_tokens_per_segment = 300;  // límite de KV cache por segmento; 0 = usar gen.max_new_tokens
+    int32_t max_tokens_per_segment = 300;
+    int32_t min_seg_chars          = 0;   // longitud mínima de segmento en chars; 0 = sin filtro  // límite de KV cache por segmento; 0 = usar gen.max_new_tokens
 };
 
 struct VoiceCache {
@@ -81,7 +82,8 @@ public:
     int32_t sample_rate() const { return codec_.sample_rate(); }
 
 private:
-    static std::vector<std::string> split_sentences(const std::string & text);
+    static std::vector<std::string> split_sentences(const std::string & text,
+                                                     int32_t min_chars = 0);
 
     bool synthesize_segment(
         const PipelineParams       & params,

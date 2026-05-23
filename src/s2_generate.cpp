@@ -89,11 +89,11 @@ GenerateResult generate(
     sparams.top_p       = params.top_p;
     sparams.top_k       = params.top_k;
 
-    // RAS state
+    // RAS state — parámetros vienen de GenerateParams (configurables por CLI/JSON)
     std::vector<int32_t> ras_window;
-    const int32_t ras_window_size = 10;
-    const float ras_high_temp     = 1.0f;
-    const float ras_high_top_p    = 0.9f;
+    const int32_t ras_window_size = params.ras_window_size;
+    const float ras_high_temp     = params.ras_high_temp;
+    const float ras_high_top_p    = params.ras_high_top_p;
 
     if (params.verbose) {
         std::cout << "[Generate] Generating (max " << params.max_new_tokens << " tokens)..." << std::endl;
