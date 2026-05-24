@@ -1,9 +1,12 @@
 // s2_audio.cpp — WAV/MP3 audio I/O
 #include "../include/s2_audio.h"
 
+#include <algorithm>
+#include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <cmath>
+#include <limits>
 
 // dr_libs implementations (header-only, define once)
 #define DR_WAV_IMPLEMENTATION
@@ -31,7 +34,6 @@ bool audio_read(const std::string & path, AudioData & out) {
             if (channels == 1) {
                 std::memcpy(out.samples.data(), data, total_frames * sizeof(float));
             } else {
-                // Mix to mono
                 for (drwav_uint64 i = 0; i < total_frames; ++i) {
                     float sum = 0.0f;
                     for (unsigned int ch = 0; ch < channels; ++ch) {
@@ -71,6 +73,65 @@ bool audio_read(const std::string & path, AudioData & out) {
     }
 
     std::fprintf(stderr, "[s2_audio] failed to read audio file: %s\n", path.c_str());
+    return false;
+}
+
+bool audio_read_from_memory(const void * in_data, size_t in_data_size, AudioData & out) {
+    out.samples.clear();
+    out.sample_rate = 0;
+
+    // Try WAV
+    {
+        unsigned int channels = 0;
+        unsigned int sample_rate = 0;
+        drwav_uint64 total_frames = 0;
+        float * data = drwav_open_memory_and_read_pcm_frames_f32(
+            in_data, in_data_size, &channels, &sample_rate, &total_frames, nullptr);
+        if (data != nullptr) {
+            out.sample_rate = static_cast<int32_t>(sample_rate);
+            out.samples.resize(static_cast<size_t>(total_frames));
+            if (channels == 1) {
+                std::memcpy(out.samples.data(), data, total_frames * sizeof(float));
+            } else {
+                for (drwav_uint64 i = 0; i < total_frames; ++i) {
+                    float sum = 0.0f;
+                    for (unsigned int ch = 0; ch < channels; ++ch) {
+                        sum += data[i * channels + ch];
+                    }
+                    out.samples[i] = sum / static_cast<float>(channels);
+                }
+            }
+            drwav_free(data, nullptr);
+            return true;
+        }
+    }
+
+    // Try MP3
+    {
+        drmp3_config config = {};
+        drmp3_uint64 total_frames = 0;
+        float * data = drmp3_open_memory_and_read_pcm_frames_f32(
+            in_data, in_data_size, &config, &total_frames, nullptr);
+        if (data != nullptr) {
+            out.sample_rate = static_cast<int32_t>(config.sampleRate);
+            out.samples.resize(static_cast<size_t>(total_frames));
+            if (config.channels == 1) {
+                std::memcpy(out.samples.data(), data, total_frames * sizeof(float));
+            } else {
+                for (drmp3_uint64 i = 0; i < total_frames; ++i) {
+                    float sum = 0.0f;
+                    for (unsigned int ch = 0; ch < config.channels; ++ch) {
+                        sum += data[i * config.channels + ch];
+                    }
+                    out.samples[i] = sum / static_cast<float>(config.channels);
+                }
+            }
+            drmp3_free(data, nullptr);
+            return true;
+        }
+    }
+
+    std::fprintf(stderr, "[s2_audio] failed to decode audio from memory\n");
     return false;
 }
 
@@ -124,6 +185,44 @@ std::vector<float> audio_resample(const float * data, size_t n_samples, int32_t 
     return out;
 }
 
+std::vector<float> audio_trim_trailing_silence(const float * data, size_t n_samples,
+                                               int32_t sample_rate,
+                                               float threshold,
+                                               float min_silence_duration) {
+    if (n_samples == 0) return std::vector<float>();
+    if (sample_rate <= 0) sample_rate = 44100;
+
+    const size_t min_silence_samples = static_cast<size_t>(min_silence_duration * sample_rate);
+    const size_t keep_tail_samples   = static_cast<size_t>(0.01f * sample_rate);
+    size_t last_audio_idx = n_samples;
+
+    for (size_t i = n_samples - 1; i > 0; --i) {
+        if (std::fabs(data[i]) > threshold) {
+            size_t silence_after = n_samples - 1 - i;
+            if (silence_after >= min_silence_samples) {
+                last_audio_idx = std::min(n_samples, i + 1 + keep_tail_samples);
+            }
+            break;
+        }
+    }
+
+    if (last_audio_idx == n_samples) {
+        bool has_audio = false;
+        for (size_t i = 0; i < n_samples; ++i) {
+            if (std::fabs(data[i]) > threshold) { has_audio = true; break; }
+        }
+        if (!has_audio) return std::vector<float>();
+        return std::vector<float>(data, data + n_samples);
+    }
+
+    const size_t min_audio_samples = static_cast<size_t>(0.1f * sample_rate);
+    if (last_audio_idx < min_audio_samples) {
+        last_audio_idx = std::min(min_audio_samples, n_samples);
+    }
+
+    return std::vector<float>(data, data + last_audio_idx);
+}
+
 bool load_audio(const std::string & path, AudioData & out, int32_t target_sample_rate) {
     if (!audio_read(path, out)) {
         return false;
@@ -135,8 +234,39 @@ bool load_audio(const std::string & path, AudioData & out, int32_t target_sample
     return true;
 }
 
-bool save_audio(const std::string & path, const std::vector<float> & data, int32_t sample_rate) {
-    return audio_write_wav(path, data.data(), data.size(), sample_rate);
+bool load_audio_from_memory(const void * data, size_t bytes, AudioData & out, int32_t target_sample_rate) {
+    if (!audio_read_from_memory(data, bytes, out)) {
+        return false;
+    }
+    if (target_sample_rate > 0 && out.sample_rate != target_sample_rate) {
+        out.samples = audio_resample(out.samples.data(), out.samples.size(), out.sample_rate, target_sample_rate);
+        out.sample_rate = target_sample_rate;
+    }
+    return true;
+}
+
+bool save_audio(const std::string & path, const std::vector<float> & data, int32_t sample_rate,
+                bool trim_silence, bool normalize_peak) {
+    std::vector<float> output_data = data;
+
+    if (trim_silence && !output_data.empty()) {
+        auto trimmed = audio_trim_trailing_silence(output_data.data(), output_data.size(), sample_rate);
+        if (!trimmed.empty()) output_data = std::move(trimmed);
+    }
+
+    if (normalize_peak && !output_data.empty()) {
+        float peak = 0.0f;
+        for (float s : output_data) {
+            float a = std::fabs(s);
+            if (a > peak) peak = a;
+        }
+        if (peak > 1e-6f) {
+            float scale = 0.95f / peak;
+            for (float & s : output_data) s *= scale;
+        }
+    }
+
+    return audio_write_wav(path, output_data.data(), output_data.size(), sample_rate);
 }
 
 } // namespace s2

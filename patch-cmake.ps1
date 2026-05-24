@@ -209,6 +209,7 @@ set(S2_SOURCES
     src/s2_prompt.cpp
     src/s2_generate.cpp
     src/s2_pipeline.cpp
+    src/s2_voice.cpp
     src/main.cpp
 )
 

@@ -1,4 +1,5 @@
 #include "../include/s2_pipeline.h"
+#include "../third_party/filesystem.hpp"
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -344,6 +345,16 @@ bool Pipeline::synthesize_segment(
 }
 
 // ---------------------------------------------------------------------------
+// postprocess_audio — trim silence (otras operaciones pueden añadirse aquí)
+// ---------------------------------------------------------------------------
+void Pipeline::postprocess_audio(std::vector<float> & audio, const PipelineParams & params) const {
+    if (params.trim_silence && !audio.empty()) {
+        auto trimmed = audio_trim_trailing_silence(audio.data(), audio.size(), codec_.sample_rate());
+        if (!trimmed.empty()) audio = std::move(trimmed);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // get_ref_codes — obtiene los codes de referencia de voz con caché LRU.
 //
 // Prioridad:
@@ -363,14 +374,38 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         return true;
     }
 
-    // 2. Sin referencia por request → generar sin voz de referencia
+    // 2. Voice profile persistido (--voice <id>) — si no hay prompt_audio_path
+    if (params.prompt_audio_path.empty() && !params.voice_id.empty()) {
+        voice_mgr_.set_storage_dir(params.voice_storage_dir);
+        std::cout << "[Voice] Loading profile: " << params.voice_id << "\n";
+        try {
+            VoiceProfile profile = voice_mgr_.load(params.voice_id);
+            const int32_t num_cb = model_.hparams().num_codebooks;
+            if (!profile.is_compatible(num_cb, model_.hparams().codebook_size, codec_.sample_rate())) {
+                std::cerr << "[Voice] Profile incompatible with current model/codec.\n";
+                out_codes.clear(); out_T_prompt = 0;
+                return true; // no es fatal — genera sin referencia
+            }
+            out_codes    = std::move(profile.codes);
+            out_T_prompt = profile.T_prompt;
+            std::cout << "[Voice] Loaded: " << params.voice_id
+                      << " (" << out_T_prompt << " frames)\n";
+            return true;
+        } catch (const std::exception & e) {
+            std::cerr << "[Voice] Failed to load '" << params.voice_id << "': " << e.what() << "\n";
+            out_codes.clear(); out_T_prompt = 0;
+            return true;
+        }
+    }
+
+    // 3. Sin referencia por request → generar sin voz de referencia
     if (params.prompt_audio_path.empty()) {
         out_codes.clear();
         out_T_prompt = 0;
         return true;
     }
 
-    // 3. Buscar en caché
+    // 4. Buscar en caché
     auto it = voice_cache_.find(params.prompt_audio_path);
     if (it != voice_cache_.end()) {
         std::cout << "[VoiceCache] HIT: " << params.prompt_audio_path << "\n";
@@ -379,7 +414,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         return true;
     }
 
-    // 4. Encodear y guardar en caché
+    // 5. Encodear y guardar en caché
     std::cout << "[VoiceCache] MISS — encoding: " << params.prompt_audio_path << "\n";
     AudioData ra;
     if (!load_audio(params.prompt_audio_path, ra, codec_.sample_rate())) {
@@ -414,6 +449,28 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
     std::cout << "[VoiceCache] Cached (" << voice_cache_.size()
               << "/" << VOICE_CACHE_MAX << "): " << params.prompt_audio_path << "\n";
 
+    // --save-voice: persistir el perfil codificado en disco
+    if (params.save_voice && !params.voice_id.empty() && !codes.empty()) {
+        voice_mgr_.set_storage_dir(params.voice_storage_dir);
+        if (params.prompt_text.empty()) {
+            std::cerr << "[Voice] --save-voice requires --prompt-text to store transcript.\n";
+        } else {
+            VoiceProfile profile;
+            profile.transcript    = params.prompt_text;
+            profile.codes         = codes;
+            profile.num_codebooks = model_.hparams().num_codebooks;
+            profile.T_prompt      = T_prompt;
+            profile.sample_rate   = codec_.sample_rate();
+            profile.codebook_size = model_.hparams().codebook_size;
+            if (voice_mgr_.save(params.voice_id, profile)) {
+                std::cout << "[Voice] Saved profile: " << params.voice_id
+                          << " -> " << voice_mgr_.storage_dir() << "\n";
+            } else {
+                std::cerr << "[Voice] Failed to save profile: " << params.voice_id << "\n";
+            }
+        }
+    }
+
     out_codes    = codes;
     out_T_prompt = T_prompt;
     return true;
@@ -438,6 +495,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
     auto process_segment = [&](const std::string & seg) -> bool {
         std::vector<float> audio;
         if (!synthesize_segment(params, seg, ref_codes, T_prompt, audio)) return false;
+        postprocess_audio(audio, params);
         return tmp.write_segment(audio);
         // 'audio' se destruye aquí → RAM liberada antes del siguiente segmento
     };
@@ -455,10 +513,11 @@ bool Pipeline::synthesize(const PipelineParams & params) {
     }
 
     // Construir WAV final desde el archivo temporal
+    const std::string final_path = params.output_path.empty() ? "out.wav" : params.output_path;
     std::rewind(tmp.fp);
-    std::ofstream out(params.output_path, std::ios::binary);
+    std::ofstream out(final_path, std::ios::binary);
     if (!out.is_open()) {
-        std::cerr << "Pipeline error: could not create " << params.output_path << "\n";
+        std::cerr << "Pipeline error: could not create " << final_path << "\n";
         return false;
     }
 
@@ -472,7 +531,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
     while ((n = std::fread(copy_buf, 1, sizeof(copy_buf), tmp.fp)) > 0)
         out.write(copy_buf, (std::streamsize)n);
 
-    std::cout << "Saved " << tmp.total_samps << " samples to " << params.output_path << "\n";
+    std::cout << "Saved " << tmp.total_samps << " samples to " << final_path << "\n";
     return true;
 }
 
@@ -521,6 +580,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
         auto ts = std::chrono::steady_clock::now();
         std::vector<float> audio; // solo este segmento en RAM
         if (!synthesize_segment(params, seg, ref_codes, T_prompt, audio)) return false;
+        postprocess_audio(audio, params);
         float dur_s = audio.size() / (float)codec_.sample_rate();
         if (!tmp.write_segment(audio)) {
             std::cerr << "Error writing segment to disk.\n";
@@ -611,6 +671,7 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
         auto ts = std::chrono::steady_clock::now();
         std::vector<float> audio;
         if (!synthesize_segment(params, seg, ref_codes, T_prompt, audio)) return false;
+        postprocess_audio(audio, params);
         float dur_s = audio.size() / (float)codec_.sample_rate();
         bool ok = tmp.write_segment(audio);
         // audio destruido aquí — RAM liberada
@@ -716,6 +777,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             return true;
         }
 
+        postprocess_audio(audio, params);
         float_to_int16(audio, pcm);
         // audio ya no se necesita — liberar antes de llamar al callback
         audio.clear();

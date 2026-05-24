@@ -6,6 +6,7 @@
 #include "s2_generate.h"
 #include "s2_model.h"
 #include "s2_tokenizer.h"
+#include "s2_voice.h"
 
 #include <cstdint>
 #include <functional>
@@ -25,9 +26,9 @@ struct PipelineParams {
     size_t       tokenizer_data_size = 0;
 
     std::string text;
-    std::string prompt_text;
+    std::string prompt_text;       // transcript of the reference audio
     std::string prompt_audio_path;
-    std::string output_path;
+    std::string output_path;       // explicit output WAV path (--output)
 
     GenerateParams gen;
 
@@ -36,9 +37,20 @@ struct PipelineParams {
 
     bool    segment_sentences      = false;
     int32_t codec_chunk_frames     = 0;
-    int32_t codec_overlap_frames   = 0;   // overlap entre chunks del codec; 0 = sin overlap (recomendado con VRAM ajustada)
+    int32_t codec_overlap_frames   = 0;
     int32_t max_tokens_per_segment = 300;
-    int32_t min_seg_chars          = 0;   // longitud mínima de segmento en chars; 0 = sin filtro  // límite de KV cache por segmento; 0 = usar gen.max_new_tokens
+    int32_t min_seg_chars          = 0;
+
+    // Trailing-silence trimming applied after synthesis
+    bool trim_silence = false;
+
+    // Voice profile persistence
+    std::string voice_id;                      // --voice <id>: load saved profile
+    bool        save_voice        = false;     // --save-voice: save after encoding
+    std::string voice_storage_dir = "./voices";// --voice-dir <path>
+
+    // Streaming decode cadence (frames between codec calls); 0 = auto
+    int32_t stream_decode_stride_frames = 0;
 };
 
 struct VoiceCache {
@@ -71,12 +83,10 @@ public:
     // HTTP clásico: todo el audio en un buffer (para clientes simples).
     bool synthesize_to_buffer(const PipelineParams & params, std::vector<char> & output_buffer);
 
-    // Guardar a archivo con ruta explícita.
+    // Guardar a archivo con ruta explícita (--output).
     bool synthesize(const PipelineParams & params);
 
     // WebSocket / streaming: llama al callback una vez por segmento de oración.
-    // El callback recibe PCM int16 listo para enviar por WebSocket.
-    // Si segment_sentences=false, el callback se llama una sola vez con todo el audio.
     bool synthesize_streaming(const PipelineParams & params, StreamCallback callback);
 
     int32_t sample_rate() const { return codec_.sample_rate(); }
@@ -99,6 +109,9 @@ private:
     // Convierte float32 → int16 (clipping a [-1,1])
     static void float_to_int16(const std::vector<float> & in, std::vector<int16_t> & out);
 
+    // Apply post-processing (trim silence) to an audio buffer.
+    void postprocess_audio(std::vector<float> & audio, const PipelineParams & params) const;
+
 private:
     Tokenizer   tokenizer_;
     SlowARModel model_;
@@ -107,16 +120,17 @@ private:
     bool        kv_cache_initialized_ = false;
     int32_t     kv_cache_max_len_     = 0;
 
-    // Para recargar el codec si hace falta (path guardado en init())
     std::string codec_path_;
 
-    bool        reference_loaded_     = false;
+    bool        reference_loaded_ = false;
     std::string reference_embedding_;
     std::string reference_text_;
 
     static constexpr size_t VOICE_CACHE_MAX = 8;
     std::unordered_map<std::string, VoiceCache> voice_cache_;
     std::vector<std::string>                    voice_cache_order_;
+
+    VoiceProfileManager voice_mgr_;
 };
 
 } // namespace s2

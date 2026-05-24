@@ -80,8 +80,13 @@ int main(int argc, char** argv) {
     params.gen.ras_high_temp     = 1.0f;
     params.gen.ras_high_top_p    = 0.9f;
     params.base_dir             = exe_dir;
+    params.output_path          = "";     // vacío = usar archivo temporal Crow
+    params.trim_silence         = false;
+    params.voice_storage_dir    = exe_dir + "voices";
+    params.stream_decode_stride_frames = 0;
 
     int port = 8080;
+    bool list_voices = false;
 
     // --- Parse des arguments ---
     for (int i = 1; i < argc; i++) {
@@ -126,186 +131,260 @@ int main(int argc, char** argv) {
             params.gen.n_threads = std::stoi(argv[++i]);
         } else if ((arg == "--max-tokens") && i + 1 < argc) {
             params.gen.max_new_tokens = std::stoi(argv[++i]);
+        } else if ((arg == "--text") && i + 1 < argc) {
+            params.text = argv[++i];
+        } else if ((arg == "-pt" || arg == "--prompt-text") && i + 1 < argc) {
+            params.prompt_text = argv[++i];
+        } else if (arg == "--voice" && i + 1 < argc) {
+            params.voice_id = argv[++i];
+        } else if (arg == "--save-voice") {
+            params.save_voice = true;
+        } else if (arg == "--voice-dir" && i + 1 < argc) {
+            params.voice_storage_dir = argv[++i];
+        } else if (arg == "--list-voices") {
+            list_voices = true;
+        } else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
+            params.output_path = argv[++i];
+        } else if (arg == "--trim-silence") {
+            params.trim_silence = true;
+        } else if (arg == "--no-trim-silence") {
+            params.trim_silence = false;
+        } else if (arg == "--stream-decode-stride" && i + 1 < argc) {
+            params.stream_decode_stride_frames = std::stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout <<
-R"(s2.exe — Fish Speech TTS inference server  (Windows / Vulkan)
-A local HTTP+WebSocket server that converts text to speech using Fish Speech models.
+R"(s2.exe — Fish Speech TTS server + CLI  (Windows / Vulkan)
+HTTP+WebSocket server and CLI tool for local voice cloning with Fish Speech models.
 
 QUICK START:
-  CPU only (works everywhere):
-    s2.exe --model model.gguf --model-codec codec.gguf
+  Server — CPU (works everywhere):
+    s2.exe --model s2-pro-q4_k_m-transformer-only.gguf \
+           --model-codec s2-pro-q4_k_m-codec-only.gguf
 
-  Single GPU (desktop, plenty of VRAM):
-    s2.exe --model model.gguf --model-codec codec.gguf -v 0 --codec-vulkan 0
-
-  Laptop with iGPU + dGPU, limited VRAM (e.g. RTX 3050 4 GB):
-    s2.exe --model model.gguf --model-codec codec.gguf \
+  Server — RTX 3050 laptop (4 GB VRAM, iGPU on index 0):
+    s2.exe --model s2-pro-q4_k_m-transformer-only.gguf \
+           --model-codec s2-pro-q4_k_m-codec-only.gguf \
            -v 1 --codec-vulkan 1 --segment --codec-chunk 32 \
-           --max-seg-tokens 300 --min-seg-chars 60
+           --max-seg-tokens 300 --min-seg-chars 60 \
+           --temperature 0.8 --top-p 0.8 --top-k 40
+
+  CLI — synthesize once to a file (no server):
+    s2.exe --model ... --model-codec ... -v 1 --codec-vulkan 1 \
+           --prompt-audio ref.wav --prompt-text "Reference transcript." \
+           --text "Hello, this is a cloned voice." \
+           --trim-silence --output hello.wav
+
+  Save a voice profile, then reuse it by name:
+    s2.exe --model ... --model-codec ... -v 1 --codec-vulkan 1 \
+           --prompt-audio ref.wav --prompt-text "Reference transcript." \
+           --voice my_voice --save-voice --output /dev/null
+    s2.exe --model ... --model-codec ... -v 1 --codec-vulkan 1 \
+           --voice my_voice --text "Hello from saved voice." --output out.wav
+
+  List saved voice profiles:
+    s2.exe --list-voices
 
 OPTIONS:
 
   Models:
-    -m,  --model <path>         Path to the transformer GGUF model file.
-                                Default: model.gguf next to the executable.
-         --model-codec <path>   Path to the codec GGUF model file.
-                                Default: codec.gguf next to the executable.
-    -t,  --tokenizer <path>     Path to tokenizer.json.
-                                Default: version embedded inside the executable.
+    -m,  --model <path>          Path to the transformer GGUF model file.
+                                 Default: model.gguf next to the executable.
+         --model-codec <path>    Path to the codec GGUF model file.
+                                 Default: codec.gguf next to the executable.
+    -t,  --tokenizer <path>      Path to tokenizer.json.
+                                 Default: tokenizer embedded inside the exe.
 
   GPU / device selection:
-    -v,  --vulkan <N>           Vulkan device index for the transformer model.
-                                  -1  CPU (default — works on any machine)
-                                   0  first GPU
-                                   1  second GPU (use this on laptops where
-                                      index 0 is the Intel/AMD iGPU)
-         --codec-vulkan <N>     Vulkan device index for the codec model.
-                                Same values as --vulkan.
-                                The codec and transformer can run on different
-                                devices. If you get OOM on the codec, set this
-                                to -1 to run it on CPU (only works with f16/f32
-                                codec weights, NOT with q4_k_m quantization).
+    -v,  --vulkan <N>            Vulkan device for the transformer model.
+                                   -1  CPU (default — works on any machine)
+                                    0  first GPU
+                                    1  second GPU (use on laptops where
+                                       index 0 is the Intel/AMD iGPU)
+         --codec-vulkan <N>      Vulkan device for the codec model.
+                                 Same index values as --vulkan.
+                                 Note: q4_k_m codec only works on GPU; CPU
+                                 fallback requires f16 or f32 codec weights.
 
   Server:
-    -p,  --port <N>             HTTP port to listen on. Default: 8080.
+    -p,  --port <N>              HTTP port to listen on. Default: 8080.
+
+  Reference audio (voice cloning):
+    -pa, --prompt-audio <path>   Path to reference WAV/MP3 for voice cloning.
+    -pt, --prompt-text <text>    Transcript of the reference audio.
+                                 Required when using --save-voice.
+                                 Helps the model align prosody to the reference.
+
+  Voice profiles (save and reuse encoded reference voices):
+         --voice <id>            Load a saved voice profile by name.
+                                 Skips re-encoding the reference audio.
+                                 Ignored if --prompt-audio is also given.
+         --save-voice            Encode --prompt-audio and save it as a profile.
+                                 Requires --voice <id>, --prompt-audio,
+                                 and --prompt-text.
+         --voice-dir <path>      Directory for .s2voice profile files.
+                                 Default: voices/ next to the executable.
+         --list-voices           List saved voice profiles and exit.
+
+  CLI output (no HTTP server):
+    -o,  --output <path>         Synthesize once, write WAV to <path>, exit.
+                                 Combine with --text for the input text, or
+                                 pipe text to stdin if --text is omitted.
+         --text <text>           Input text for CLI mode (--output).
+         --trim-silence          Trim trailing silence from the output WAV.
+         --no-trim-silence       Keep trailing silence in the output (default).
 
   Generation limits:
-         --threads <N>          Number of CPU threads for CPU-bound ops.
-                                Default: 4.
-         --max-tokens <N>       Maximum tokens the model may generate per
-                                request (whole text, no --segment).
-                                Default: 1024.  One token ≈ one codec frame
-                                ≈ ~11 ms of audio at 44100 Hz / hop 512.
-         --max-seg-tokens <N>   Maximum tokens per sentence when --segment is
-                                active. Controls KV-cache size per segment.
-                                Lower values use less VRAM.
-                                Default: 300 (~3.3 s of audio per sentence).
+         --threads <N>           CPU threads for CPU-bound ops. Default: 4.
+         --max-tokens <N>        Max tokens per request (no --segment).
+                                 Default: 1024. One token ≈ ~11 ms of audio.
+         --max-seg-tokens <N>    Max tokens per sentence with --segment.
+                                 Controls KV-cache size; lower = less VRAM.
+                                 Default: 300 (~3.3 s per sentence).
 
   Segmentation (recommended for long texts or limited VRAM):
-         --segment              Split the input text into sentences before
-                                generating. Each sentence is synthesized
-                                independently, which caps VRAM usage to the
-                                longest sentence instead of the full text.
-                                Audio segments are concatenated into one WAV.
-                                Can also be enabled per-request:
-                                  { "text": "...", "segment": true }
-         --min-seg-chars <N>    Minimum character length for a sentence segment.
-                                Segments shorter than N are merged with the next
-                                one before synthesis, preventing very short
-                                clips that tend to sound unnatural or cut off.
-                                Default: 0 (no minimum — keep all segments).
-                                Recommended: 60-90 for most use cases.
+         --segment               Split text into sentences before generating.
+                                 Each sentence uses its own KV cache, capping
+                                 VRAM to the longest sentence, not the full text.
+                                 Enable per-request: { "segment": true }
+         --min-seg-chars <N>     Merge segments shorter than N characters with
+                                 the next one. Prevents unnatural short clips.
+                                 Default: 0 (no minimum). Recommended: 60-90.
 
   Codec chunking (advanced — tune for your VRAM budget):
-         --codec-chunk <N>      Number of codec frames to decode per GPU call.
-                                Each chunk is decoded independently. Smaller
-                                values use less peak VRAM at the cost of
-                                slightly more overhead.
-                                Default: 0 (auto, ~120 frames per chunk).
-                                With 4 GB VRAM and the transformer loaded,
-                                use 32.
-         --codec-overlap <N>    Number of frames of overlap between consecutive
-                                codec chunks. Overlap smooths the audio at chunk
-                                boundaries but increases the VRAM cost of every
-                                chunk after the first (the graph grows with
-                                chunk_len + overlap). On a 4 GB GPU with the
-                                transformer already in VRAM, keep this at 0.
-                                Default: 0.
+         --codec-chunk <N>       Codec frames decoded per GPU call. Smaller =
+                                 less peak VRAM, slightly more overhead.
+                                 Default: 0 (auto, ~120 frames).
+                                 RTX 3050 4 GB with transformer loaded: use 32.
+         --codec-overlap <N>     Overlap frames between codec chunks.
+                                 Smooths chunk boundaries but costs more VRAM
+                                 (graph scales with chunk+overlap). Keep at 0
+                                 on 4 GB GPUs with transformer in VRAM.
+                                 Default: 0.
 
-  Sampling (controls voice variability and expressiveness):
-         --temperature <F>      Sampling temperature for the transformer.
-                                Higher = more expressive and varied, but less
-                                stable. Lower = more monotone but consistent.
-                                Default: 0.7.  Range: 0.1 – 1.5.
-         --top-p <F>            Nucleus (top-p) sampling threshold.
-                                The model samples only from the smallest set of
-                                tokens whose cumulative probability exceeds p.
-                                Default: 0.7.  Range: 0.1 – 1.0.
-         --top-k <N>            Top-k sampling. Only the k most likely tokens
-                                are kept as candidates before applying top-p.
-                                Default: 30.
-         --min-end-tokens <N>   Minimum tokens to generate before the model is
-                                allowed to emit the end-of-sequence token.
-                                Prevents the model from producing very short
-                                or empty clips for short input texts.
-                                Default: 64.
+  Sampling:
+         --temperature <F>       Sampling temperature. Higher = more expressive,
+                                 less stable. Default: 0.7. Range: 0.1-1.5.
+         --top-p <F>             Nucleus sampling threshold.
+                                 Default: 0.7. Range: 0.1-1.0.
+         --top-k <N>             Top-k candidates before applying top-p.
+                                 Default: 30.
+         --min-end-tokens <N>    Min tokens before EOS is allowed. Prevents
+                                 empty output on short texts. Default: 64.
 
   RAS — Repetition Aware Sampling (anti-repetition):
-    RAS detects when the model is looping (repeating the same semantic token
-    recently seen) and resamples that token with a higher temperature to break
-    the loop. Relevant when the model gets stuck repeating a syllable or sound.
+    Detects when the model loops on a token and resamples it at higher
+    temperature. Use if the output stutters or repeats syllables.
+         --ras-window <N>        Recent-token window to watch. Default: 10.
+         --ras-temp <F>          Temperature for the resample. Default: 1.0.
+         --ras-top-p <F>         Top-p for the resample. Default: 0.9.
 
-         --ras-window <N>       Number of recent tokens to watch for repetition.
-                                If the current token appears in this window,
-                                RAS triggers a resample.
-                                Default: 10.
-         --ras-temp <F>         Temperature used when resampling a repeated token.
-                                Should be higher than --temperature to escape loops.
-                                Default: 1.0.
-         --ras-top-p <F>        Top-p used when resampling a repeated token.
-                                Default: 0.9.
+  Streaming (WebSocket /ws/tts):
+         --stream-decode-stride <N>
+                                 Codec decode cadence in frames. Lower values
+                                 reduce first-chunk latency at the cost of more
+                                 decode calls. 0 = auto (4 frames). Default: 0.
 
   Other:
-    -h,  --help                 Show this help and exit.
+    -h,  --help                  Show this help and exit.
 
 HTTP ENDPOINTS:
-  POST /v1/tts                  Fish Audio-compatible synthesis endpoint.
-  POST /v1/audio/speech         OpenAI-compatible synthesis endpoint.
-  POST /synthesize              Legacy endpoint.
-  GET  /v1/models               List available models.
-  GET  /health                  Health check.
+  POST /v1/tts                   Fish Audio-compatible TTS endpoint.
+  POST /v1/audio/speech          OpenAI-compatible TTS endpoint.
+  POST /synthesize               Legacy endpoint.
+  GET  /v1/models                List available models.
+  GET  /health                   Health check.
 
-  Request body (JSON):
+  Request body (JSON) — all fields optional except "text":
     {
-      "text":            "Text to synthesize.",
-      "format":          "wav",           // output format (wav only for now)
-      "segment":         true,            // enable sentence segmentation
-      "temperature":     0.7,
-      "top_p":           0.7,
-      "top_k":           30,
-      "min_end_tokens":  64,
-      "ras_window":      10,
-      "ras_temp":        1.0,
-      "ras_top_p":       0.9,
-      "codec_chunk":     32,
-      "codec_overlap":   0,
-      "min_seg_chars":   60
+      "text":           "Text to synthesize.",
+      "format":         "wav",
+      "segment":        true,
+      "prompt_text":    "Transcript of the reference audio.",
+      "voice":          "my_voice",
+      "temperature":    0.7,
+      "top_p":          0.7,
+      "top_k":          30,
+      "min_end_tokens": 64,
+      "ras_window":     10,
+      "ras_temp":       1.0,
+      "ras_top_p":      0.9,
+      "codec_chunk":    32,
+      "codec_overlap":  0,
+      "min_seg_chars":  60,
+      "trim_silence":   false,
+      "stream_stride":  0
     }
 
 WEBSOCKET ENDPOINT — /ws/tts  (streaming, minimum latency):
-  Send a JSON message with the text; receive binary audio frames as each
-  sentence finishes, without waiting for the full synthesis to complete.
-  Each binary message: [2-byte flags LE][PCM int16 LE, mono, 44100 Hz]
-  A final JSON message {"done": true, "segments": N} signals completion.
+  Send JSON, receive binary PCM frames as each sentence finishes.
+  Binary message format: [2-byte flags LE][PCM int16 LE, mono, 44100 Hz]
+    flags bit 0 = is_last (1 on the final segment)
+  Final message (text): {"done": true, "segments": N, "sample_rate": 44100}
 
   Python example:
     import asyncio, json, websockets
 
     async def tts():
-        uri = "ws://localhost:8080/ws/tts"
-        async with websockets.connect(uri) as ws:
+        async with websockets.connect("ws://localhost:8080/ws/tts") as ws:
             await ws.send(json.dumps({
-                "text": "Hello world. How are you?",
-                "segment": True
+                "text": "Hello world. How are you today?",
+                "segment": True,
+                "voice": "my_voice"
             }))
             while True:
                 msg = await ws.recv()
-                if isinstance(msg, str):       # final status message
-                    print(json.loads(msg))
+                if isinstance(msg, str):
+                    print(json.loads(msg))   # {"done": true, "segments": 2, ...}
                     break
-                pcm = msg[2:]                  # skip 2-byte flags header
-                # feed pcm (int16 mono 44100 Hz) to your audio output
+                pcm = msg[2:]               # strip 2-byte flags header
+                # feed pcm (int16, mono, 44100 Hz) to your audio output
 
-HTTP EXAMPLE:
-  curl -X POST http://localhost:8080/v1/tts \
-       -H "Content-Type: application/json" \
-       -d '{"text": "Hello world.", "segment": true}' \
-       --output audio.wav
+HTTP EXAMPLES:
+  Basic synthesis:
+    curl -X POST http://localhost:8080/v1/tts \
+         -H "Content-Type: application/json" \
+         -d "{"text": "Hello world.", "segment": true}" \
+         --output audio.wav
+
+  With a saved voice:
+    curl -X POST http://localhost:8080/v1/tts \
+         -H "Content-Type: application/json" \
+         -d "{"text": "Hello.", "voice": "my_voice", "trim_silence": true}" \
+         --output audio.wav
 )";
             return 0;
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
             std::cerr << "Use --help for usage information." << std::endl;
+            return 1;
+        }
+    }
+
+    // --list-voices: listar perfiles guardados y salir
+    if (list_voices) {
+        s2::VoiceProfileManager voice_mgr_tmp;
+        voice_mgr_tmp.set_storage_dir(params.voice_storage_dir);
+        std::vector<std::string> ids = voice_mgr_tmp.list();
+        std::sort(ids.begin(), ids.end());
+        if (ids.empty()) {
+            std::cout << "No saved voice profiles in: " << params.voice_storage_dir << "\n";
+        } else {
+            std::cout << "Saved voice profiles (" << params.voice_storage_dir << "):\n";
+            for (const std::string & id : ids) {
+                std::cout << "  " << id << "\n";
+            }
+        }
+        return 0;
+    }
+
+    // --save-voice validations
+    if (params.save_voice) {
+        if (params.voice_id.empty()) {
+            std::cerr << "Error: --save-voice requires --voice <id>.\n";
+            return 1;
+        }
+        if (params.prompt_audio_path.empty() || params.prompt_text.empty()) {
+            std::cerr << "Error: --save-voice requires both --prompt-audio and --prompt-text.\n";
             return 1;
         }
     }
@@ -352,6 +431,31 @@ HTTP EXAMPLE:
         return 1;
     }
 
+    // --- Modo CLI: --output path ---
+    // Si se especificó --output, sintetizar una vez, guardar y salir (sin servidor HTTP).
+    if (!params.output_path.empty()) {
+        if (params.text.empty()) {
+            // Leer stdin si no se pasó texto
+            std::cout << "Reading text from stdin (Ctrl+D to finish)...\n";
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                if (!params.text.empty()) params.text += " ";
+                params.text += line;
+            }
+        }
+        if (params.text.empty()) {
+            std::cerr << "Error: --output requires text. Pipe it or set --text.\n";
+            return 1;
+        }
+        // segment_sentences ya configurado por --segment si el usuario lo pasó
+        if (!pipeline.synthesize(params)) {
+            std::cerr << "Synthesis failed.\n";
+            return 1;
+        }
+        std::cout << "Done: " << params.output_path << "\n";
+        return 0;
+    }
+
     // --- Serveur HTTP ---
     crow::SimpleApp app;
 
@@ -388,6 +492,10 @@ HTTP EXAMPLE:
         if (json.has("ras_window"))       synth_params.gen.ras_window_size         = json["ras_window"].i();
         if (json.has("ras_temp"))         synth_params.gen.ras_high_temp           = (float)json["ras_temp"].d();
         if (json.has("ras_top_p"))        synth_params.gen.ras_high_top_p          = (float)json["ras_top_p"].d();
+        if (json.has("prompt_text"))      synth_params.prompt_text                  = json["prompt_text"].s();
+        if (json.has("voice"))            synth_params.voice_id                     = json["voice"].s();
+        if (json.has("trim_silence"))     synth_params.trim_silence                 = json["trim_silence"].b();
+        if (json.has("stream_stride"))    synth_params.stream_decode_stride_frames  = json["stream_stride"].i();
 
         // Paramètres Fish Audio (ignorés gracieusement si non pertinents)
         // reference_id, chunk_length, normalize, format, mp3_bitrate, opus_bitrate, latency
@@ -572,6 +680,10 @@ HTTP EXAMPLE:
         if (json.has("ras_window"))       ws_params.gen.ras_window_size           = json["ras_window"].i();
         if (json.has("ras_temp"))         ws_params.gen.ras_high_temp             = (float)json["ras_temp"].d();
         if (json.has("ras_top_p"))        ws_params.gen.ras_high_top_p            = (float)json["ras_top_p"].d();
+        if (json.has("prompt_text"))      ws_params.prompt_text                     = json["prompt_text"].s();
+        if (json.has("voice"))            ws_params.voice_id                        = json["voice"].s();
+        if (json.has("trim_silence"))     ws_params.trim_silence                    = json["trim_silence"].b();
+        if (json.has("stream_stride"))    ws_params.stream_decode_stride_frames     = json["stream_stride"].i();
 
         std::cout << "[WS] Sintetizando: \"" << ws_params.text << "\""
                   << (ws_params.segment_sentences ? " [segmentado]" : "") << "\n";
