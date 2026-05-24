@@ -355,6 +355,20 @@ void Pipeline::postprocess_audio(std::vector<float> & audio, const PipelineParam
 }
 
 // ---------------------------------------------------------------------------
+// encode_reference — API pública para que main.cpp encodee sin sintetizar.
+// Delega en get_ref_codes y hereda toda la lógica de VoiceCache.
+// ---------------------------------------------------------------------------
+bool Pipeline::encode_reference(const PipelineParams & params,
+                                 std::vector<int32_t> & out_codes,
+                                 int32_t              & out_T_prompt) {
+    if (!initialized_) {
+        std::cerr << "[Pipeline] encode_reference: pipeline not initialized.\n";
+        return false;
+    }
+    return get_ref_codes(params, out_codes, out_T_prompt);
+}
+
+// ---------------------------------------------------------------------------
 // get_ref_codes — obtiene los codes de referencia de voz con caché LRU.
 //
 // Prioridad:
@@ -751,13 +765,16 @@ void Pipeline::float_to_int16(const std::vector<float> & in,
 // ---------------------------------------------------------------------------
 // synthesize_streaming — genera audio y llama al callback por segmento.
 //
-// Protocolo del callback:
-//   - Se llama una vez por oración (si segment=true) o una vez total (si no).
-//   - is_last=true en la última llamada.
-//   - Si el callback devuelve false, se aborta la generación.
+// Con stream_decode_stride_frames > 0 (o auto=4):
+//   Usa generate_streaming() para recibir frames uno a uno mientras el
+//   transformer genera. Cada vez que se acumulan stride frames, decodifica
+//   ese chunk con el codec y lo envía al cliente. Latencia hasta el primer
+//   chunk: prefill + stride * ~11ms en lugar de esperar todos los tokens.
 //
-// Diseñado para WebSocket: el cliente empieza a recibir y reproducir audio
-// mientras el servidor genera el siguiente segmento en paralelo.
+// Con stream_decode_stride_frames == 0 y segment=true:
+//   Comportamiento previo: genera el segmento completo, decodifica todo y
+//   envía. Útil si el codec tiene poca VRAM (un chunk de decode grande es
+//   más eficiente que muchos chunks pequeños).
 // ---------------------------------------------------------------------------
 bool Pipeline::synthesize_streaming(const PipelineParams & params,
                                      StreamCallback         callback) {
@@ -767,21 +784,160 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
     std::vector<int32_t> ref_codes; int32_t T_prompt = 0;
     get_ref_codes(params, ref_codes, T_prompt);
 
-    auto process_and_send = [&](const std::string & seg, bool is_last) -> bool {
+    // Stride: número de frames a acumular antes de cada decode+send.
+    // 0 → desactivado (flujo segmento-completo).
+    // Valores típicos: 4 (baja latencia) a 32 (menor overhead).
+    const int32_t stride = params.stream_decode_stride_frames;
+    const bool    use_stride = (stride > 0);
+
+    // -----------------------------------------------------------------------
+    // Helper: genera un segmento con decode en tiempo real (stride activo)
+    // -----------------------------------------------------------------------
+    auto stream_segment_stride = [&](const std::string & seg, bool is_last_seg) -> bool {
+        // Construir el prompt usando la API de s2_prompt
+        const int32_t num_cb = model_.hparams().num_codebooks;
+
+        // Construir PromptTensor usando build_prompt de s2_prompt.h
+        PromptTensor pt = build_prompt(
+            tokenizer_,
+            seg,
+            params.prompt_text,
+            ref_codes.empty() ? nullptr : ref_codes.data(),
+            num_cb,
+            T_prompt
+        );
+        if (pt.cols == 0) {
+            std::cerr << "[Stream] build_prompt returned empty for: \"" << seg << "\"\n";
+            return true;
+        }
+
+        // Configurar parámetros de generación para este segmento
+        GenerateParams gp = params.gen;
+        gp.max_new_tokens = params.max_tokens_per_segment;
+        gp.verbose        = false;
+
+        // Inicializar KV cache si es necesario
+        if (!kv_cache_initialized_ || kv_cache_max_len_ < (pt.cols + gp.max_new_tokens)) {
+            int32_t ctx_len = pt.cols + gp.max_new_tokens + 64;
+            if (!model_.init_kv_cache(ctx_len)) {
+                std::cerr << "[Stream] init_kv_cache failed.\n";
+                return false;
+            }
+            kv_cache_initialized_ = true;
+            kv_cache_max_len_     = ctx_len;
+        }
+
+        // Buffer de acumulación de frames para decode por stride
+        const int32_t decode_stride = (stride > 0) ? stride : 4;
+        std::vector<int32_t> pending_codes;   // acumulados, row-major (num_cb, T)
+        pending_codes.reserve(static_cast<size_t>(num_cb) * decode_stride * 2);
+        int32_t pending_frames = 0;
+        bool    cb_ok          = true;
+
+        // Función interna: decodifica pending_codes y envía al callback WS
+        auto flush_pending = [&](bool is_last_chunk) -> bool {
+            if (pending_frames == 0) return true;
+
+            std::vector<float> audio_chunk;
+            if (!codec_.decode_chunked(pending_codes.data(), pending_frames,
+                                        num_cb,
+                                        params.codec_chunk_frames,
+                                        params.codec_overlap_frames,
+                                        audio_chunk)) {
+                std::cerr << "[Stream] decode_chunked failed on chunk of "
+                          << pending_frames << " frames.\n";
+                pending_codes.clear(); pending_frames = 0;
+                return true; // no fatal — seguir con el siguiente stride
+            }
+
+            postprocess_audio(audio_chunk, params);
+
+            std::vector<int16_t> pcm;
+            float_to_int16(audio_chunk, pcm);
+            audio_chunk.clear(); audio_chunk.shrink_to_fit();
+
+            float dur_s = pcm.size() / (float)codec_.sample_rate();
+            std::cout << "[Stream] Chunk " << pending_frames << " frames ("
+                      << dur_s << "s)" << (is_last_chunk ? " [LAST]" : "") << "\n";
+
+            bool ok = callback(pcm.data(), pcm.size(), is_last_chunk);
+            pending_codes.clear(); pending_frames = 0;
+            return ok;
+        };
+
+        // FrameCallback para generate_streaming
+        auto on_frame = [&](const int32_t * codes, int32_t n_cb) -> bool {
+            if (!cb_ok) return false;
+            // Append en row-major: pending_codes[cb * pending_frames_capacity + t]
+            // Para simplificar, usamos layout (T, num_cb) transpuesto luego.
+            // En realidad decode_chunked espera (num_cb, T) row-major.
+            // Acumulamos frame a frame transponiendo al vuelo:
+            //   Para el frame actual t=pending_frames:
+            //     pending_codes[cb * max_T + t] = codes[cb]
+            // Pero max_T no es conocido. Usamos (pending_frames, num_cb) y
+            // transponemos al hacer flush. Más simple: guardamos como (T, num_cb)
+            // y transponemos en flush.
+            for (int32_t cb = 0; cb < n_cb; ++cb) {
+                pending_codes.push_back(codes[cb]);
+            }
+            pending_frames++;
+
+            if (pending_frames >= decode_stride) {
+                // Transponer de (T, num_cb) a (num_cb, T) para decode_chunked
+                std::vector<int32_t> transposed(static_cast<size_t>(num_cb) * pending_frames);
+                for (int32_t t = 0; t < pending_frames; ++t)
+                    for (int32_t cb = 0; cb < num_cb; ++cb)
+                        transposed[static_cast<size_t>(cb) * pending_frames + t] =
+                            pending_codes[static_cast<size_t>(t) * num_cb + cb];
+                pending_codes = std::move(transposed);
+                // flush — is_last_chunk=false (habrá más frames)
+                cb_ok = flush_pending(false);
+                // Reiniciar acumulador en formato (T, num_cb) para próximo stride
+                pending_codes.clear();
+            }
+            return cb_ok;
+        };
+
+        generate_streaming(model_, tokenizer_.config(), pt, gp, on_frame);
+
+        model_.free_kv_cache();
+        kv_cache_initialized_ = false;
+        kv_cache_max_len_     = 0;
+
+        // Flush frames restantes (el último chunk, marcado como is_last)
+        if (pending_frames > 0 && cb_ok) {
+            // Transponer residuo (T, num_cb) → (num_cb, T)
+            std::vector<int32_t> transposed(static_cast<size_t>(num_cb) * pending_frames);
+            for (int32_t t = 0; t < pending_frames; ++t)
+                for (int32_t cb = 0; cb < num_cb; ++cb)
+                    transposed[static_cast<size_t>(cb) * pending_frames + t] =
+                        pending_codes[static_cast<size_t>(t) * num_cb + cb];
+            pending_codes = std::move(transposed);
+            cb_ok = flush_pending(is_last_seg);
+        } else if (cb_ok && is_last_seg) {
+            // Sin residuo pero es el último seg: enviar señal de fin al callback
+            // con 0 muestras (el protocolo WS espera is_last=true en algún punto)
+            // Crow ya envía {"done":true} al salir del lambda — no hace falta.
+        }
+
+        return cb_ok;
+    };
+
+    // -----------------------------------------------------------------------
+    // Helper: segmento completo (comportamiento previo, sin stride)
+    // -----------------------------------------------------------------------
+    auto stream_segment_full = [&](const std::string & seg, bool is_last) -> bool {
         std::vector<float>   audio;
         std::vector<int16_t> pcm;
 
         if (!synthesize_segment(params, seg, ref_codes, T_prompt, audio)) {
             std::cerr << "[Stream] synthesize_segment failed: \"" << seg << "\"\n";
-            // En modo streaming continuamos con el siguiente segmento si falla uno
-            return true;
+            return true; // continuar con el siguiente segmento
         }
 
         postprocess_audio(audio, params);
         float_to_int16(audio, pcm);
-        // audio ya no se necesita — liberar antes de llamar al callback
-        audio.clear();
-        audio.shrink_to_fit();
+        audio.clear(); audio.shrink_to_fit();
 
         float dur_s = pcm.size() / (float)codec_.sample_rate();
         std::cout << "[Stream] Sending " << pcm.size() << " samples ("
@@ -790,20 +946,30 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
         return callback(pcm.data(), pcm.size(), is_last);
     };
 
+    // -----------------------------------------------------------------------
+    // Dispatch: con stride o sin stride
+    // -----------------------------------------------------------------------
     if (params.segment_sentences) {
         auto segs = split_sentences(params.text, params.min_seg_chars);
-        std::cout << "[Stream] " << segs.size() << " segments.\n";
+        std::cout << "[Stream] " << segs.size() << " segments"
+                  << (use_stride ? " (stride=" + std::to_string(stride) + ")" : "") << ".\n";
         for (size_t i = 0; i < segs.size(); ++i) {
             bool is_last = (i == segs.size() - 1);
             std::cout << "[Stream " << (i+1) << "/" << segs.size()
                       << "] \"" << segs[i] << "\"\n";
-            if (!process_and_send(segs[i], is_last)) {
-                std::cout << "[Stream] Callback aborted generation.\n";
+            bool ok = use_stride
+                ? stream_segment_stride(segs[i], is_last)
+                : stream_segment_full(segs[i], is_last);
+            if (!ok) {
+                std::cout << "[Stream] Callback aborted.\n";
                 return false;
             }
         }
     } else {
-        if (!process_and_send(params.text, true)) return false;
+        bool ok = use_stride
+            ? stream_segment_stride(params.text, true)
+            : stream_segment_full(params.text, true);
+        if (!ok) return false;
     }
 
     return true;

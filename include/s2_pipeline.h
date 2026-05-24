@@ -89,7 +89,16 @@ public:
     // WebSocket / streaming: llama al callback una vez por segmento de oración.
     bool synthesize_streaming(const PipelineParams & params, StreamCallback callback);
 
-    int32_t sample_rate() const { return codec_.sample_rate(); }
+    int32_t sample_rate()    const { return codec_.sample_rate(); }
+    int32_t num_codebooks()  const { return model_.hparams().num_codebooks; }
+    int32_t codebook_size()  const { return model_.hparams().codebook_size; }
+
+    // Encode a reference audio and return the codes + T_prompt.
+    // Used by the HTTP POST /v1/voices/<id> endpoint.
+    // Does NOT run TTS generation.
+    bool encode_reference(const PipelineParams & params,
+                          std::vector<int32_t> & out_codes,
+                          int32_t              & out_T_prompt);
 
 private:
     static std::vector<std::string> split_sentences(const std::string & text,

@@ -205,4 +205,141 @@ GenerateResult generate(
     return out;
 }
 
+
+// ---------------------------------------------------------------------------
+// generate_streaming — same loop as generate(), but fires frame_cb per frame
+// instead of accumulating into a flat codes array.
+// ---------------------------------------------------------------------------
+GenerateResult generate_streaming(
+    SlowARModel & model,
+    const TokenizerConfig & config,
+    const PromptTensor & prompt,
+    const GenerateParams & params,
+    FrameCallback frame_cb
+) {
+    GenerateResult out;
+    out.num_codebooks = model.hparams().num_codebooks;
+    if (out.num_codebooks <= 0) out.num_codebooks = 1;
+
+    const int32_t vocab_size    = model.hparams().vocab_size;
+    const int32_t sem_begin     = model.hparams().semantic_begin_id;
+    const int32_t sem_end       = model.hparams().semantic_end_id;
+    const int32_t codebook_size = model.hparams().codebook_size;
+    const int32_t im_end_id     = config.im_end_id;
+    const int32_t num_cb        = out.num_codebooks;
+
+    std::vector<float> sem_mask(vocab_size, -std::numeric_limits<float>::infinity());
+    for (int32_t i = sem_begin; i <= sem_end && i < vocab_size; ++i) sem_mask[i] = 0.0f;
+    if (im_end_id >= 0 && im_end_id < vocab_size) sem_mask[im_end_id] = 0.0f;
+
+    // Transpose prompt to time-major
+    const int32_t rows = prompt.rows;
+    const int32_t cols = prompt.cols;
+    std::vector<int32_t> prompt_tm(static_cast<size_t>(rows) * cols);
+    for (int32_t r = 0; r < rows; ++r)
+        for (int32_t c = 0; c < cols; ++c)
+            prompt_tm[static_cast<size_t>(c) * rows + r] = prompt.data[static_cast<size_t>(r) * cols + c];
+
+    StepResult state;
+    if (params.verbose) std::cout << "[GenerateStream] Prefilling " << cols << " tokens...\n";
+    if (!model.prefill(prompt_tm, cols, params.n_threads, state)) {
+        std::cerr << "[GenerateStream] Prefill failed.\n";
+        return out;
+    }
+
+    auto apply_mask_and_sample = [&](const std::vector<float> & logits, bool block_im_end) -> int32_t {
+        std::vector<float> biased(vocab_size);
+        for (int32_t i = 0; i < vocab_size; ++i) biased[i] = logits[i] + sem_mask[i];
+        if (block_im_end && im_end_id >= 0 && im_end_id < vocab_size)
+            biased[im_end_id] = -std::numeric_limits<float>::infinity();
+        SamplerParams sp;
+        sp.temperature = params.temperature; sp.top_p = params.top_p; sp.top_k = params.top_k;
+        const int32_t force_id = block_im_end ? -1 : im_end_id;
+        return sample_token(biased.data(), vocab_size, sp, force_id);
+    };
+
+    bool block_end = (params.min_tokens_before_end > 0);
+    int32_t main_token = apply_mask_and_sample(state.logits, block_end);
+
+    std::vector<float> fast_logits;
+    SamplerParams sparams;
+    sparams.temperature = params.temperature;
+    sparams.top_p       = params.top_p;
+    sparams.top_k       = params.top_k;
+
+    std::vector<int32_t> ras_window;
+    const int32_t ras_window_size = params.ras_window_size;
+    const float   ras_high_temp   = params.ras_high_temp;
+    const float   ras_high_top_p  = params.ras_high_top_p;
+
+    // Per-frame codes buffer reused across iterations (avoids allocation per frame)
+    std::vector<int32_t> frame_codes(num_cb);
+
+    if (params.verbose) std::cout << "[GenerateStream] Generating...\n";
+
+    int32_t step = 0;
+    while (main_token != im_end_id && step < params.max_new_tokens) {
+        // RAS check
+        if (!ras_window.empty() &&
+            std::find(ras_window.begin(), ras_window.end(), main_token) != ras_window.end() &&
+            main_token >= sem_begin && main_token <= sem_end)
+        {
+            std::vector<float> biased(vocab_size);
+            for (int32_t i = 0; i < vocab_size; ++i) biased[i] = state.logits[i] + sem_mask[i];
+            if (step < params.min_tokens_before_end && im_end_id >= 0 && im_end_id < vocab_size)
+                biased[im_end_id] = -std::numeric_limits<float>::infinity();
+            SamplerParams ras_sp;
+            ras_sp.temperature = ras_high_temp; ras_sp.top_p = ras_high_top_p; ras_sp.top_k = params.top_k;
+            main_token = sample_token(biased.data(), vocab_size, ras_sp,
+                                      (step < params.min_tokens_before_end) ? -1 : im_end_id);
+        }
+
+        ras_window.push_back(main_token);
+        if ((int32_t)ras_window.size() > ras_window_size) ras_window.erase(ras_window.begin());
+
+        int32_t sem_code = main_token - sem_begin;
+        if (sem_code < 0)              sem_code = 0;
+        if (sem_code >= codebook_size) sem_code = codebook_size - 1;
+
+        std::vector<int32_t> codebooks_cb;
+        codebooks_cb.reserve(num_cb);
+        codebooks_cb.push_back(sem_code);
+
+        for (int32_t cb_idx = 1; cb_idx < num_cb; ++cb_idx) {
+            if (!model.fast_decode(state.hidden, codebooks_cb, params.n_threads, fast_logits)) {
+                for (int32_t r = cb_idx; r < num_cb; ++r) codebooks_cb.push_back(0);
+                break;
+            }
+            codebooks_cb.push_back(sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams));
+        }
+
+        // Fire the per-frame callback immediately
+        for (int32_t cb = 0; cb < num_cb; ++cb) frame_codes[cb] = codebooks_cb[cb];
+        if (!frame_cb(frame_codes.data(), num_cb)) break;   // caller requested stop
+        out.n_frames++;
+
+        std::vector<int32_t> step_input(num_cb + 1);
+        step_input[0] = main_token;
+        for (int32_t cb = 0; cb < num_cb; ++cb) step_input[cb + 1] = codebooks_cb[cb];
+
+        if (!model.step(step_input, params.n_threads, state)) {
+            std::cerr << "[GenerateStream] step() failed at step " << step << "\n";
+            break;
+        }
+
+        step++;
+        if (params.verbose && step % 50 == 0)
+            std::cout << "\r[GenerateStream] " << step << " tokens..." << std::flush;
+
+        bool block_next_end = (step < params.min_tokens_before_end);
+        main_token = apply_mask_and_sample(state.logits, block_next_end);
+    }
+
+    if (params.verbose) std::cout << "\n[GenerateStream] Done: " << out.n_frames << " frames.\n";
+
+    // Out.codes is empty — the caller consumed frames via callback.
+    // n_frames is set so callers can report totals.
+    return out;
+}
+
 } // namespace s2

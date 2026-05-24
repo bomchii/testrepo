@@ -47,4 +47,21 @@ GenerateResult generate(
     const GenerateParams & params
 );
 
+// Streaming variant: calls frame_cb(codes_ptr, num_codebooks) once per generated
+// frame, in the order the frames are produced. If frame_cb returns false, generation
+// stops early (treated as EOS). Use this when you want to pipeline decoding with
+// generation instead of waiting for all frames.
+//
+// codes_ptr points to a temporary buffer valid only for the duration of the call.
+// Copy the codes if you need them past the callback return.
+using FrameCallback = std::function<bool(const int32_t * codes, int32_t num_codebooks)>;
+
+GenerateResult generate_streaming(
+    SlowARModel & model,
+    const TokenizerConfig & config,
+    const PromptTensor & prompt,
+    const GenerateParams & params,
+    FrameCallback frame_cb
+);
+
 } // namespace s2

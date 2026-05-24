@@ -351,6 +351,17 @@ HTTP EXAMPLES:
          -H "Content-Type: application/json" \
          -d "{"text": "Hello.", "voice": "my_voice", "trim_silence": true}" \
          --output audio.wav
+
+  Save a voice via HTTP:
+    curl -X POST http://localhost:8080/v1/voices/my_voice \
+         -H "Content-Type: application/json" \
+         -d "{"audio_path": "C:/refs/speaker.wav", "transcript": "Reference text."}"
+
+  List saved voices:
+    curl http://localhost:8080/v1/voices
+
+  Delete a voice:
+    curl -X DELETE http://localhost:8080/v1/voices/my_voice
 )";
             return 0;
         } else {
@@ -605,6 +616,130 @@ HTTP EXAMPLES:
         return crow::response(200, resp);
     });
 
+    // ================================================================
+    // Voice profile management — GET/POST/DELETE /v1/voices
+    // ================================================================
+
+    // GET /v1/voices — list all saved voice profiles
+    CROW_ROUTE(app, "/v1/voices")
+    .methods("GET"_method)
+    ([&]() {
+        s2::VoiceProfileManager mgr;
+        mgr.set_storage_dir(params.voice_storage_dir);
+        std::vector<std::string> ids = mgr.list();
+        std::sort(ids.begin(), ids.end());
+
+        crow::json::wvalue resp;
+        resp["object"] = "list";
+        int idx = 0;
+        for (const std::string & id : ids) {
+            crow::json::wvalue item;
+            item["id"]     = id;
+            item["object"] = "voice";
+            resp["data"][idx++] = std::move(item);
+        }
+        resp["count"] = (int)ids.size();
+        return crow::response(200, resp);
+    });
+
+    // POST /v1/voices/<id> — save a voice profile from multipart (audio + transcript)
+    // Body JSON: { "transcript": "...", "audio_path": "/abs/path/to/ref.wav" }
+    // (uploading raw audio bytes via multipart is left for a future iteration;
+    //  audio_path is sufficient for local use)
+    CROW_ROUTE(app, "/v1/voices/<string>")
+    .methods("POST"_method)
+    ([&](const crow::request& req, const std::string & voice_id) {
+        auto json = crow::json::load(req.body);
+        if (!json) return crow::response(400, "Invalid JSON");
+
+        if (!json.has("audio_path") || !json.has("transcript")) {
+            return crow::response(400, "Required fields: audio_path, transcript");
+        }
+
+        s2::PipelineParams vp = params;
+        vp.prompt_audio_path  = json["audio_path"].s();
+        vp.prompt_text        = json["transcript"].s();
+        vp.voice_id           = voice_id;
+        vp.save_voice         = true;
+        vp.voice_storage_dir  = params.voice_storage_dir;
+        vp.text               = "__probe__";   // dummy — needed for init check only
+
+        // Encode the reference audio and save the profile.
+        // We reuse get_ref_codes via a minimal synthesize call that stops
+        // after encoding (no actual TTS generation).
+        std::vector<int32_t> codes;
+        int32_t T_prompt = 0;
+        if (!pipeline.encode_reference(vp, codes, T_prompt)) {
+            return crow::response(500, "Failed to encode reference audio");
+        }
+
+        s2::VoiceProfileManager mgr;
+        mgr.set_storage_dir(params.voice_storage_dir);
+
+        s2::VoiceProfile profile;
+        profile.transcript    = vp.prompt_text;
+        profile.codes         = codes;
+        profile.T_prompt      = T_prompt;
+        profile.num_codebooks = pipeline.num_codebooks();
+        profile.codebook_size = pipeline.codebook_size();
+        profile.sample_rate   = pipeline.sample_rate();
+
+        if (!mgr.save(voice_id, profile)) {
+            return crow::response(500, "Failed to save voice profile");
+        }
+
+        crow::json::wvalue resp;
+        resp["id"]       = voice_id;
+        resp["object"]   = "voice";
+        resp["T_prompt"] = T_prompt;
+        resp["saved"]    = true;
+        std::cout << "[Voice] Saved via HTTP: " << voice_id << " (" << T_prompt << " frames)\n";
+        return crow::response(201, resp);
+    });
+
+    // GET /v1/voices/<id> — get metadata for a single voice profile
+    CROW_ROUTE(app, "/v1/voices/<string>")
+    .methods("GET"_method)
+    ([&](const std::string & voice_id) {
+        s2::VoiceProfileManager mgr;
+        mgr.set_storage_dir(params.voice_storage_dir);
+        try {
+            s2::VoiceProfile profile = mgr.load(voice_id);
+            crow::json::wvalue resp;
+            resp["id"]             = voice_id;
+            resp["object"]         = "voice";
+            resp["transcript"]     = profile.transcript;
+            resp["T_prompt"]       = profile.T_prompt;
+            resp["num_codebooks"]  = profile.num_codebooks;
+            resp["codebook_size"]  = profile.codebook_size;
+            resp["sample_rate"]    = profile.sample_rate;
+            return crow::response(200, resp);
+        } catch (const std::exception & e) {
+            crow::json::wvalue err;
+            err["error"] = std::string("Voice not found: ") + e.what();
+            return crow::response(404, err);
+        }
+    });
+
+    // DELETE /v1/voices/<id> — delete a saved voice profile
+    CROW_ROUTE(app, "/v1/voices/<string>")
+    .methods("DELETE"_method)
+    ([&](const std::string & voice_id) {
+        s2::VoiceProfileManager mgr;
+        mgr.set_storage_dir(params.voice_storage_dir);
+        if (!mgr.remove(voice_id)) {
+            crow::json::wvalue err;
+            err["error"] = "Voice not found: " + voice_id;
+            return crow::response(404, err);
+        }
+        crow::json::wvalue resp;
+        resp["id"]     = voice_id;
+        resp["deleted"] = true;
+        std::cout << "[Voice] Deleted via HTTP: " << voice_id << "\n";
+        return crow::response(200, resp);
+    });
+
+    // ================================================================
     CROW_ROUTE(app, "/health")
     .methods("GET"_method)
     ([]() {
@@ -620,7 +755,8 @@ HTTP EXAMPLES:
         info["endpoints"][1] = "/synthesize";
         info["endpoints"][2] = "/v1/audio/speech";
         info["endpoints"][3] = "/v1/models";
-        info["endpoints"][4] = "/health";
+        info["endpoints"][4] = "/v1/voices";
+        info["endpoints"][5] = "/health";
         return crow::response(200, info);
     });
 
