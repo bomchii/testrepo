@@ -1,4 +1,4 @@
-name: Build s2.cpp - Windows + Vulkan
+name: Build s2.cpp - Windows (Vulkan + CUDA)
 
 on:
   push:
@@ -208,4 +208,169 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: s2-*-windows-vulkan.zip
+          generate_release_notes: true
+
+  build-cuda:
+    name: Windows Server 2025 - MSVC - CUDA 12
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Instalar CUDA Toolkit 12.6
+        uses: Jimver/cuda-toolkit@v0.2.23
+        with:
+          cuda: '12.6.3'
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Verificar CUDA
+        shell: pwsh
+        run: |
+          nvcc --version
+          $cudaPath = $env:CUDA_PATH
+          if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
+          if (-Not $cudaPath) { Write-Error "CUDA_PATH no encontrado"; exit 1 }
+          Write-Host "CUDA_PATH = $cudaPath"
+          "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+
+      - name: Parchear CMakeLists.txt para CUDA
+        shell: pwsh
+        run: pwsh -File patch-cmake-cuda.ps1
+
+      - name: Cache Crow headers
+        uses: actions/cache@v5
+        with:
+          path: build/_deps/crow-include
+          key: crow-${{ runner.os }}-v1.3.1
+
+      - name: Generar tokenizer_data embebido en el exe
+        shell: pwsh
+        run: |
+          $json = "tokenizer.json"
+          if (-Not (Test-Path $json)) { Write-Error "tokenizer.json no encontrado"; exit 1 }
+
+          $bytes  = [System.IO.File]::ReadAllBytes((Resolve-Path $json).Path)
+          $nBytes = $bytes.Length
+          Write-Host "tokenizer.json: $nBytes bytes ($([math]::Round($nBytes/1MB,2)) MB)"
+
+          $hLines = [System.Collections.Generic.List[string]]::new()
+          $hLines.Add("// tokenizer_data.h -- generado por el workflow. NO editar.")
+          $hLines.Add("#pragma once")
+          $hLines.Add("#include <stddef.h>")
+          $hLines.Add("extern const unsigned char tokenizer_json_data[];")
+          $hLines.Add("extern const unsigned long long tokenizer_json_size;")
+          [System.IO.File]::WriteAllLines(
+              (Join-Path (Get-Location) "src/tokenizer_data.h"),
+              $hLines,
+              [System.Text.UTF8Encoding]::new($false))
+          Write-Host "OK: src/tokenizer_data.h"
+
+          $sb = [System.Text.StringBuilder]::new($nBytes * 6)
+          $sb.AppendLine("// tokenizer_data.cpp -- generado por el workflow. NO editar.") | Out-Null
+          $sb.AppendLine("#ifdef _MSC_VER")                                               | Out-Null
+          $sb.AppendLine("#  pragma warning(push)")                                        | Out-Null
+          $sb.AppendLine("#  pragma warning(disable: 4838 4309 4365 4267)")                | Out-Null
+          $sb.AppendLine("#endif")                                                         | Out-Null
+          $sb.AppendLine("#include <stddef.h>")                                            | Out-Null
+          $sb.AppendLine("extern const unsigned long long tokenizer_json_size = ${nBytes}ULL;")   | Out-Null
+          $sb.AppendLine("extern const unsigned char tokenizer_json_data[] = {")                  | Out-Null
+
+          $COLS = 32
+          for ($i = 0; $i -lt $nBytes; $i += $COLS) {
+              $end   = [Math]::Min($i + $COLS, $nBytes)
+              $chunk = $bytes[$i..($end - 1)]
+              $hexes = ($chunk | ForEach-Object { "0x{0:x2}u" -f $_ }) -join ","
+              $sb.AppendLine("    $hexes,") | Out-Null
+          }
+
+          $sb.AppendLine("    0x00u")   | Out-Null
+          $sb.AppendLine("};")          | Out-Null
+          $sb.AppendLine("#ifdef _MSC_VER")   | Out-Null
+          $sb.AppendLine("#  pragma warning(pop)") | Out-Null
+          $sb.AppendLine("#endif")      | Out-Null
+
+          [System.IO.File]::WriteAllText(
+              (Join-Path (Get-Location) "src/tokenizer_data.cpp"),
+              $sb.ToString(),
+              [System.Text.UTF8Encoding]::new($false))
+          Write-Host "OK: src/tokenizer_data.cpp ($([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1KB,1)) KB)"
+
+      - name: CMake Configure (CUDA)
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DS2_CUDA=ON `
+            -DGGML_CUDA=ON `
+            -DS2_VULKAN=OFF `
+            -DS2_METAL=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_CUDA_ARCHITECTURES=86 `
+            -DGGML_AVX2=ON `
+            -DGGML_AVX512=OFF `
+            -DGGML_VULKAN_FLASH_ATTENTION=OFF
+
+      - name: CMake Build (CUDA)
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Verificar ejecutable CUDA
+        shell: pwsh
+        run: |
+          $exe = "build\Release\s2-cuda.exe"
+          if (-Not (Test-Path $exe)) {
+            Write-Error "s2-cuda.exe no fue generado."
+            exit 1
+          }
+          $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "OK: s2-cuda.exe generado ($sizeMB MB)"
+          & $exe --help 2>&1 | Out-Null
+          $global:LASTEXITCODE = 0
+          Write-Host "OK: s2-cuda.exe ejecuta correctamente"
+
+      - name: Empaquetar release CUDA
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-cuda | Out-Null
+          Copy-Item build\Release\s2-cuda.exe release-cuda\
+
+          # cudart64_12.dll debe distribuirse junto al exe para que funcione
+          # en equipos sin CUDA Toolkit instalado.
+          $cudaPath = $env:CUDA_PATH
+          $cudart = Join-Path $cudaPath "bin\cudart64_12.dll"
+          if (Test-Path $cudart) {
+              Copy-Item $cudart release-cuda\
+              Write-Host "OK: cudart64_12.dll incluida"
+          } else {
+              Write-Warning "cudart64_12.dll no encontrada en $cudaPath\bin — puede faltar en runtime"
+          }
+
+          $sizeMB = [math]::Round((Get-Item release-cuda\s2-cuda.exe).Length / 1MB, 1)
+          Write-Host "`nContenido del release CUDA:"
+          Get-ChildItem release-cuda\ | Format-Table Name, Length -AutoSize
+          Write-Host "Tamanio de s2-cuda.exe: $sizeMB MB"
+
+      - name: Subir artifact CUDA
+        uses: actions/upload-artifact@v6
+        with:
+          name: s2-windows-cuda
+          path: release-cuda/
+          retention-days: 30
+
+      - name: Crear ZIP para GitHub Release (CUDA)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
+          Compress-Archive -Path release-cuda\* -DestinationPath "s2-$tag-windows-cuda.zip"
+        env:
+          GITHUB_REF: ${{ github.ref }}
+
+      - name: Publicar GitHub Release (CUDA)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: s2-*-windows-cuda.zip
           generate_release_notes: true
