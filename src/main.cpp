@@ -33,11 +33,11 @@ static std::string get_exe_dir() {
     wchar_t buf[32768] = {};
     DWORD len = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
     if (len == 0) return "";
-    // Convertir UTF-16 → UTF-8
+    // Convertir UTF-16 -> UTF-8
     int utf8_len = WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(len), nullptr, 0, nullptr, nullptr);
     std::string path(utf8_len, '\0');
     WideCharToMultiByte(CP_UTF8, 0, buf, static_cast<int>(len), path.data(), utf8_len, nullptr, nullptr);
-    // Recortar hasta el último separador
+    // Recortar hasta el ultimo separador
     auto sep = path.find_last_of("/\\");
     return (sep == std::string::npos) ? "" : path.substr(0, sep + 1);
 #else
@@ -55,8 +55,8 @@ int main(int argc, char** argv) {
 
     s2::PipelineParams params;
     // -----------------------------------------------------------------------
-    // Defaults conservadores — funcionan en cualquier PC sin GPU Vulkan.
-    // El usuario activa GPU explícitamente con -v / --codec-vulkan.
+    // Defaults conservadores -- funcionan en cualquier PC sin GPU Vulkan.
+    // El usuario activa GPU explicitamente con -v / --codec-vulkan.
     // -----------------------------------------------------------------------
     params.model_path           = exe_dir + "model.gguf";
     params.tokenizer_path       = exe_dir + "tokenizer.json";
@@ -67,11 +67,11 @@ int main(int argc, char** argv) {
     params.gen.temperature      = 0.7f;
     params.gen.top_p            = 0.7f;
     params.gen.top_k            = 30;
-    params.segment_sentences    = false; // OFF por defecto — el usuario activa con --segment
-    params.codec_chunk_frames   = 0;     // 0 = automático (se calcula en runtime)
+    params.segment_sentences    = false; // OFF por defecto -- el usuario activa con --segment
+    params.codec_chunk_frames   = 0;     // 0 = automatico (se calcula en runtime)
     params.codec_overlap_frames  = 0;     // 0 = sin overlap (recomendado con VRAM ajustada)
-    params.min_seg_chars         = 0;     // 0 = sin filtro de longitud mínima
-    // GenerateParams defaults (también en s2_generate.h)
+    params.min_seg_chars         = 0;     // 0 = sin filtro de longitud minima
+    // GenerateParams defaults (tambien en s2_generate.h)
     params.gen.temperature       = 0.7f;
     params.gen.top_p             = 0.7f;
     params.gen.top_k             = 30;
@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
     params.gen.ras_high_temp     = 1.0f;
     params.gen.ras_high_top_p    = 0.9f;
     params.base_dir             = exe_dir;
-    params.output_path          = "";     // vacío = usar archivo temporal Crow
+    params.output_path          = "";     // vacio = usar archivo temporal Crow
     params.trim_silence         = false;
     params.voice_storage_dir    = exe_dir + "voices";
     params.stream_decode_stride_frames = 0;
@@ -153,22 +153,22 @@ int main(int argc, char** argv) {
             params.stream_decode_stride_frames = std::stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout <<
-R"(s2.exe — Fish Speech TTS server + CLI  (Windows / Vulkan)
+R"(s2.exe -- Fish Speech TTS server + CLI  (Windows / Vulkan)
 HTTP+WebSocket server and CLI tool for local voice cloning with Fish Speech models.
 
 QUICK START:
-  Server — CPU (works everywhere):
+  Server -- CPU (works everywhere):
     s2.exe --model s2-pro-q4_k_m-transformer-only.gguf \
            --model-codec s2-pro-q4_k_m-codec-only.gguf
 
-  Server — RTX 3050 laptop (4 GB VRAM, iGPU on index 0):
+  Server -- RTX 3050 laptop (4 GB VRAM, iGPU on index 0):
     s2.exe --model s2-pro-q4_k_m-transformer-only.gguf \
            --model-codec s2-pro-q4_k_m-codec-only.gguf \
            -v 1 --codec-vulkan 1 --segment --codec-chunk 32 \
            --max-seg-tokens 300 --min-seg-chars 60 \
            --temperature 0.8 --top-p 0.8 --top-k 40
 
-  CLI — synthesize once to a file (no server):
+  CLI -- synthesize once to a file (no server):
     s2.exe --model ... --model-codec ... -v 1 --codec-vulkan 1 \
            --prompt-audio ref.wav --prompt-text "Reference transcript." \
            --text "Hello, this is a cloned voice." \
@@ -196,7 +196,7 @@ OPTIONS:
 
   GPU / device selection:
     -v,  --vulkan <N>            Vulkan device for the transformer model.
-                                   -1  CPU (default — works on any machine)
+                                   -1  CPU (default -- works on any machine)
                                     0  first GPU
                                     1  second GPU (use on laptops where
                                        index 0 is the Intel/AMD iGPU)
@@ -236,7 +236,7 @@ OPTIONS:
   Generation limits:
          --threads <N>           CPU threads for CPU-bound ops. Default: 4.
          --max-tokens <N>        Max tokens per request (no --segment).
-                                 Default: 1024. One token ≈ ~11 ms of audio.
+                                 Default: 1024. One token ~= ~11 ms of audio.
          --max-seg-tokens <N>    Max tokens per sentence with --segment.
                                  Controls KV-cache size; lower = less VRAM.
                                  Default: 300 (~3.3 s per sentence).
@@ -250,7 +250,7 @@ OPTIONS:
                                  the next one. Prevents unnatural short clips.
                                  Default: 0 (no minimum). Recommended: 60-90.
 
-  Codec chunking (advanced — tune for your VRAM budget):
+  Codec chunking (advanced -- tune for your VRAM budget):
          --codec-chunk <N>       Codec frames decoded per GPU call. Smaller =
                                  less peak VRAM, slightly more overhead.
                                  Default: 0 (auto, ~120 frames).
@@ -271,7 +271,7 @@ OPTIONS:
          --min-end-tokens <N>    Min tokens before EOS is allowed. Prevents
                                  empty output on short texts. Default: 64.
 
-  RAS — Repetition Aware Sampling (anti-repetition):
+  RAS -- Repetition Aware Sampling (anti-repetition):
     Detects when the model loops on a token and resamples it at higher
     temperature. Use if the output stutters or repeats syllables.
          --ras-window <N>        Recent-token window to watch. Default: 10.
@@ -294,7 +294,7 @@ HTTP ENDPOINTS:
   GET  /v1/models                List available models.
   GET  /health                   Health check.
 
-  Request body (JSON) — all fields optional except "text":
+  Request body (JSON) -- all fields optional except "text":
     {
       "text":           "Text to synthesize.",
       "format":         "wav",
@@ -315,7 +315,7 @@ HTTP ENDPOINTS:
       "stream_stride":  0
     }
 
-WEBSOCKET ENDPOINT — /ws/tts  (streaming, minimum latency):
+WEBSOCKET ENDPOINT -- /ws/tts  (streaming, minimum latency):
   Send JSON, receive binary PCM frames as each sentence finishes.
   Binary message format: [2-byte flags LE][PCM int16 LE, mono, 44100 Hz]
     flags bit 0 = is_last (1 on the final segment)
@@ -423,7 +423,7 @@ HTTP EXAMPLES:
               << "  RAS window:    " << params.gen.ras_window_size << " tokens\n"
               << "  RAS temp:      " << params.gen.ras_high_temp << "\n";
 
-    // --- Charger le modèle ---
+    // --- Charger le modele ---
     s2::Pipeline pipeline;
 
 #ifdef S2_TOKENIZER_EMBEDDED
@@ -443,10 +443,10 @@ HTTP EXAMPLES:
     }
 
     // --- Modo CLI: --output path ---
-    // Si se especificó --output, sintetizar una vez, guardar y salir (sin servidor HTTP).
+    // Si se especifico --output, sintetizar una vez, guardar y salir (sin servidor HTTP).
     if (!params.output_path.empty()) {
         if (params.text.empty()) {
-            // Leer stdin si no se pasó texto
+            // Leer stdin si no se paso texto
             std::cout << "Reading text from stdin (Ctrl+D to finish)...\n";
             std::string line;
             while (std::getline(std::cin, line)) {
@@ -458,7 +458,7 @@ HTTP EXAMPLES:
             std::cerr << "Error: --output requires text. Pipe it or set --text.\n";
             return 1;
         }
-        // segment_sentences ya configurado por --segment si el usuario lo pasó
+        // segment_sentences ya configurado por --segment si el usuario lo paso
         if (!pipeline.synthesize(params)) {
             std::cerr << "Synthesis failed.\n";
             return 1;
@@ -470,27 +470,27 @@ HTTP EXAMPLES:
     // --- Serveur HTTP ---
     crow::SimpleApp app;
 
-    // Respuestas > 1MB se streamean automáticamente (sin timeout).
-    // Los WAV de audio suelen ser varios MB — sin esto pueden cortar.
+    // Respuestas > 1MB se streamean automaticamente (sin timeout).
+    // Los WAV de audio suelen ser varios MB -- sin esto pueden cortar.
     app.stream_threshold(1024 * 1024); // 1 MB
 
     // ================================================================
-    // Helper : traitement commun de synthèse
+    // Helper : traitement commun de synthese
     // ================================================================
     auto do_synthesize = [&](const crow::json::rvalue& json) -> crow::response {
         s2::PipelineParams synth_params = params;
 
-        // Compatibilité Fish Audio : "text" est le champ principal
+        // Compatibilite Fish Audio : "text" est le champ principal
         if (json.has("text")) {
             synth_params.text = json["text"].s();
         } else if (json.has("input")) {
-            // Certaines implémentations utilisent "input"
+            // Certaines implementations utilisent "input"
             synth_params.text = json["input"].s();
         } else {
             return crow::response(400, "Missing 'text' field");
         }
 
-        // Paramètres de génération (format s2.cpp natif)
+        // Parametres de generation (format s2.cpp natif)
         if (json.has("temperature")) synth_params.gen.temperature = json["temperature"].d();
         if (json.has("top_p"))       synth_params.gen.top_p = json["top_p"].d();
         if (json.has("top_k"))       synth_params.gen.top_k = json["top_k"].i();
@@ -508,17 +508,17 @@ HTTP EXAMPLES:
         if (json.has("trim_silence"))     synth_params.trim_silence                 = json["trim_silence"].b();
         if (json.has("stream_stride"))    synth_params.stream_decode_stride_frames  = json["stream_stride"].i();
 
-        // Paramètres Fish Audio (ignorés gracieusement si non pertinents)
+        // Parametres Fish Audio (ignores gracieusement si non pertinents)
         // reference_id, chunk_length, normalize, format, mp3_bitrate, opus_bitrate, latency
-        // On les accepte sans erreur pour la compatibilité
+        // On les accepte sans erreur pour la compatibilite
 
-        // Déterminer le format de sortie
+        // Determiner le format de sortie
         std::string format = "wav";
         if (json.has("format")) {
             format = json["format"].s();
         }
 
-        // Síntesis — escribe WAV a %TEMP%, Crow lo sirve directo sin cargarlo en RAM
+        // Sintesis -- escribe WAV a %TEMP%, Crow lo sirve directo sin cargarlo en RAM
         std::string wav_path;
         if (!pipeline.synthesize_to_file(synth_params, wav_path)) {
             return crow::response(500, "Synthesis failed");
@@ -528,7 +528,7 @@ HTTP EXAMPLES:
 
         if (format == "pcm") {
             // PCM crudo: cargar en buffer descartando cabecera WAV de 44 bytes.
-            // Único caso donde sí cargamos en RAM (el cliente pide raw PCM).
+            // Unico caso donde si cargamos en RAM (el cliente pide raw PCM).
             std::ifstream f(wav_path, std::ios::binary);
             f.seekg(44);
             std::string pcm_data((std::istreambuf_iterator<char>(f)),
@@ -539,16 +539,16 @@ HTTP EXAMPLES:
             res.body = std::move(pcm_data);
         } else {
             // WAV (default): Crow sirve el archivo temporal directamente.
-            // set_static_file_info usa sendfile del OS — cero copias en RAM.
-            // El archivo se borra después de que Crow lo envíe... pero Crow no
-            // tiene callback de finalización, así que usamos un workaround:
+            // set_static_file_info usa sendfile del OS -- cero copias en RAM.
+            // El archivo se borra despues de que Crow lo envie... pero Crow no
+            // tiene callback de finalizacion, asi que usamos un workaround:
             // ponemos la ruta en el header X-Temp-File y lo borramos en un
-            // middleware de post-respuesta. Por ahora lo borramos con un pequeño
+            // middleware de post-respuesta. Por ahora lo borramos con un pequeno
             // delay en un thread separado (simple y funcional).
             res.set_header("Content-Type", "audio/wav");
             res.set_static_file_info_unsafe(wav_path);
 
-            // Borrar el archivo temporal después de ~5s (tiempo suficiente para
+            // Borrar el archivo temporal despues de ~5s (tiempo suficiente para
             // que Crow termine de enviarlo incluso con conexiones lentas)
             std::string path_copy = wav_path;
             std::thread([path_copy]() {
@@ -575,7 +575,7 @@ HTTP EXAMPLES:
     });
 
     // ================================================================
-    // Route legacy : POST /synthesize (compatibilité avec vos tests)
+    // Route legacy : POST /synthesize (compatibilite avec vos tests)
     // ================================================================
     CROW_ROUTE(app, "/synthesize")
     .methods("POST"_method)
@@ -617,10 +617,10 @@ HTTP EXAMPLES:
     });
 
     // ================================================================
-    // Voice profile management — GET/POST/DELETE /v1/voices
+    // Voice profile management -- GET/POST/DELETE /v1/voices
     // ================================================================
 
-    // GET /v1/voices — list all saved voice profiles
+    // GET /v1/voices -- list all saved voice profiles
     CROW_ROUTE(app, "/v1/voices")
     .methods("GET"_method)
     ([&]() {
@@ -642,7 +642,7 @@ HTTP EXAMPLES:
         return crow::response(200, resp);
     });
 
-    // POST /v1/voices/<id> — save a voice profile from multipart (audio + transcript)
+    // POST /v1/voices/<id> -- save a voice profile from multipart (audio + transcript)
     // Body JSON: { "transcript": "...", "audio_path": "/abs/path/to/ref.wav" }
     // (uploading raw audio bytes via multipart is left for a future iteration;
     //  audio_path is sufficient for local use)
@@ -662,7 +662,7 @@ HTTP EXAMPLES:
         vp.voice_id           = voice_id;
         vp.save_voice         = true;
         vp.voice_storage_dir  = params.voice_storage_dir;
-        vp.text               = "__probe__";   // dummy — needed for init check only
+        vp.text               = "__probe__";   // dummy -- needed for init check only
 
         // Encode the reference audio and save the profile.
         // We reuse get_ref_codes via a minimal synthesize call that stops
@@ -697,7 +697,7 @@ HTTP EXAMPLES:
         return crow::response(201, resp);
     });
 
-    // GET /v1/voices/<id> — get metadata for a single voice profile
+    // GET /v1/voices/<id> -- get metadata for a single voice profile
     CROW_ROUTE(app, "/v1/voices/<string>")
     .methods("GET"_method)
     ([&](const std::string & voice_id) {
@@ -721,7 +721,7 @@ HTTP EXAMPLES:
         }
     });
 
-    // DELETE /v1/voices/<id> — delete a saved voice profile
+    // DELETE /v1/voices/<id> -- delete a saved voice profile
     CROW_ROUTE(app, "/v1/voices/<string>")
     .methods("DELETE"_method)
     ([&](const std::string & voice_id) {
@@ -761,25 +761,25 @@ HTTP EXAMPLES:
     });
 
     // ================================================================
-    // WebSocket /ws/tts — streaming real por segmento de oración.
+    // WebSocket /ws/tts -- streaming real por segmento de oracion.
     //
     // Protocolo (JSON sobre WebSocket):
     //
-    //   Cliente → Servidor:
+    //   Cliente -> Servidor:
     //     { "text": "...", "segment": true, "reference_audio": "path" }
     //
-    //   Servidor → Cliente (mensajes binarios):
+    //   Servidor -> Cliente (mensajes binarios):
     //     [2 bytes little-endian: flags] [PCM int16 LE, mono, 44100Hz]
-    //     flags bit0 = is_last (1 si es el último segmento)
+    //     flags bit0 = is_last (1 si es el ultimo segmento)
     //
-    //   Servidor → Cliente (mensaje de texto al finalizar):
+    //   Servidor -> Cliente (mensaje de texto al finalizar):
     //     { "done": true, "segments": N, "sample_rate": 44100 }
     //
-    //   Servidor → Cliente (en caso de error):
-    //     { "error": "descripción" }
+    //   Servidor -> Cliente (en caso de error):
+    //     { "error": "descripcion" }
     //
     // El cliente puede empezar a reproducir el primer mensaje binario
-    // antes de que lleguen los siguientes — latencia = primera oración.
+    // antes de que lleguen los siguientes -- latencia = primera oracion.
     // ================================================================
     CROW_WEBSOCKET_ROUTE(app, "/ws/tts")
     .onopen([](crow::websocket::connection& conn) {
@@ -826,7 +826,7 @@ HTTP EXAMPLES:
 
         int segment_count = 0;
 
-        // El callback se llama por cada segmento de oración.
+        // El callback se llama por cada segmento de oracion.
         // Enviamos: [2 bytes flags little-endian][PCM int16 LE]
         s2::StreamCallback cb = [&](const int16_t* pcm, size_t n_samples, bool is_last) -> bool {
             try {
@@ -840,8 +840,8 @@ HTTP EXAMPLES:
                 segment_count++;
                 return true; // continuar generando
             } catch (...) {
-                std::cerr << "[WS] Error sending segment — client disconnected?\n";
-                return false; // abortar generación
+                std::cerr << "[WS] Error sending segment -- client disconnected?\n";
+                return false; // abortar generacion
             }
         };
 
@@ -866,7 +866,7 @@ HTTP EXAMPLES:
               << "  POST /v1/audio/speech  (OpenAI compatible)\n"
               << "  GET  /v1/models\n"
               << "  GET  /health\n"
-              << "  WS   /ws/tts           (streaming — minimum latency)\n\n";
+              << "  WS   /ws/tts           (streaming -- minimum latency)\n\n";
 
     std::cout << "Server listening on port " << port << "...\n";
     app.port(port).multithreaded().run();

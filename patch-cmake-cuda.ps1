@@ -233,7 +233,7 @@ if(MSVC AND EXISTS "`${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer_data.cpp")
         COMPILE_FLAGS "/wd4838 /wd4309 /wd4365 /wd4267")
 endif()
 
-target_include_directories(s2 PRIVATE
+target_include_directories(s2-cuda PRIVATE
     `${CMAKE_CURRENT_SOURCE_DIR}/include
     `${CMAKE_CURRENT_SOURCE_DIR}/third_party
     `${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
