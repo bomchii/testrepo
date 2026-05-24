@@ -840,10 +840,10 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
 
             std::vector<float> audio_chunk;
             if (!codec_.decode_chunked(pending_codes.data(), pending_frames,
-                                        num_cb,
+                                        params.gen.n_threads,
+                                        audio_chunk,
                                         params.codec_chunk_frames,
-                                        params.codec_overlap_frames,
-                                        audio_chunk)) {
+                                        params.codec_overlap_frames)) {
                 std::cerr << "[Stream] decode_chunked failed on chunk of "
                           << pending_frames << " frames.\n";
                 pending_codes.clear(); pending_frames = 0;
