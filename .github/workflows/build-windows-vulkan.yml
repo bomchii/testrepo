@@ -309,6 +309,8 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF `
             -DGGML_CUDA_ARCHITECTURES=86 `
             -DGGML_AVX2=ON `
+            -DGGML_STATIC=ON `
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static `
             -DGGML_AVX512=OFF `
             -DGGML_VULKAN_FLASH_ATTENTION=OFF
 
@@ -336,21 +338,34 @@ jobs:
           New-Item -ItemType Directory -Force -Path release-cuda | Out-Null
           Copy-Item build\Release\s2-cuda.exe release-cuda\
 
-          # cudart64_12.dll debe distribuirse junto al exe para que funcione
-          # en equipos sin CUDA Toolkit instalado.
+          # cudart esta linkeado estaticamente en el exe (GGML_STATIC=ON +
+          # CMAKE_CUDA_RUNTIME_LIBRARY=Static). NO se necesita cudart64_12.dll.
+          #
+          # cublas NO tiene version estatica en Windows (NVIDIA no la provee).
+          # cublas64_12.dll y cublasLt64_12.dll son las unicas DLLs obligatorias.
           $cudaPath = $env:CUDA_PATH
-          $cudart = Join-Path $cudaPath "bin\cudart64_12.dll"
-          if (Test-Path $cudart) {
-              Copy-Item $cudart release-cuda\
-              Write-Host "OK: cudart64_12.dll incluida"
+          if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
+
+          $cublas = Join-Path $cudaPath "bin\cublas64_12.dll"
+          if (Test-Path $cublas) {
+              Copy-Item $cublas release-cuda\
+              Write-Host "OK: cublas64_12.dll incluida"
           } else {
-              Write-Warning "cudart64_12.dll no encontrada en $cudaPath\bin — puede faltar en runtime"
+              Write-Warning "cublas64_12.dll no encontrada en $cudaPath\bin"
+          }
+
+          $cublasLt = Join-Path $cudaPath "bin\cublasLt64_12.dll"
+          if (Test-Path $cublasLt) {
+              Copy-Item $cublasLt release-cuda\
+              Write-Host "OK: cublasLt64_12.dll incluida"
+          } else {
+              Write-Warning "cublasLt64_12.dll no encontrada -- puede faltar en runtime"
           }
 
           $sizeMB = [math]::Round((Get-Item release-cuda\s2-cuda.exe).Length / 1MB, 1)
           Write-Host "`nContenido del release CUDA:"
           Get-ChildItem release-cuda\ | Format-Table Name, Length -AutoSize
-          Write-Host "Tamanio de s2-cuda.exe: $sizeMB MB"
+          Write-Host "Tamanio de s2-cuda.exe: $sizeMB MB (cudart embebido, cublas dinamica)"
 
       - name: Subir artifact CUDA
         uses: actions/upload-artifact@v6

@@ -15,7 +15,7 @@
 namespace s2 {
 
 // ---------------------------------------------------------------------------
-// Helpers (graph‑level, no side effects)
+// Helpers (graph-level, no side effects)
 // ---------------------------------------------------------------------------
 
 static ggml_tensor * repeat_checked(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b,
@@ -205,7 +205,7 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
               << ", has_fast_decoder: " << hparams_.has_fast_decoder << std::endl;
 
     // ---------------------------------------------------------------------------
-    // Load tensor pointers (metadata only — data loaded below)
+    // Load tensor pointers (metadata only -- data loaded below)
     // ---------------------------------------------------------------------------
     auto req_t = [&](const std::string & name) -> ggml_tensor * {
         ggml_tensor * t = ggml_get_tensor(weights_.ctx_w, name.c_str());
@@ -317,7 +317,7 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
     tmp.shrink_to_fit();
     std::fclose(f);
 
-    // Advise the kernel to drop the file pages from page cache — the weights
+    // Advise the kernel to drop the file pages from page cache -- the weights
     // are now in the backend buffer (VRAM) and we no longer need the cached
     // file data in RAM.
 #ifdef __linux__
@@ -417,7 +417,7 @@ bool SlowARModel::step(const std::vector<int32_t> & flat_tokens, int32_t n_threa
 }
 
 // ---------------------------------------------------------------------------
-// eval_cached() — main inference path with KV cache
+// eval_cached() -- main inference path with KV cache
 // ---------------------------------------------------------------------------
 
 bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
@@ -666,7 +666,7 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
 }
 
 // ---------------------------------------------------------------------------
-// fast_decode() — fast AR decoder (matches eval_fast_prefix from reference)
+// fast_decode() -- fast AR decoder (matches eval_fast_prefix from reference)
 // ---------------------------------------------------------------------------
 
 bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
@@ -833,7 +833,7 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
 } // namespace s2
 
 // ---------------------------------------------------------------------------
-// free_kv_cache() — implementación añadida por s2.cpp fork
+// free_kv_cache() -- implementacion anadida por s2.cpp fork
 // Libera el buffer de KV cache de VRAM/RAM para dar espacio al codec decode.
 // Declarada en s2_model.h pero no implementada en el original de mach92432.
 // ---------------------------------------------------------------------------

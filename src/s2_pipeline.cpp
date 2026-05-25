@@ -25,11 +25,11 @@ Pipeline::Pipeline()  = default;
 Pipeline::~Pipeline() = default;
 
 // ---------------------------------------------------------------------------
-// TempPcmFile — archivo temporal de PCM crudo en %TEMP% (o /tmp en Linux).
+// TempPcmFile -- archivo temporal de PCM crudo en %TEMP% (o /tmp en Linux).
 //
-// Escribe float32 → int16 directamente a disco segmento a segmento.
-// Nunca acumula más de un segmento en RAM.
-// Al terminar, total_samples() devuelve el número total de muestras escritas
+// Escribe float32 -> int16 directamente a disco segmento a segmento.
+// Nunca acumula mas de un segmento en RAM.
+// Al terminar, total_samples() devuelve el numero total de muestras escritas
 // y el FILE* se puede rebobinar para leer y construir el WAV final.
 // ---------------------------------------------------------------------------
 struct TempPcmFile {
@@ -41,16 +41,16 @@ struct TempPcmFile {
 #ifdef _WIN32
         wchar_t tmp_dir[MAX_PATH];
         GetTempPathW(MAX_PATH, tmp_dir);
-        // GetTempFileNameW crea un archivo con extensión .tmp — lo renombramos
+        // GetTempFileNameW crea un archivo con extension .tmp -- lo renombramos
         // a .wav para que Crow sirva el MIME type correcto (audio/wav).
         wchar_t tmp_base[MAX_PATH];
         GetTempFileNameW(tmp_dir, L"s2_", 0, tmp_base);
-        // Construir ruta .wav: reemplazar extensión .tmp por .wav
+        // Construir ruta .wav: reemplazar extension .tmp por .wav
         wchar_t tmp_file[MAX_PATH];
         wcsncpy_s(tmp_file, tmp_base, MAX_PATH);
         wchar_t * ext = wcsrchr(tmp_file, L'.');
         if (ext) wcscpy_s(ext, 5, L".wav");
-        // Renombrar el archivo que Windows ya creó
+        // Renombrar el archivo que Windows ya creo
         _wrename(tmp_base, tmp_file);
         // Convertir a UTF-8 para almacenar
         int n = WideCharToMultiByte(CP_UTF8, 0, tmp_file, -1, nullptr, 0, nullptr, nullptr);
@@ -59,7 +59,7 @@ struct TempPcmFile {
         fp = _wfopen(tmp_file, L"w+b");
 #else
         path = "/tmp/s2_XXXXXX.pcm";
-        // mkstemps para extensión
+        // mkstemps para extension
         int fd = mkstemps(path.data(), 4);
         if (fd < 0) return false;
         fp = fdopen(fd, "w+b");
@@ -67,11 +67,11 @@ struct TempPcmFile {
         return fp != nullptr;
     }
 
-    // Escribe un segmento de audio float32 → int16 a disco.
-    // Solo este segmento necesita estar en RAM simultáneamente.
+    // Escribe un segmento de audio float32 -> int16 a disco.
+    // Solo este segmento necesita estar en RAM simultaneamente.
     bool write_segment(const std::vector<float> & samples) {
         if (!fp || samples.empty()) return false;
-        // Convertir float32 → int16 en un buffer temporal del tamaño del segmento
+        // Convertir float32 -> int16 en un buffer temporal del tamano del segmento
         std::vector<int16_t> pcm(samples.size());
         for (size_t i = 0; i < samples.size(); ++i) {
             float s = std::max(-1.0f, std::min(1.0f, samples[i]));
@@ -99,7 +99,7 @@ struct TempPcmFile {
 };
 
 // ---------------------------------------------------------------------------
-// build_wav_header — 44 bytes estándar PCM WAV
+// build_wav_header -- 44 bytes estandar PCM WAV
 // ---------------------------------------------------------------------------
 static void build_wav_header(char * hdr, uint32_t n_samples, int32_t sample_rate,
                               int16_t n_channels = 1, int16_t bits = 16) {
@@ -126,7 +126,7 @@ static void build_wav_header(char * hdr, uint32_t n_samples, int32_t sample_rate
 }
 
 // ---------------------------------------------------------------------------
-// split_sentences — divide texto en oraciones respetando abreviaturas
+// split_sentences -- divide texto en oraciones respetando abreviaturas
 // ---------------------------------------------------------------------------
 std::vector<std::string> Pipeline::split_sentences(const std::string & text,
                                                     int32_t min_chars) {
@@ -150,7 +150,7 @@ std::vector<std::string> Pipeline::split_sentences(const std::string & text,
             if (min_chars <= 0 || seg_len >= min_chars)
                 sentences.push_back(current.substr(s, e - s + 1));
             // Si el segmento es demasiado corto, se fusiona con el siguiente
-            // dejando current sin limpiar para acumular más texto.
+            // dejando current sin limpiar para acumular mas texto.
             else { current = current.substr(s, e - s + 1) + " "; return; }
         }
         current.clear();
@@ -163,7 +163,7 @@ std::vector<std::string> Pipeline::split_sentences(const std::string & text,
         bool is_end = (c == '.' || c == '!' || c == '?');
         if (!is_end) continue;
 
-        // Consumir comillas/paréntesis de cierre
+        // Consumir comillas/parentesis de cierre
         size_t j = i + 1;
         while (j < text.size() && (text[j] == '"' || text[j] == '\'' ||
                text[j] == ')' || text[j] == ']'))
@@ -240,7 +240,7 @@ bool Pipeline::init(const PipelineParams & params) {
     }
     codec_path_ = codec_path;
 
-    // Sincronizar hparams tokenizer ↔ modelo
+    // Sincronizar hparams tokenizer <-> modelo
     {
         const ModelHParams & hp = model_.hparams();
         TokenizerConfig    & tc = tokenizer_.config();
@@ -280,7 +280,7 @@ bool Pipeline::init(const PipelineParams & params) {
 }
 
 // ---------------------------------------------------------------------------
-// synthesize_segment — genera audio float32 para un fragmento de texto.
+// synthesize_segment -- genera audio float32 para un fragmento de texto.
 // El llamador decide si lo guarda en RAM o lo vuelca a disco.
 // ---------------------------------------------------------------------------
 bool Pipeline::synthesize_segment(
@@ -298,7 +298,7 @@ bool Pipeline::synthesize_segment(
         num_cb, T_prompt);
 
     // KV cache: reutilizar si cabe.
-    // En modo segmentado, limitar max_new_tokens al mínimo necesario para el segmento
+    // En modo segmentado, limitar max_new_tokens al minimo necesario para el segmento
     // para evitar OOM en GPUs con VRAM ajustada (RTX 3050 4GB con modelo+codec en VRAM).
     int32_t seg_max_tokens = params.gen.max_new_tokens;
     if (params.max_tokens_per_segment > 0 && params.max_tokens_per_segment < seg_max_tokens) {
@@ -324,9 +324,9 @@ bool Pipeline::synthesize_segment(
         return false;
     }
 
-    // Liberar el KV cache inmediatamente después de generate() para recuperar
+    // Liberar el KV cache inmediatamente despues de generate() para recuperar
     // VRAM antes de que decode_chunked() intente allocar sus activaciones.
-    // El siguiente segmento lo reinicializará con init_kv_cache().
+    // El siguiente segmento lo reinicializara con init_kv_cache().
     model_.free_kv_cache();
     kv_cache_initialized_ = false;
     kv_cache_max_len_     = 0;
@@ -336,7 +336,7 @@ bool Pipeline::synthesize_segment(
                                params.codec_chunk_frames,
                                params.codec_overlap_frames)) {
         // El codec q4_k_m no es compatible con backend CPU (GGML_ASSERT F16 en ops.cpp).
-        // Si falla en GPU es OOM — reportar directamente sin intentar fallback CPU.
+        // Si falla en GPU es OOM -- reportar directamente sin intentar fallback CPU.
         std::cerr << "Pipeline error: decode_chunked() failed (GPU OOM).\n";
         std::cerr << "  Try reducing --codec-chunk, or use --codec-vulkan -1 with an f16/f32 codec.\n";
         return false;
@@ -345,7 +345,7 @@ bool Pipeline::synthesize_segment(
 }
 
 // ---------------------------------------------------------------------------
-// postprocess_audio — trim silence (otras operaciones pueden añadirse aquí)
+// postprocess_audio -- trim silence (otras operaciones pueden anadirse aqui)
 // ---------------------------------------------------------------------------
 void Pipeline::postprocess_audio(std::vector<float> & audio, const PipelineParams & params) const {
     if (params.trim_silence && !audio.empty()) {
@@ -355,8 +355,8 @@ void Pipeline::postprocess_audio(std::vector<float> & audio, const PipelineParam
 }
 
 // ---------------------------------------------------------------------------
-// encode_reference — API pública para que main.cpp encodee sin sintetizar.
-// Delega en get_ref_codes y hereda toda la lógica de VoiceCache.
+// encode_reference -- API publica para que main.cpp encodee sin sintetizar.
+// Delega en get_ref_codes y hereda toda la logica de VoiceCache.
 // ---------------------------------------------------------------------------
 bool Pipeline::encode_reference(const PipelineParams & params,
                                  std::vector<int32_t> & out_codes,
@@ -369,11 +369,11 @@ bool Pipeline::encode_reference(const PipelineParams & params,
 }
 
 // ---------------------------------------------------------------------------
-// get_ref_codes — obtiene los codes de referencia de voz con caché LRU.
+// get_ref_codes -- obtiene los codes de referencia de voz con cache LRU.
 //
 // Prioridad:
 //   1. reference.wav cargado al init (ya en reference_embedding_)
-//   2. prompt_audio_path del request — busca en caché, encodea si no está
+//   2. prompt_audio_path del request -- busca en cache, encodea si no esta
 // ---------------------------------------------------------------------------
 bool Pipeline::get_ref_codes(const PipelineParams & params,
                               std::vector<int32_t> & out_codes,
@@ -388,7 +388,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         return true;
     }
 
-    // 2. Voice profile persistido (--voice <id>) — si no hay prompt_audio_path
+    // 2. Voice profile persistido (--voice <id>) -- si no hay prompt_audio_path
     if (params.prompt_audio_path.empty() && !params.voice_id.empty()) {
         voice_mgr_.set_storage_dir(params.voice_storage_dir);
         std::cout << "[Voice] Loading profile: " << params.voice_id << "\n";
@@ -398,7 +398,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
             if (!profile.is_compatible(num_cb, model_.hparams().codebook_size, codec_.sample_rate())) {
                 std::cerr << "[Voice] Profile incompatible with current model/codec.\n";
                 out_codes.clear(); out_T_prompt = 0;
-                return true; // no es fatal — genera sin referencia
+                return true; // no es fatal -- genera sin referencia
             }
             out_codes    = std::move(profile.codes);
             out_T_prompt = profile.T_prompt;
@@ -412,14 +412,14 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         }
     }
 
-    // 3. Sin referencia por request → generar sin voz de referencia
+    // 3. Sin referencia por request -> generar sin voz de referencia
     if (params.prompt_audio_path.empty()) {
         out_codes.clear();
         out_T_prompt = 0;
         return true;
     }
 
-    // 4. Buscar en caché
+    // 4. Buscar en cache
     auto it = voice_cache_.find(params.prompt_audio_path);
     if (it != voice_cache_.end()) {
         std::cout << "[VoiceCache] HIT: " << params.prompt_audio_path << "\n";
@@ -428,13 +428,13 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         return true;
     }
 
-    // 5. Encodear y guardar en caché
-    std::cout << "[VoiceCache] MISS — encoding: " << params.prompt_audio_path << "\n";
+    // 5. Encodear y guardar en cache
+    std::cout << "[VoiceCache] MISS -- encoding: " << params.prompt_audio_path << "\n";
     AudioData ra;
     if (!load_audio(params.prompt_audio_path, ra, codec_.sample_rate())) {
         std::cerr << "[VoiceCache] Error loading audio: " << params.prompt_audio_path << "\n";
         out_codes.clear(); out_T_prompt = 0;
-        return true; // no es fatal — genera sin referencia
+        return true; // no es fatal -- genera sin referencia
     }
 
     std::vector<int32_t> codes;
@@ -446,7 +446,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         return true;
     }
 
-    // LRU: si el caché está lleno, borrar la entrada más antigua
+    // LRU: si el cache esta lleno, borrar la entrada mas antigua
     if (voice_cache_.size() >= VOICE_CACHE_MAX && !voice_cache_order_.empty()) {
         const std::string & oldest = voice_cache_order_.front();
         std::cout << "[VoiceCache] Evicting: " << oldest << "\n";
@@ -491,7 +491,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
 }
 
 // ---------------------------------------------------------------------------
-// synthesize — guarda a disco (usa TempPcmFile para RAM mínima)
+// synthesize -- guarda a disco (usa TempPcmFile para RAM minima)
 // ---------------------------------------------------------------------------
 bool Pipeline::synthesize(const PipelineParams & params) {
     if (!initialized_) { std::cerr << "Pipeline not initialized.\n"; return false; }
@@ -511,7 +511,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
         if (!synthesize_segment(params, seg, ref_codes, T_prompt, audio)) return false;
         postprocess_audio(audio, params);
         return tmp.write_segment(audio);
-        // 'audio' se destruye aquí → RAM liberada antes del siguiente segmento
+        // 'audio' se destruye aqui -> RAM liberada antes del siguiente segmento
     };
 
     if (params.segment_sentences) {
@@ -520,7 +520,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
         for (size_t i = 0; i < segs.size(); ++i) {
             std::cout << "[" << (i+1) << "/" << segs.size() << "] \"" << segs[i] << "\"\n";
             if (!process_segment(segs[i]))
-                std::cerr << "Segment " << (i+1) << " failed — continuing.\n";
+                std::cerr << "Segment " << (i+1) << " failed -- continuing.\n";
         }
     } else {
         if (!process_segment(params.text)) return false;
@@ -539,7 +539,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
     build_wav_header(hdr, (uint32_t)tmp.total_samps, codec_.sample_rate());
     out.write(hdr, 44);
 
-    // Streamear PCM desde disco → disco sin pasar por RAM
+    // Streamear PCM desde disco -> disco sin pasar por RAM
     char copy_buf[65536];
     size_t n;
     while ((n = std::fread(copy_buf, 1, sizeof(copy_buf), tmp.fp)) > 0)
@@ -550,14 +550,14 @@ bool Pipeline::synthesize(const PipelineParams & params) {
 }
 
 // ---------------------------------------------------------------------------
-// synthesize_to_buffer — para HTTP (Crow).
+// synthesize_to_buffer -- para HTTP (Crow).
 //
-// Estrategia de RAM mínima:
+// Estrategia de RAM minima:
 //   - Cada segmento se escribe al TempPcmFile (disco, %TEMP%)
 //   - Al final se construye el output_buffer leyendo el archivo temporal
-//   - Pico de RAM = segmento más largo + output_buffer final
+//   - Pico de RAM = segmento mas largo + output_buffer final
 //   - output_buffer es inevitable porque Crow necesita el body completo
-//     antes de enviar la respuesta HTTP. Para streaming verdadero habría
+//     antes de enviar la respuesta HTTP. Para streaming verdadero habria
 //     que usar chunked transfer encoding (mejora futura).
 // ---------------------------------------------------------------------------
 bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
@@ -570,7 +570,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Referencia de voz — con caché LRU para evitar re-encodear entre requests
+    // Referencia de voz -- con cache LRU para evitar re-encodear entre requests
     const int32_t num_cb = model_.hparams().num_codebooks;
     std::vector<int32_t> ref_codes; int32_t T_prompt = 0;
     auto t_ref0 = std::chrono::steady_clock::now();
@@ -588,7 +588,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
     }
     std::cout << "[TempPCM] " << tmp.path << "\n";
 
-    // Función lambda: sintetiza un segmento y lo vuelca a disco inmediatamente
+    // Funcion lambda: sintetiza un segmento y lo vuelca a disco inmediatamente
     uint64_t total_frames = 0;
     auto process_segment = [&](const std::string & seg) -> bool {
         auto ts = std::chrono::steady_clock::now();
@@ -600,10 +600,10 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
             std::cerr << "Error writing segment to disk.\n";
             return false;
         }
-        // audio se destruye aquí → RAM liberada
+        // audio se destruye aqui -> RAM liberada
         auto te = std::chrono::steady_clock::now();
         float inf_s = std::chrono::duration_cast<std::chrono::milliseconds>(te-ts).count()/1000.f;
-        std::cout << "  → " << dur_s << "s audio / " << inf_s << "s inferencia ("
+        std::cout << "  -> " << dur_s << "s audio / " << inf_s << "s inferencia ("
                   << (dur_s/std::max(inf_s,0.001f)) << "x RT)\n";
         total_frames++;
         return true;
@@ -616,7 +616,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
             std::cout << "[" << (i+1) << "/" << segs.size() << "] \""
                       << segs[i] << "\"\n";
             if (!process_segment(segs[i]))
-                std::cerr << "Segment " << (i+1) << " failed — skipping.\n";
+                std::cerr << "Segment " << (i+1) << " failed -- skipping.\n";
         }
     } else {
         if (!process_segment(params.text)) return false;
@@ -634,7 +634,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
               << total_inf_s << "s (" << (total_audio_s/std::max(total_inf_s,0.001f)) << "x RT)\n";
 
     // Construir output_buffer: cabecera WAV (44B) + leer PCM desde disco
-    // Pico de RAM aquí = WAV completo (inevitable para HTTP response body)
+    // Pico de RAM aqui = WAV completo (inevitable para HTTP response body)
     const int32_t sr = codec_.sample_rate();
     uint32_t data_bytes = (uint32_t)(tmp.total_samps * sizeof(int16_t));
     output_buffer.resize(44 + data_bytes);
@@ -646,19 +646,19 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
     if (read != data_bytes) {
         std::cerr << "Pipeline warning: read " << read << "/" << data_bytes << " bytes del temp.\n";
     }
-    // tmp se destruye aquí → archivo temporal borrado automáticamente
+    // tmp se destruye aqui -> archivo temporal borrado automaticamente
 
     std::cout << "[Buffer] WAV ready: " << output_buffer.size() / 1024 << " KB\n";
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// synthesize_to_file — escribe WAV completo a un archivo temporal y retorna
+// synthesize_to_file -- escribe WAV completo a un archivo temporal y retorna
 // la ruta. Crow lo sirve con set_static_file_info() sin cargarlo en RAM.
 //
 // Ventaja sobre synthesize_to_buffer:
-//   - Cero copias extra: PCM → %TEMP% → cliente directo vía sendfile del OS
-//   - RAM pico = 1 segmento en float32, nada más
+//   - Cero copias extra: PCM -> %TEMP% -> cliente directo via sendfile del OS
+//   - RAM pico = 1 segmento en float32, nada mas
 //   - Crow usa stream_threshold para no hacer timeout en archivos grandes
 // ---------------------------------------------------------------------------
 bool Pipeline::synthesize_to_file(const PipelineParams & params,
@@ -688,10 +688,10 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
         postprocess_audio(audio, params);
         float dur_s = audio.size() / (float)codec_.sample_rate();
         bool ok = tmp.write_segment(audio);
-        // audio destruido aquí — RAM liberada
+        // audio destruido aqui -- RAM liberada
         auto te = std::chrono::steady_clock::now();
         float inf_s = std::chrono::duration_cast<std::chrono::milliseconds>(te-ts).count()/1000.f;
-        std::cout << "  → " << dur_s << "s audio in " << inf_s << "s ("
+        std::cout << "  -> " << dur_s << "s audio in " << inf_s << "s ("
                   << (dur_s/std::max(inf_s,0.001f)) << "x RT)\n";
         return ok;
     };
@@ -702,7 +702,7 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
         for (size_t i = 0; i < segs.size(); ++i) {
             std::cout << "[" << (i+1) << "/" << segs.size() << "] \"" << segs[i] << "\"\n";
             if (!process_seg(segs[i]))
-                std::cerr << "Segment " << (i+1) << " failed — skipping.\n";
+                std::cerr << "Segment " << (i+1) << " failed -- skipping.\n";
         }
     } else {
         if (!process_seg(params.text)) return false;
@@ -714,7 +714,7 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
     }
 
     // Construir el WAV final en un NUEVO archivo temporal (con cabecera).
-    // El TempPcmFile solo tiene PCM crudo sin cabecera — necesitamos un
+    // El TempPcmFile solo tiene PCM crudo sin cabecera -- necesitamos un
     // archivo WAV completo para que Crow lo sirva con Content-Type correcto.
     TempPcmFile wav_tmp;
     if (!wav_tmp.open()) {
@@ -727,7 +727,7 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
     build_wav_header(hdr, (uint32_t)tmp.total_samps, codec_.sample_rate());
     std::fwrite(hdr, 1, 44, wav_tmp.fp);
 
-    // Copiar PCM desde tmp → wav_tmp en bloques de 64KB (sin pasar por RAM)
+    // Copiar PCM desde tmp -> wav_tmp en bloques de 64KB (sin pasar por RAM)
     std::rewind(tmp.fp);
     char copy_buf[65536];
     size_t n;
@@ -743,15 +743,15 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
     std::cout << "[File] WAV: " << wav_tmp.path
               << " (" << (44 + tmp.total_samps*2)/1024 << " KB)\n";
 
-    // Transferir ownership de la ruta — el llamador borra el archivo
+    // Transferir ownership de la ruta -- el llamador borra el archivo
     out_wav_path = wav_tmp.path;
     wav_tmp.path.clear(); // evitar que el destructor lo borre
-    // wav_tmp.fp se cierra al destruir — el archivo queda en disco
+    // wav_tmp.fp se cierra al destruir -- el archivo queda en disco
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// float_to_int16 — convierte muestras float32 [-1,1] a int16
+// float_to_int16 -- convierte muestras float32 [-1,1] a int16
 // ---------------------------------------------------------------------------
 void Pipeline::float_to_int16(const std::vector<float> & in,
                                 std::vector<int16_t>      & out) {
@@ -763,18 +763,18 @@ void Pipeline::float_to_int16(const std::vector<float> & in,
 }
 
 // ---------------------------------------------------------------------------
-// synthesize_streaming — genera audio y llama al callback por segmento.
+// synthesize_streaming -- genera audio y llama al callback por segmento.
 //
 // Con stream_decode_stride_frames > 0 (o auto=4):
 //   Usa generate_streaming() para recibir frames uno a uno mientras el
 //   transformer genera. Cada vez que se acumulan stride frames, decodifica
-//   ese chunk con el codec y lo envía al cliente. Latencia hasta el primer
+//   ese chunk con el codec y lo envia al cliente. Latencia hasta el primer
 //   chunk: prefill + stride * ~11ms en lugar de esperar todos los tokens.
 //
 // Con stream_decode_stride_frames == 0 y segment=true:
 //   Comportamiento previo: genera el segmento completo, decodifica todo y
-//   envía. Útil si el codec tiene poca VRAM (un chunk de decode grande es
-//   más eficiente que muchos chunks pequeños).
+//   envia. Util si el codec tiene poca VRAM (un chunk de decode grande es
+//   mas eficiente que muchos chunks pequenos).
 // ---------------------------------------------------------------------------
 bool Pipeline::synthesize_streaming(const PipelineParams & params,
                                      StreamCallback         callback) {
@@ -784,9 +784,9 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
     std::vector<int32_t> ref_codes; int32_t T_prompt = 0;
     get_ref_codes(params, ref_codes, T_prompt);
 
-    // Stride: número de frames a acumular antes de cada decode+send.
-    // 0 → desactivado (flujo segmento-completo).
-    // Valores típicos: 4 (baja latencia) a 32 (menor overhead).
+    // Stride: numero de frames a acumular antes de cada decode+send.
+    // 0 -> desactivado (flujo segmento-completo).
+    // Valores tipicos: 4 (baja latencia) a 32 (menor overhead).
     const int32_t stride = params.stream_decode_stride_frames;
     const bool    use_stride = (stride > 0);
 
@@ -811,7 +811,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             return true;
         }
 
-        // Configurar parámetros de generación para este segmento
+        // Configurar parametros de generacion para este segmento
         GenerateParams gp = params.gen;
         gp.max_new_tokens = params.max_tokens_per_segment;
         gp.verbose        = false;
@@ -827,14 +827,14 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             kv_cache_max_len_     = ctx_len;
         }
 
-        // Buffer de acumulación de frames para decode por stride
+        // Buffer de acumulacion de frames para decode por stride
         const int32_t decode_stride = (stride > 0) ? stride : 4;
         std::vector<int32_t> pending_codes;   // acumulados, row-major (num_cb, T)
         pending_codes.reserve(static_cast<size_t>(num_cb) * decode_stride * 2);
         int32_t pending_frames = 0;
         bool    cb_ok          = true;
 
-        // Función interna: decodifica pending_codes y envía al callback WS
+        // Funcion interna: decodifica pending_codes y envia al callback WS
         auto flush_pending = [&](bool is_last_chunk) -> bool {
             if (pending_frames == 0) return true;
 
@@ -847,7 +847,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
                 std::cerr << "[Stream] decode_chunked failed on chunk of "
                           << pending_frames << " frames.\n";
                 pending_codes.clear(); pending_frames = 0;
-                return true; // no fatal — seguir con el siguiente stride
+                return true; // no fatal -- seguir con el siguiente stride
             }
 
             postprocess_audio(audio_chunk, params);
@@ -875,7 +875,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             //   Para el frame actual t=pending_frames:
             //     pending_codes[cb * max_T + t] = codes[cb]
             // Pero max_T no es conocido. Usamos (pending_frames, num_cb) y
-            // transponemos al hacer flush. Más simple: guardamos como (T, num_cb)
+            // transponemos al hacer flush. Mas simple: guardamos como (T, num_cb)
             // y transponemos en flush.
             for (int32_t cb = 0; cb < n_cb; ++cb) {
                 pending_codes.push_back(codes[cb]);
@@ -890,9 +890,9 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
                         transposed[static_cast<size_t>(cb) * pending_frames + t] =
                             pending_codes[static_cast<size_t>(t) * num_cb + cb];
                 pending_codes = std::move(transposed);
-                // flush — is_last_chunk=false (habrá más frames)
+                // flush -- is_last_chunk=false (habra mas frames)
                 cb_ok = flush_pending(false);
-                // Reiniciar acumulador en formato (T, num_cb) para próximo stride
+                // Reiniciar acumulador en formato (T, num_cb) para proximo stride
                 pending_codes.clear();
             }
             return cb_ok;
@@ -904,9 +904,9 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
         kv_cache_initialized_ = false;
         kv_cache_max_len_     = 0;
 
-        // Flush frames restantes (el último chunk, marcado como is_last)
+        // Flush frames restantes (el ultimo chunk, marcado como is_last)
         if (pending_frames > 0 && cb_ok) {
-            // Transponer residuo (T, num_cb) → (num_cb, T)
+            // Transponer residuo (T, num_cb) -> (num_cb, T)
             std::vector<int32_t> transposed(static_cast<size_t>(num_cb) * pending_frames);
             for (int32_t t = 0; t < pending_frames; ++t)
                 for (int32_t cb = 0; cb < num_cb; ++cb)
@@ -915,9 +915,9 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             pending_codes = std::move(transposed);
             cb_ok = flush_pending(is_last_seg);
         } else if (cb_ok && is_last_seg) {
-            // Sin residuo pero es el último seg: enviar señal de fin al callback
-            // con 0 muestras (el protocolo WS espera is_last=true en algún punto)
-            // Crow ya envía {"done":true} al salir del lambda — no hace falta.
+            // Sin residuo pero es el ultimo seg: enviar senal de fin al callback
+            // con 0 muestras (el protocolo WS espera is_last=true en algun punto)
+            // Crow ya envia {"done":true} al salir del lambda -- no hace falta.
         }
 
         return cb_ok;

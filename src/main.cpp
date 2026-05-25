@@ -545,7 +545,11 @@ HTTP EXAMPLES:
             // ponemos la ruta en el header X-Temp-File y lo borramos en un
             // middleware de post-respuesta. Por ahora lo borramos con un pequeno
             // delay en un thread separado (simple y funcional).
-            res.set_header("Content-Type", "audio/wav");
+            // application/octet-stream es compatible con todos los clientes
+            // (PowerShell Invoke-RestMethod, curl, etc). audio/wav causa warnings
+            // en algunos clientes y hace que PowerShell descarte el body.
+            res.set_header("Content-Type", "application/octet-stream");
+            res.set_header("Content-Disposition", "attachment; filename=\"audio.wav\"");
             res.set_static_file_info_unsafe(wav_path);
 
             // Borrar el archivo temporal despues de ~5s (tiempo suficiente para
