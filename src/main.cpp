@@ -195,15 +195,23 @@ OPTIONS:
                                  Default: tokenizer embedded inside the exe.
 
   GPU / device selection:
-    -v,  --vulkan <N>            Vulkan device for the transformer model.
+    -v,  --vulkan <N>            GPU device index for the transformer model.
+                                 In Vulkan builds this selects the Vulkan device.
+                                 In CUDA builds this selects the CUDA device.
                                    -1  CPU (default -- works on any machine)
                                     0  first GPU
                                     1  second GPU (use on laptops where
                                        index 0 is the Intel/AMD iGPU)
-         --codec-vulkan <N>      Vulkan device for the codec model.
-                                 Same index values as --vulkan.
+         --codec-vulkan <N>      GPU device index for the codec model (Vulkan builds).
+                                 In CUDA builds this flag is ignored -- use -v instead.
                                  Note: q4_k_m codec only works on GPU; CPU
                                  fallback requires f16 or f32 codec weights.
+
+  NOTE FOR CUDA BUILDS (s2-cuda.exe):
+    Use -v <N> to select the CUDA device for both transformer and codec.
+    --codec-vulkan is a Vulkan-only flag and has no effect in this build.
+    Example for RTX 3050 laptop (device 1):
+      s2-cuda.exe --model ... --model-codec ... -v 1 --segment --codec-chunk 32
 
   Server:
     -p,  --port <N>              HTTP port to listen on. Default: 8080.
@@ -403,6 +411,38 @@ HTTP EXAMPLES:
     auto gpu_str = [](int d) -> std::string {
         return d < 0 ? "CPU" : ("GPU " + std::to_string(d));
     };
+
+    // Detectar flags de backend incorrectos y advertir al usuario
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_VULKAN)
+    // Build CUDA: --codec-vulkan se ignora. Redirigir al device CUDA equivalente.
+    if (params.codec_vulkan_device >= 0 && params.vulkan_device < 0) {
+        // El usuario paso --codec-vulkan N pero no -v N
+        // En CUDA el device se controla via -v. Redirigimos automaticamente.
+        params.vulkan_device       = params.codec_vulkan_device;
+        params.codec_vulkan_device = params.codec_vulkan_device;
+        std::cerr << "[Warning] This is a CUDA build. --codec-vulkan is a Vulkan flag.\n"
+                  << "          Redirecting to CUDA device " << params.vulkan_device << ".\n"
+                  << "          Use -v " << params.vulkan_device << " instead.\n";
+    } else if (params.codec_vulkan_device >= 0) {
+        std::cerr << "[Warning] This is a CUDA build. --codec-vulkan is ignored.\n"
+                  << "          CUDA device is controlled by -v / --vulkan.\n";
+    }
+    if (params.codec_vulkan_device < 0 && params.vulkan_device >= 0) {
+        // -v pasado sin --codec-vulkan: aplicar el mismo device al codec
+        params.codec_vulkan_device = params.vulkan_device;
+    }
+#elif defined(GGML_USE_VULKAN) && !defined(GGML_USE_CUDA)
+    // Build Vulkan: no hay nada especial que advertir
+    (void)0;
+#else
+    // Build CPU puro: advertir si el usuario pide GPU
+    if (params.vulkan_device >= 0 || params.codec_vulkan_device >= 0) {
+        std::cerr << "[Warning] This build has no GPU backend compiled.\n"
+                  << "          -v and --codec-vulkan flags are ignored. Running on CPU.\n";
+        params.vulkan_device       = -1;
+        params.codec_vulkan_device = -1;
+    }
+#endif
 
     std::cout << "\nConfiguration:\n"
               << "  Model:         " << params.model_path << "\n"
