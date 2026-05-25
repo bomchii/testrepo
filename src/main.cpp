@@ -538,28 +538,26 @@ HTTP EXAMPLES:
             res.set_header("X-Sample-Rate", std::to_string(pipeline.sample_rate()));
             res.body = std::move(pcm_data);
         } else {
-            // WAV (default): Crow sirve el archivo temporal directamente.
-            // set_static_file_info usa sendfile del OS -- cero copias en RAM.
-            // El archivo se borra despues de que Crow lo envie... pero Crow no
-            // tiene callback de finalizacion, asi que usamos un workaround:
-            // ponemos la ruta en el header X-Temp-File y lo borramos en un
-            // middleware de post-respuesta. Por ahora lo borramos con un pequeno
-            // delay en un thread separado (simple y funcional).
-            // application/octet-stream es compatible con todos los clientes
-            // (PowerShell Invoke-RestMethod, curl, etc). audio/wav causa warnings
-            // en algunos clientes y hace que PowerShell descarte el body.
+            // WAV (default): leer el archivo completo en memoria y responder.
+            // set_static_file_info_unsafe sobreescribe los headers que seteamos
+            // y en Windows/TEMP puede fallar silenciosamente con body vacio.
+            // Leer en RAM es la unica forma confiable con Crow en Windows.
+            std::ifstream wav_f(wav_path, std::ios::binary);
+            if (!wav_f) {
+                std::remove(wav_path.c_str());
+                return crow::response(500, "Failed to read WAV file");
+            }
+            std::string wav_data((std::istreambuf_iterator<char>(wav_f)),
+                                  std::istreambuf_iterator<char>());
+            wav_f.close();
+            std::remove(wav_path.c_str());
+            std::cout << "[File] WAV: " << wav_path
+                      << " (" << (wav_data.size() / 1024) << " KB)\n";
+
             res.set_header("Content-Type", "application/octet-stream");
             res.set_header("Content-Disposition", "attachment; filename=\"audio.wav\"");
-            res.set_static_file_info_unsafe(wav_path);
-
-            // Borrar el archivo temporal despues de ~5s (tiempo suficiente para
-            // que Crow termine de enviarlo incluso con conexiones lentas)
-            std::string path_copy = wav_path;
-            std::thread([path_copy]() {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-                std::remove(path_copy.c_str());
-                std::cout << "[Cleanup] Deleted temp: " << path_copy << "\n";
-            }).detach();
+            res.set_header("Content-Length", std::to_string(wav_data.size()));
+            res.body = std::move(wav_data);
         }
 
         return res;
