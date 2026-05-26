@@ -1,6 +1,8 @@
 #include "../include/s2_codec.h"
-#ifdef GGML_USE_VULKAN
-#include "ggml-vulkan.h"
+#if defined(GGML_USE_CUDA)
+#  include "ggml-cuda.h"
+#elif defined(GGML_USE_VULKAN)
+#  include "ggml-vulkan.h"
 #endif
 #include <iostream>
 #include <vector>
@@ -166,12 +168,12 @@ static int64_t extra_padding_for_conv1d(int64_t length, int kernel_size, int str
     return ideal - length;
 }
 
-// Convert CL (C, T) → LC (T, C) (contiguous)
+// Convert CL (C, T) -> LC (T, C) (contiguous)
 static ggml_tensor * cl_to_lc(ggml_context * ctx, ggml_tensor * x) {
     return ggml_cont(ctx, ggml_transpose(ctx, x));
 }
 
-// Convert LC (T, C) → CL (C, T) (contiguous)
+// Convert LC (T, C) -> CL (C, T) (contiguous)
 static ggml_tensor * lc_to_cl(ggml_context * ctx, ggml_tensor * x) {
     ggml_tensor * xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
     ggml_tensor * x2 = ggml_reshape_2d(ctx, xc, xc->ne[0], xc->ne[1]);
@@ -186,7 +188,7 @@ static ggml_tensor * causal_conv_1d(ggml_context * ctx,
     if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
     if (bias   && bias->type   != GGML_TYPE_F32) bias   = ggml_cast(ctx, bias,   GGML_TYPE_F32);
     // Poids potentiellement aplati en 2D [in_ch*kernel, out_ch, 1] par la quantisation GGUF
-    // → reshaper en 3D [kernel, in_ch, out_ch] attendu par ggml_conv_1d
+    // -> reshaper en 3D [kernel, in_ch, out_ch] attendu par ggml_conv_1d
     if (weight->ne[2] == 1 && weight->ne[0] > 1) {
         const int64_t in_ch = x->ne[0];  // x est CL : ne[0] = canaux
         if (in_ch > 1 && weight->ne[0] % in_ch == 0) {
@@ -211,7 +213,7 @@ static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
                                                ggml_tensor * x, int stride, int crop_right) {
     if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
     if (bias && bias->type != GGML_TYPE_F32) bias = ggml_cast(ctx, bias, GGML_TYPE_F32);
-    // Poids aplati 2D [kernel*out_ch, in_ch, 1] → reshape 3D [kernel, out_ch, in_ch]
+    // Poids aplati 2D [kernel*out_ch, in_ch, 1] -> reshape 3D [kernel, out_ch, in_ch]
     if (weight->ne[2] == 1 && bias) {
         const int64_t in_ch  = weight->ne[1];
         const int64_t out_ch = bias->ne[0];
@@ -537,7 +539,7 @@ static std::vector<float> tensor_to_f32(ggml_tensor * t) {
         ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
         for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(tmp[i]);
     } else {
-        // Dequantification générique via ggml type traits (Q8_0, Q4_K, etc.)
+        // Dequantification generique via ggml type traits (Q8_0, Q4_K, etc.)
         const ggml_type_traits * tr = ggml_get_type_traits(t->type);
         if (!tr || !tr->to_float) {
             throw std::runtime_error("unsupported tensor type for host copy: " +
@@ -580,7 +582,7 @@ static vq_cache load_vq_cache(ggml_context * ctx_w, const std::string & prefix,
     return vq;
 }
 
-// Project input (frames, in_dim) → output (frames, out_dim) via linear
+// Project input (frames, in_dim) -> output (frames, out_dim) via linear
 static void project_1x1(const std::vector<float> & input, int32_t frames,
                          int32_t in_dim, int32_t out_dim,
                          const std::vector<float> & weight, const std::vector<float> & bias,
@@ -652,7 +654,7 @@ static void dequantize_one_vq(const vq_cache & vq, const int32_t * codes, int32_
     }
 }
 
-// Decode (num_codebooks, frames) row-major codes → stage vector (frames, quantizer_input_dim)
+// Decode (num_codebooks, frames) row-major codes -> stage vector (frames, quantizer_input_dim)
 static bool decode_codes_stage(AudioCodec::Impl & impl, const int32_t * codes,
                                 int32_t n_frames, std::vector<float> & stage_out) {
     stage_out.assign(static_cast<size_t>(n_frames) * impl.quantizer_input_dim, 0.0f);
@@ -705,11 +707,21 @@ void AudioCodec::unload() {
 
 bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
     if (vulkan_device >= 0) {
-#ifdef GGML_USE_VULKAN
+#if defined(GGML_USE_CUDA)
+        impl_->backend = ggml_backend_cuda_init(vulkan_device);
+        if (!impl_->backend) {
+            std::cerr << "[Codec] CUDA init failed on device " << vulkan_device
+                      << ", falling back to CPU." << std::endl;
+        } else {
+            std::cout << "[Codec] CUDA backend on device " << vulkan_device << std::endl;
+        }
+#elif defined(GGML_USE_VULKAN)
         impl_->backend = ggml_backend_vk_init(static_cast<size_t>(vulkan_device));
         if (!impl_->backend) {
             std::cerr << "[Codec] Vulkan init failed, falling back to CPU." << std::endl;
         }
+#else
+        std::cerr << "[Codec] No GPU backend compiled, falling back to CPU." << std::endl;
 #endif
     }
     if (!impl_->backend) impl_->backend = ggml_backend_cpu_init();
@@ -863,7 +875,7 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
 }
 
 // ---------------------------------------------------------------------------
-// encode()  — audio (mono float32) → codes (num_codebooks, T) row-major
+// encode()  -- audio (mono float32) -> codes (num_codebooks, T) row-major
 // ---------------------------------------------------------------------------
 
 bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_threads,
@@ -1050,7 +1062,7 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
 }
 
 // ---------------------------------------------------------------------------
-// decode()  — codes (num_codebooks, n_frames) row-major → mono float32 audio
+// decode()  -- codes (num_codebooks, n_frames) row-major -> mono float32 audio
 // ---------------------------------------------------------------------------
 
 bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threads,
@@ -1156,7 +1168,7 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
             return false;
         }
 
-        // audio_t is (1, T) or (C, T) — we expect (1, T), take total elements
+        // audio_t is (1, T) or (C, T) -- we expect (1, T), take total elements
         const int32_t n_samples = static_cast<int32_t>(ggml_nelements(audio_t));
         audio_out.resize(n_samples);
         ggml_backend_tensor_get(audio_t, audio_out.data(), 0, n_samples * sizeof(float));
@@ -1167,18 +1179,18 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
 }
 
 // ---------------------------------------------------------------------------
-// decode_chunked()  — igual que decode() pero procesa en ventanas para
+// decode_chunked()  -- igual que decode() pero procesa en ventanas para
 // evitar OOM en GPUs con VRAM limitada (ej. RTX 3050 4 GB).
 //
 // Estrategia:
-//   - chunk_frames  : cuántos frames procesar por llamada a decode()
+//   - chunk_frames  : cuantos frames procesar por llamada a decode()
 //   - overlap       : frames del chunk anterior que se re-procesan al inicio
 //                     del siguiente para "calentar" el transformer y las
 //                     convoluciones dilatadas sin artefactos de borde.
 //                     Se descarta del output de cada chunk (excepto el primero).
 //
 // El overlap adecuado es max(rvq_transformer_window_size, 64).
-// Con chunk_frames=0 se elige automáticamente basándose en window_size.
+// Con chunk_frames=0 se elige automaticamente basandose en window_size.
 // ---------------------------------------------------------------------------
 
 bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t n_threads,
@@ -1191,7 +1203,7 @@ bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t
 
     // Overlap entre chunks: con overlap > 0 el codec re-procesa N frames del chunk
     // anterior para suavizar las uniones. ADVERTENCIA: en el codec Firefly GAN el
-    // grafo de ggml escala con chunk_len = chunk_frames + overlap — con overlap=31
+    // grafo de ggml escala con chunk_len = chunk_frames + overlap -- con overlap=31
     // y chunk=32 el segundo chunk necesita ~373 MB (OOM en RTX 3050 con transformer
     // en VRAM). Default=0 (sin overlap): todos los chunks tienen el mismo grafo.
     // Usar overlap > 0 solo si la VRAM lo permite (codec solo en GPU sin transformer).
@@ -1199,7 +1211,7 @@ bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t
         ? std::min(overlap_frames, chunk_frames - 1)  // overlap < chunk siempre
         : 0;
 
-    // Tamaño de chunk: si el usuario especificó uno explícito (> 0), respetarlo.
+    // Tamano de chunk: si el usuario especifico uno explicito (> 0), respetarlo.
     if (chunk_frames <= 0) {
         chunk_frames = 120;  // ~2.7 s a 44100/512, cabe en VRAM con modelo en GPU
     }
@@ -1210,7 +1222,7 @@ bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t
 
     audio_out.clear();
 
-    int32_t frame_pos = 0;   // posición actual en el stream de codes
+    int32_t frame_pos = 0;   // posicion actual en el stream de codes
     bool first_chunk  = true;
 
     while (frame_pos < n_frames) {
@@ -1222,7 +1234,7 @@ bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t
         const int32_t chunk_len = chunk_end - chunk_start_with_overlap;
 
         // Copiar chunk de codes a buffer contiguo (num_cb, chunk_len) row-major
-        // El layout original es (num_cb, n_frames) — cada codebook ocupa n_frames slots.
+        // El layout original es (num_cb, n_frames) -- cada codebook ocupa n_frames slots.
         std::vector<int32_t> chunk_codes(static_cast<size_t>(num_cb) * chunk_len);
         for (int32_t cb = 0; cb < num_cb; ++cb) {
             const int32_t * src = codes + static_cast<size_t>(cb) * n_frames + chunk_start_with_overlap;
@@ -1237,9 +1249,9 @@ bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t
             return false;
         }
 
-        // Calcular cuántos samples de audio corresponden al overlap que hay que descartar.
+        // Calcular cuantos samples de audio corresponden al overlap que hay que descartar.
         // El factor de upsample total = product(decoder_rates) * product(quantizer_downsample_factor).
-        // Más simple: lo inferimos del ratio chunk_audio.size() / chunk_len.
+        // Mas simple: lo inferimos del ratio chunk_audio.size() / chunk_len.
         const int32_t samples_per_frame = (chunk_len > 0)
             ? static_cast<int32_t>(chunk_audio.size() / chunk_len)
             : 512;

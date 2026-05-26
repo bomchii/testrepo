@@ -1,4 +1,9 @@
 #include "../include/s2_model.h"
+#if defined(GGML_USE_CUDA)
+#  include "ggml-cuda.h"
+#elif defined(GGML_USE_VULKAN)
+#  include "ggml-vulkan.h"
+#endif
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -97,13 +102,21 @@ SlowARModel::~SlowARModel() {
 
 bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
     if (vulkan_device >= 0) {
-#ifdef GGML_USE_VULKAN
+#if defined(GGML_USE_CUDA)
+        backend_ = ggml_backend_cuda_init(vulkan_device);
+        if (!backend_) {
+            std::cerr << "[Model] CUDA init failed on device " << vulkan_device
+                      << ", falling back to CPU." << std::endl;
+        } else {
+            std::cout << "[Model] CUDA backend on device " << vulkan_device << std::endl;
+        }
+#elif defined(GGML_USE_VULKAN)
         backend_ = ggml_backend_vk_init(static_cast<size_t>(vulkan_device));
         if (!backend_) {
             std::cerr << "[Model] Vulkan init failed, falling back to CPU." << std::endl;
         }
 #else
-        std::cerr << "[Model] Vulkan not compiled, falling back to CPU." << std::endl;
+        std::cerr << "[Model] No GPU backend compiled, falling back to CPU." << std::endl;
 #endif
     }
     if (!backend_) {
