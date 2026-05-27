@@ -853,10 +853,12 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
         }
         std::fclose(f);
 
-        // CUDA workaround: dequantize q4_K tensors to F16 so all CUDA ops work.
-        // ggml-cuda does not implement get_rows / some conv ops for q4_K.
-#if defined(GGML_USE_CUDA)
-        if (!ggml_backend_is_cpu(impl_->backend)) {
+        // Dequantize q4_K/q5_K/q6_K tensors to F16.
+        // ops.cpp:6207 asserts F16 for certain conv ops in the Firefly decoder.
+        // This affects both CPU and CUDA backends with q4_k_m codec weights.
+        {
+            (void)0; // always run dequant for quantized codec models
+        if (true) {
             int32_t dequant_count = 0;
             for (ggml_tensor * t = ggml_get_first_tensor(impl_->ctx_w);
                  t != nullptr;
@@ -883,9 +885,8 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
             }
             if (dequant_count > 0)
                 std::cout << "[Codec] Dequantized " << dequant_count
-                          << " tensors to F16 for CUDA compatibility.\n";
+                          << " tensors to F16 for compatibility.\n";
         }
-#endif
 
         // Load VQ caches (CPU copies of codebooks)
         impl_->semantic_vq = load_vq_cache(impl_->ctx_w,

@@ -1,4 +1,7 @@
 #include "s2_pipeline.h"
+#if defined(GGML_USE_CUDA)
+#  include <cuda_runtime.h>
+#endif
 #include <crow.h>
 #include <fstream>
 #include <iostream>
@@ -428,8 +431,25 @@ HTTP EXAMPLES:
                   << "          CUDA device is controlled by -v / --vulkan.\n";
     }
     if (params.codec_vulkan_device < 0 && params.vulkan_device >= 0) {
-        // -v pasado sin --codec-vulkan: aplicar el mismo device al codec
         params.codec_vulkan_device = params.vulkan_device;
+    }
+    // Auto-clamp CUDA device index.
+    // Vulkan enumerates iGPU as device 0 and dGPU as device 1.
+    // CUDA only counts NVIDIA GPUs: RTX 3050 laptop = device 0, not 1.
+    {
+        int cuda_dev_count = 0;
+        cudaError_t cuda_err = cudaGetDeviceCount(&cuda_dev_count);
+        if (cuda_err != cudaSuccess || cuda_dev_count == 0) {
+            std::cerr << "[Warning] No CUDA devices found. Running on CPU.\n";
+            params.vulkan_device       = -1;
+            params.codec_vulkan_device = -1;
+        } else if (params.vulkan_device >= cuda_dev_count) {
+            std::cerr << "[Warning] CUDA device " << params.vulkan_device
+                      << " not found (" << cuda_dev_count << " device(s) available).\n"
+                      << "          Clamping to device 0.\n";
+            params.vulkan_device       = 0;
+            params.codec_vulkan_device = 0;
+        }
     }
 #elif defined(GGML_USE_VULKAN) && !defined(GGML_USE_CUDA)
     // Build Vulkan: no hay nada especial que advertir
