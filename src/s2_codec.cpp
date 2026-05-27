@@ -857,8 +857,6 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
         // ops.cpp:6207 asserts F16 for certain conv ops in the Firefly decoder.
         // This affects both CPU and CUDA backends with q4_k_m codec weights.
         {
-            (void)0; // always run dequant for quantized codec models
-        if (true) {
             int32_t dequant_count = 0;
             for (ggml_tensor * t = ggml_get_first_tensor(impl_->ctx_w);
                  t != nullptr;
