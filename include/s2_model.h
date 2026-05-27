@@ -1,5 +1,5 @@
 #pragma once
-// s2_model.h — Slow-AR + Fast-AR model (Dual-AR Qwen3 transformer)
+// s2_model.h -- Slow-AR + Fast-AR model (Dual-AR Qwen3 transformer)
 //
 // Loads the Dual-AR portion from a unified GGUF file and provides
 // prefill / step / fast decode operations with KV cache.
@@ -96,7 +96,7 @@ public:
 
     // Initialize KV cache for generation
     bool init_kv_cache(int32_t max_seq_len);
-    void free_kv_cache();  // ← AJOUTER
+    void free_kv_cache();  // <- AJOUTER
 
     // Reset KV cache (for new generation)
     void reset();
@@ -121,6 +121,9 @@ private:
     ModelHParams   hparams_;
     ModelWeights   weights_;
     ggml_backend_t backend_      = nullptr;
+    ggml_backend_t backend_cpu_  = nullptr;
+    ggml_backend_buffer_t emb_buf_cpu_ = nullptr;
+    bool           cuda_mode_    = false;
     ggml_gallocr_t allocr_       = nullptr;
     ggml_gallocr_t fast_allocr_  = nullptr;
     ggml_context * ctx_kv_      = nullptr;

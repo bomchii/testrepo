@@ -88,12 +88,14 @@ SlowARModel::SlowARModel() {}
 
 SlowARModel::~SlowARModel() {
     if (ctx_kv_)          ggml_free(ctx_kv_);
-    if (kv_buf_)          ggml_backend_buffer_free(kv_buf_);
-    if (weights_.ctx_w)   ggml_free(weights_.ctx_w);
+    if (kv_buf_)           ggml_backend_buffer_free(kv_buf_);
+    if (emb_buf_cpu_)      ggml_backend_buffer_free(emb_buf_cpu_);
+    if (weights_.ctx_w)    ggml_free(weights_.ctx_w);
     if (weights_.model_buf) ggml_backend_buffer_free(weights_.model_buf);
     if (fast_allocr_)     ggml_gallocr_free(fast_allocr_);
     if (allocr_)          ggml_gallocr_free(allocr_);
-    if (backend_)         ggml_backend_free(backend_);
+    if (backend_ && backend_ != backend_cpu_) ggml_backend_free(backend_);
+    if (backend_cpu_)      ggml_backend_free(backend_cpu_);
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +111,7 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
                       << ", falling back to CPU." << std::endl;
         } else {
             std::cout << "[Model] CUDA backend on device " << vulkan_device << std::endl;
+            cuda_mode_ = true;
         }
 #elif defined(GGML_USE_VULKAN)
         backend_ = ggml_backend_vk_init(static_cast<size_t>(vulkan_device));
@@ -119,8 +122,14 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
         std::cerr << "[Model] No GPU backend compiled, falling back to CPU." << std::endl;
 #endif
     }
+    // Always keep a CPU backend for embedding tables (CUDA get_rows workaround)
+    backend_cpu_ = ggml_backend_cpu_init();
+    if (!backend_cpu_) {
+        std::cerr << "[Model] Failed to init CPU backend." << std::endl;
+        return false;
+    }
     if (!backend_) {
-        backend_ = ggml_backend_cpu_init();
+        backend_ = backend_cpu_;
     }
     if (!backend_) {
         std::cerr << "[Model] Failed to init any GGML backend." << std::endl;
@@ -129,6 +138,33 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
 
     allocr_      = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     fast_allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
+
+    // CUDA workaround: dequantize embedding tables to F16.
+    // ggml_cuda_get_rows does not support q4_K on vocab 155K.
+#if defined(GGML_USE_CUDA)
+    if (cuda_mode_) {
+        auto dequant_emb = [&](ggml_tensor * t) {
+            if (!t) return;
+            if (t->type != GGML_TYPE_Q4_K && t->type != GGML_TYPE_Q5_K &&
+                t->type != GGML_TYPE_Q6_K) return;
+            const size_t n_elems = static_cast<size_t>(ggml_nelements(t));
+            const size_t q_bytes = ggml_nbytes(t);
+            std::vector<uint8_t> q_data(q_bytes);
+            ggml_backend_tensor_get(t, q_data.data(), 0, q_bytes);
+            std::vector<float> f32_data(n_elems);
+            const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
+            tt->to_float(q_data.data(), f32_data.data(), (int64_t)n_elems);
+            std::vector<ggml_fp16_t> f16_data(n_elems);
+            ggml_fp32_to_fp16_row(f32_data.data(), f16_data.data(), (int64_t)n_elems);
+            t->type = GGML_TYPE_F16;
+            ggml_backend_tensor_set(t, f16_data.data(), 0, n_elems * sizeof(ggml_fp16_t));
+        };
+        dequant_emb(weights_.embeddings);
+        dequant_emb(weights_.codebook_embeddings);
+        dequant_emb(weights_.fast_embeddings);
+        std::cout << "[Model] Embedding tables dequantized to F16 for CUDA.\n";
+    }
+#endif
 
     struct gguf_init_params params = { /*no_alloc=*/true, /*ctx=*/&weights_.ctx_w };
     gguf_context * ctx_gguf = gguf_init_from_file(gguf_path.c_str(), params);

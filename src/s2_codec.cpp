@@ -853,6 +853,40 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
         }
         std::fclose(f);
 
+        // CUDA workaround: dequantize q4_K tensors to F16 so all CUDA ops work.
+        // ggml-cuda does not implement get_rows / some conv ops for q4_K.
+#if defined(GGML_USE_CUDA)
+        if (!ggml_backend_is_cpu(impl_->backend)) {
+            int32_t dequant_count = 0;
+            for (ggml_tensor * t = ggml_get_first_tensor(impl_->ctx_w);
+                 t != nullptr;
+                 t = ggml_get_next_tensor(impl_->ctx_w, t)) {
+                if (t->type == GGML_TYPE_Q4_K ||
+                    t->type == GGML_TYPE_Q5_K ||
+                    t->type == GGML_TYPE_Q6_K) {
+                    // Read quantized data, dequantize to F16, write back
+                    const size_t n_elems = static_cast<size_t>(ggml_nelements(t));
+                    const size_t q_bytes = ggml_nbytes(t);
+                    std::vector<uint8_t> q_data(q_bytes);
+                    ggml_backend_tensor_get(t, q_data.data(), 0, q_bytes);
+                    std::vector<float> f32_data(n_elems);
+                    const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
+                    tt->to_float(q_data.data(), f32_data.data(), (int64_t)n_elems);
+                    // Convert F32 -> F16
+                    std::vector<ggml_fp16_t> f16_data(n_elems);
+                    ggml_fp32_to_fp16_row(f32_data.data(), f16_data.data(), (int64_t)n_elems);
+                    // Change tensor type and write F16 data
+                    t->type = GGML_TYPE_F16;
+                    ggml_backend_tensor_set(t, f16_data.data(), 0, n_elems * sizeof(ggml_fp16_t));
+                    dequant_count++;
+                }
+            }
+            if (dequant_count > 0)
+                std::cout << "[Codec] Dequantized " << dequant_count
+                          << " tensors to F16 for CUDA compatibility.\n";
+        }
+#endif
+
         // Load VQ caches (CPU copies of codebooks)
         impl_->semantic_vq = load_vq_cache(impl_->ctx_w,
             impl_->tprefix + "quantizer.semantic_quantizer.quantizers.0",
