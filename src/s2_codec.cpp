@@ -825,66 +825,85 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
         hop_length_     = impl_->hop_length;
         num_codebooks_  = impl_->quantizer_residual_codebooks + 1;
 
-        // Allocate and load tensor data
-        impl_->model_buf = ggml_backend_alloc_ctx_tensors(impl_->ctx_w, impl_->backend);
-        if (!impl_->model_buf) throw std::runtime_error("ggml_backend_alloc_ctx_tensors() failed");
-
-        const size_t data_offset = gguf_get_data_offset(gguf_ctx);
-        const int64_t n_tensors  = gguf_get_n_tensors(gguf_ctx);
-        std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
-        if (!f) throw std::runtime_error("failed to reopen codec file");
-        for (int64_t ti = 0; ti < n_tensors; ++ti) {
-            const char * name = gguf_get_tensor_name(gguf_ctx, ti);
-            ggml_tensor * t = ggml_get_tensor(impl_->ctx_w, name);
-            if (!t) continue;
-            const size_t off   = data_offset + gguf_get_tensor_offset(gguf_ctx, ti);
-            const size_t nbytes = ggml_nbytes(t);
-            std::vector<uint8_t> tmp(nbytes);
-#ifdef _WIN32
-            _fseeki64(f, (int64_t)off, SEEK_SET);
-#else
-            fseeko(f, (off_t)off, SEEK_SET);
-#endif
-            if (std::fread(tmp.data(), 1, nbytes, f) != nbytes) {
-                std::fclose(f);
-                throw std::runtime_error(std::string("failed to read tensor: ") + name);
-            }
-            ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
-        }
-        std::fclose(f);
-
-        // Dequantize q4_K/q5_K/q6_K tensors to F16.
-        // ops.cpp:6207 asserts F16 for certain conv ops in the Firefly decoder.
-        // This affects both CPU and CUDA backends with q4_k_m codec weights.
+        // Pre-pass: retype Q4_K/Q5_K/Q6_K tensors to F16 BEFORE allocation.
+        // With the CUDA backend, ggml_backend_alloc_ctx_tensors allocates
+        // device memory sized by t->type at alloc time. If we allocate as Q4_K
+        // and later call tensor_set with F16 data, the backend size check in
+        // ggml-backend.cpp:292 fires because the allocated block is Q4_K-sized
+        // but ggml_nbytes(t) after t->type=F16 is smaller. By retyping first,
+        // the allocator reserves exactly F16-sized buffers and both the initial
+        // load (dequantized inline) and any later writes are consistent.
         {
-            int32_t dequant_count = 0;
             for (ggml_tensor * t = ggml_get_first_tensor(impl_->ctx_w);
                  t != nullptr;
                  t = ggml_get_next_tensor(impl_->ctx_w, t)) {
                 if (t->type == GGML_TYPE_Q4_K ||
                     t->type == GGML_TYPE_Q5_K ||
                     t->type == GGML_TYPE_Q6_K) {
-                    // Read quantized data, dequantize to F16, write back
-                    const size_t n_elems = static_cast<size_t>(ggml_nelements(t));
-                    const size_t q_bytes = ggml_nbytes(t);
-                    std::vector<uint8_t> q_data(q_bytes);
-                    ggml_backend_tensor_get(t, q_data.data(), 0, q_bytes);
-                    std::vector<float> f32_data(n_elems);
-                    const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
-                    tt->to_float(q_data.data(), f32_data.data(), (int64_t)n_elems);
-                    // Convert F32 -> F16
-                    std::vector<ggml_fp16_t> f16_data(n_elems);
-                    ggml_fp32_to_fp16_row(f32_data.data(), f16_data.data(), (int64_t)n_elems);
-                    // Change tensor type and write F16 data
                     t->type = GGML_TYPE_F16;
-                    ggml_backend_tensor_set(t, f16_data.data(), 0, n_elems * sizeof(ggml_fp16_t));
-                    dequant_count++;
                 }
             }
-            if (dequant_count > 0)
-                std::cout << "[Codec] Dequantized " << dequant_count
-                          << " tensors to F16 for compatibility.\n";
         }
+
+        // Allocate and load tensor data
+        impl_->model_buf = ggml_backend_alloc_ctx_tensors(impl_->ctx_w, impl_->backend);
+        if (!impl_->model_buf) throw std::runtime_error("ggml_backend_alloc_ctx_tensors() failed");
+
+        const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+        const int64_t n_tensors  = gguf_get_n_tensors(gguf_ctx);
+        int32_t dequant_count = 0;
+        std::FILE * f = std::fopen(gguf_path.c_str(), "rb");
+        if (!f) throw std::runtime_error("failed to reopen codec file");
+        for (int64_t ti = 0; ti < n_tensors; ++ti) {
+            const char * name = gguf_get_tensor_name(gguf_ctx, ti);
+            ggml_tensor * t = ggml_get_tensor(impl_->ctx_w, name);
+            if (!t) continue;
+            const size_t off = data_offset + gguf_get_tensor_offset(gguf_ctx, ti);
+            // Determine original type from GGUF (tensor in ctx_w may already be F16
+            // after pre-pass; read original quantized type from gguf metadata).
+            ggml_type orig_type = gguf_get_tensor_type(gguf_ctx, ti);
+            if (orig_type == GGML_TYPE_Q4_K ||
+                orig_type == GGML_TYPE_Q5_K ||
+                orig_type == GGML_TYPE_Q6_K) {
+                // Read raw quantized bytes from file, dequantize to F16 inline.
+                const size_t q_bytes = gguf_get_tensor_size(gguf_ctx, ti);
+                const size_t n_elems = static_cast<size_t>(ggml_nelements(t));
+                std::vector<uint8_t> q_data(q_bytes);
+#ifdef _WIN32
+                _fseeki64(f, (int64_t)off, SEEK_SET);
+#else
+                fseeko(f, (off_t)off, SEEK_SET);
+#endif
+                if (std::fread(q_data.data(), 1, q_bytes, f) != q_bytes) {
+                    std::fclose(f);
+                    throw std::runtime_error(std::string("failed to read tensor: ") + name);
+                }
+                std::vector<float> f32_buf(n_elems);
+                const struct ggml_type_traits * tt = ggml_get_type_traits(orig_type);
+                tt->to_float(q_data.data(), f32_buf.data(), (int64_t)n_elems);
+                std::vector<ggml_fp16_t> f16_buf(n_elems);
+                ggml_fp32_to_fp16_row(f32_buf.data(), f16_buf.data(), (int64_t)n_elems);
+                ggml_backend_tensor_set(t, f16_buf.data(), 0, n_elems * sizeof(ggml_fp16_t));
+                dequant_count++;
+            } else {
+                const size_t nbytes = ggml_nbytes(t);
+                std::vector<uint8_t> tmp(nbytes);
+#ifdef _WIN32
+                _fseeki64(f, (int64_t)off, SEEK_SET);
+#else
+                fseeko(f, (off_t)off, SEEK_SET);
+#endif
+                if (std::fread(tmp.data(), 1, nbytes, f) != nbytes) {
+                    std::fclose(f);
+                    throw std::runtime_error(std::string("failed to read tensor: ") + name);
+                }
+                ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
+            }
+        }
+        std::fclose(f);
+        if (dequant_count > 0)
+            std::cout << "[Codec] Dequantized " << dequant_count
+                      << " tensors to F16 for compatibility.\n";
 
         // Load VQ caches (CPU copies of codebooks)
         impl_->semantic_vq = load_vq_cache(impl_->ctx_w,
