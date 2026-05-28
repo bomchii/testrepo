@@ -826,13 +826,15 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
         num_codebooks_  = impl_->quantizer_residual_codebooks + 1;
 
         // Pre-pass: retype Q4_K/Q5_K/Q6_K tensors to F16 BEFORE allocation.
-        // With the CUDA backend, ggml_backend_alloc_ctx_tensors allocates
-        // device memory sized by t->type at alloc time. If we allocate as Q4_K
-        // and later call tensor_set with F16 data, the backend size check in
-        // ggml-backend.cpp:292 fires because the allocated block is Q4_K-sized
-        // but ggml_nbytes(t) after t->type=F16 is smaller. By retyping first,
-        // the allocator reserves exactly F16-sized buffers and both the initial
-        // load (dequantized inline) and any later writes are consistent.
+        // With the CUDA backend, ggml_backend_alloc_ctx_tensors uses
+        // ggml_nbytes(t) (which reads t->nb[]) to size device buffers.
+        // We must update BOTH t->type AND t->nb[] so that ggml_nbytes returns
+        // the correct F16 size. Changing only t->type leaves Q4_K strides in
+        // nb[], causing ggml_nbytes to return a wrong (smaller) value, which
+        // then makes the tensor_set assert fire: offset+size <= ggml_nbytes.
+        //
+        // F16 strides: nb[0] = sizeof(ggml_fp16_t) = 2
+        //              nb[i] = nb[i-1] * ne[i-1]  for i >= 1
         {
             for (ggml_tensor * t = ggml_get_first_tensor(impl_->ctx_w);
                  t != nullptr;
@@ -840,7 +842,11 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
                 if (t->type == GGML_TYPE_Q4_K ||
                     t->type == GGML_TYPE_Q5_K ||
                     t->type == GGML_TYPE_Q6_K) {
-                    t->type = GGML_TYPE_F16;
+                    t->type  = GGML_TYPE_F16;
+                    t->nb[0] = sizeof(ggml_fp16_t);   // 2 bytes per element
+                    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                        t->nb[d] = t->nb[d - 1] * t->ne[d - 1];
+                    }
                 }
             }
         }
