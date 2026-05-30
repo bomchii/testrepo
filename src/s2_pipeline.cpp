@@ -206,7 +206,7 @@ bool Pipeline::init(const PipelineParams & params) {
             std::cerr << "Pipeline error: embedded tokenizer parse failed.\n";
             return false;
         }
-        std::cout << "Tokenizer: embedded (" << params.tokenizer_data_size << " B)\n";
+        std::cout << "Tokenizer: embedded (" << params.tokenizer_data_size << " B)" << std::endl;
     } else {
         if (!tokenizer_.load(params.tokenizer_path)) {
             std::cerr << "Pipeline error: tokenizer not found: " << params.tokenizer_path << "\n";

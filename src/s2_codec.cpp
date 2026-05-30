@@ -706,7 +706,7 @@ void AudioCodec::unload() {
 // ---------------------------------------------------------------------------
 
 bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
-    if (vulkan_device >= 0) {
+    std::cout << "[Codec] Loading: " << gguf_path << std::endl;
 #if defined(GGML_USE_CUDA)
         impl_->backend = ggml_backend_cuda_init(vulkan_device);
         if (!impl_->backend) {

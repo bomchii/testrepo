@@ -497,7 +497,17 @@ HTTP EXAMPLES:
     std::cout << "  Tokenizer:    " << params.tokenizer_path << std::endl;
 #endif
 
-    if (!pipeline.init(params)) {
+    bool init_ok = false;
+    try {
+        init_ok = pipeline.init(params);
+    } catch (const std::exception & e) {
+        std::cerr << "Pipeline init exception: " << e.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "Pipeline init unknown exception." << std::endl;
+        return 1;
+    }
+    if (!init_ok) {
         std::cerr << "Pipeline initialization failed." << std::endl;
         return 1;
     }

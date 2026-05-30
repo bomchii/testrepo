@@ -103,7 +103,7 @@ SlowARModel::~SlowARModel() {
 // ---------------------------------------------------------------------------
 
 bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
-    if (vulkan_device >= 0) {
+    std::cout << "[Model] Loading: " << gguf_path << std::endl;
 #if defined(GGML_USE_CUDA)
         backend_ = ggml_backend_cuda_init(vulkan_device);
         if (!backend_) {
