@@ -153,6 +153,7 @@ option(S2_METAL   "Build with Metal backend"   OFF)
 
 set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GGML_AVX512         OFF CACHE BOOL "" FORCE)
 
 if(S2_VULKAN)
     set(GGML_VULKAN ON CACHE BOOL "" FORCE)
@@ -267,6 +268,7 @@ $opensslLinkBlock
             /DASIO_STANDALONE
             /DNOMINMAX
             /DWIN32_LEAN_AND_MEAN
+            /arch:AVX2
         )
     endif()
 elseif(UNIX AND NOT APPLE)

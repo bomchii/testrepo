@@ -138,7 +138,8 @@ jobs:
             -DVulkan_LIBRARY="$env:Vulkan_LIBRARY" `
             -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=OFF `
             -DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT=OFF `
-            -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=OFF
+            -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=OFF `
+            -DGGML_AVX512=OFF
 
       - name: CMake Build
         shell: pwsh
