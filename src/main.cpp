@@ -62,6 +62,7 @@ int main(int argc, char** argv) {
     // El usuario activa GPU explicitamente con -v / --codec-vulkan.
     // -----------------------------------------------------------------------
     params.model_path           = exe_dir + "model.gguf";
+    params.codec_model_path     = exe_dir + "codec.gguf";
     params.tokenizer_path       = exe_dir + "tokenizer.json";
     params.vulkan_device        = -1;   // CPU por defecto (seguro en cualquier PC)
     params.codec_vulkan_device  = -1;   // CPU por defecto
@@ -136,6 +137,8 @@ int main(int argc, char** argv) {
             params.gen.max_new_tokens = std::stoi(argv[++i]);
         } else if ((arg == "--text") && i + 1 < argc) {
             params.text = argv[++i];
+        } else if ((arg == "-pa" || arg == "--prompt-audio") && i + 1 < argc) {
+            params.prompt_audio_path = argv[++i];
         } else if ((arg == "-pt" || arg == "--prompt-text") && i + 1 < argc) {
             params.prompt_text = argv[++i];
         } else if (arg == "--voice" && i + 1 < argc) {
@@ -497,17 +500,7 @@ HTTP EXAMPLES:
     std::cout << "  Tokenizer:    " << params.tokenizer_path << std::endl;
 #endif
 
-    bool init_ok = false;
-    try {
-        init_ok = pipeline.init(params);
-    } catch (const std::exception & e) {
-        std::cerr << "Pipeline init exception: " << e.what() << std::endl;
-        return 1;
-    } catch (...) {
-        std::cerr << "Pipeline init unknown exception." << std::endl;
-        return 1;
-    }
-    if (!init_ok) {
+    if (!pipeline.init(params)) {
         std::cerr << "Pipeline initialization failed." << std::endl;
         return 1;
     }

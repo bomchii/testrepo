@@ -155,8 +155,14 @@ jobs:
           }
           $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           Write-Host "OK: s2.exe generado ($sizeMB MB)"
-          # Ejecutar --help e ignorar el exit code (s2 retorna 1 sin modelos)
+          # --help returns 0. A crash (e.g. illegal instruction) returns a
+          # negative code like 0xC000001D. Allow 0 or 1; anything else is a crash.
           & $exe --help 2>&1 | Out-Null
+          $ec = $LASTEXITCODE
+          if ($ec -ne 0 -and $ec -ne 1) {
+            Write-Error "s2.exe terminated abnormally (exit code: $ec -- likely CPU instruction crash)"
+            exit 1
+          }
           $global:LASTEXITCODE = 0
           Write-Host "OK: s2.exe ejecuta correctamente"
 
@@ -330,6 +336,11 @@ jobs:
           $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           Write-Host "OK: s2-cuda.exe generado ($sizeMB MB)"
           & $exe --help 2>&1 | Out-Null
+          $ec = $LASTEXITCODE
+          if ($ec -ne 0 -and $ec -ne 1) {
+            Write-Error "s2-cuda.exe terminated abnormally (exit code: $ec -- likely CPU instruction crash)"
+            exit 1
+          }
           $global:LASTEXITCODE = 0
           Write-Host "OK: s2-cuda.exe ejecuta correctamente"
 

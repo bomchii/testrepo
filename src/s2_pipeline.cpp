@@ -206,7 +206,7 @@ bool Pipeline::init(const PipelineParams & params) {
             std::cerr << "Pipeline error: embedded tokenizer parse failed.\n";
             return false;
         }
-        std::cout << "Tokenizer: embedded (" << params.tokenizer_data_size << " B)" << std::endl;
+        std::cout << "Tokenizer: embedded (" << params.tokenizer_data_size << " B)\n";
     } else {
         if (!tokenizer_.load(params.tokenizer_path)) {
             std::cerr << "Pipeline error: tokenizer not found: " << params.tokenizer_path << "\n";
@@ -292,8 +292,14 @@ bool Pipeline::synthesize_segment(
 
     const int32_t num_cb = model_.hparams().num_codebooks;
 
+    // Prefer per-request prompt_text (HTTP/CLI); fall back to global reference_text_
+    // loaded from reference.txt at init. Using reference_text_ here was a bug that
+    // caused voice cloning prompt text to be ignored in HTTP and CLI modes.
+    const std::string & effective_prompt_text =
+        params.prompt_text.empty() ? reference_text_ : params.prompt_text;
+
     PromptTensor prompt = build_prompt(
-        tokenizer_, text_segment, reference_text_,
+        tokenizer_, text_segment, effective_prompt_text,
         ref_codes.empty() ? nullptr : ref_codes.data(),
         num_cb, T_prompt);
 

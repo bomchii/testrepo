@@ -108,26 +108,11 @@ if (-Not (Test-Path $crowHeader.Replace('/', '\'))) {
 }
 Write-Host "OK: crow.h verificado"
 
-# ── 3. Parchear ggml-vulkan/CMakeLists.txt ────────────────────────────────────
-$vkPath  = "ggml\src\ggml-vulkan\CMakeLists.txt"
-$vkCmake = Get-Content $vkPath -Raw
-
-if ($vkCmake -match "execute_process") {
-    $vkCmake = $vkCmake -replace '(?s)function\(test_shader_extension_support.*?endfunction\(\)', @'
-function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
-    message(STATUS "${EXTENSION_NAME} disabled (portability build)")
-    set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
-endfunction()
-'@
-    [System.IO.File]::WriteAllText(
-        (Resolve-Path $vkPath).Path,
-        $vkCmake,
-        [System.Text.UTF8Encoding]::new($false)
-    )
-    Write-Host "OK: ggml-vulkan CMakeLists.txt parcheado (coopmat OFF)"
-} else {
-    Write-Host "OK: ggml-vulkan CMakeLists.txt ya parcheado"
-}
+# ── 3. ggml-vulkan CMakeLists.txt -- NO parchear en build CUDA ───────────────
+# GGML_VULKAN=OFF para este build -- el patch de coopmat solo es necesario
+# cuando se compila con Vulkan activo (patch-cmake.ps1). Omitir aqui evita
+# fallos si la estructura del subdirectorio ggml cambia en el futuro.
+Write-Host "OK: ggml-vulkan patch omitido (build CUDA, GGML_VULKAN=OFF)"
 
 # ── 4. Reescribir CMakeLists.txt raiz ────────────────────────────────────────
 # main.cpp hace #include <crow.h> — con el include dir apuntando a
@@ -154,12 +139,14 @@ option(S2_METAL   "Build with Metal backend"   OFF)
 
 set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GGML_AVX512         OFF CACHE BOOL "" FORCE)
+set(GGML_AVX2           ON  CACHE BOOL "" FORCE)
 
 if(S2_VULKAN)
-    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
 endif()
 if(S2_CUDA)
-    set(GGML_CUDA ON CACHE BOOL "" FORCE)  # CUDA activo
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
 endif()
 if(S2_METAL)
     set(GGML_METAL ON CACHE BOOL "" FORCE)
