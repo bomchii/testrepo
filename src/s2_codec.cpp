@@ -706,8 +706,10 @@ void AudioCodec::unload() {
 // ---------------------------------------------------------------------------
 
 bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
-    std::cout << "[Codec] Loading: " << gguf_path << std::endl;
+    // GPU backend init: #if at the outer level to avoid MSVC/CUDA scope-tracking
+    // bug when preprocessor branches are nested inside C++ if{} braces.
 #if defined(GGML_USE_CUDA)
+    if (vulkan_device >= 0) {
         impl_->backend = ggml_backend_cuda_init(vulkan_device);
         if (!impl_->backend) {
             std::cerr << "[Codec] CUDA init failed on device " << vulkan_device
@@ -715,15 +717,19 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
         } else {
             std::cout << "[Codec] CUDA backend on device " << vulkan_device << std::endl;
         }
+    }
 #elif defined(GGML_USE_VULKAN)
+    if (vulkan_device >= 0) {
         impl_->backend = ggml_backend_vk_init(static_cast<size_t>(vulkan_device));
         if (!impl_->backend) {
             std::cerr << "[Codec] Vulkan init failed, falling back to CPU." << std::endl;
         }
-#else
-        std::cerr << "[Codec] No GPU backend compiled, falling back to CPU." << std::endl;
-#endif
     }
+#else
+    if (vulkan_device >= 0) {
+        std::cerr << "[Codec] No GPU backend compiled, falling back to CPU." << std::endl;
+    }
+#endif
     if (!impl_->backend) impl_->backend = ggml_backend_cpu_init();
     if (!impl_->backend) { std::cerr << "[Codec] No backend." << std::endl; return false; }
 

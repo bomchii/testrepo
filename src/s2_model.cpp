@@ -103,8 +103,10 @@ SlowARModel::~SlowARModel() {
 // ---------------------------------------------------------------------------
 
 bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
-    std::cout << "[Model] Loading: " << gguf_path << std::endl;
+    // GPU backend init: #if at the outer level so MSVC/CUDA does not mis-track
+    // function scope when preprocessor branches are nested inside C++ braces.
 #if defined(GGML_USE_CUDA)
+    if (vulkan_device >= 0) {
         backend_ = ggml_backend_cuda_init(vulkan_device);
         if (!backend_) {
             std::cerr << "[Model] CUDA init failed on device " << vulkan_device
@@ -113,15 +115,19 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
             std::cout << "[Model] CUDA backend on device " << vulkan_device << std::endl;
             cuda_mode_ = true;
         }
+    }
 #elif defined(GGML_USE_VULKAN)
+    if (vulkan_device >= 0) {
         backend_ = ggml_backend_vk_init(static_cast<size_t>(vulkan_device));
         if (!backend_) {
             std::cerr << "[Model] Vulkan init failed, falling back to CPU." << std::endl;
         }
-#else
-        std::cerr << "[Model] No GPU backend compiled, falling back to CPU." << std::endl;
-#endif
     }
+#else
+    if (vulkan_device >= 0) {
+        std::cerr << "[Model] No GPU backend compiled, falling back to CPU." << std::endl;
+    }
+#endif
     // Always keep a CPU backend for embedding tables (CUDA get_rows workaround)
     backend_cpu_ = ggml_backend_cpu_init();
     if (!backend_cpu_) {
