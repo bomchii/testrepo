@@ -9,8 +9,13 @@ on:
 
 jobs:
   build:
-    name: Windows Server 2025 - MSVC - Vulkan
-    runs-on: windows-2025
+    name: Windows Server 2022 - MSVC - Vulkan
+    # Pinned to windows-2022 (VS 2022 / MSVC 19.4x) to match the last verified-green
+    # toolchain. windows-2025 moved to VS 2026 (MSVC 19.51, C++20 default, stricter
+    # diagnostics) on 2026-06-08; pinning keeps both jobs on one consistent compiler
+    # and avoids surprise breakage in the Crow/Asio/ggml compile. Revisit when ready
+    # to validate against VS 2026 (test via the windows-2025-vs2026 label on a branch).
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
@@ -218,8 +223,14 @@ jobs:
           generate_release_notes: true
 
   build-cuda:
-    name: Windows Server 2025 - MSVC - CUDA 12
-    runs-on: windows-2025
+    name: Windows Server 2022 - MSVC - CUDA 12
+    # Pinned to windows-2022 (Visual Studio 2022 / MSVC 19.4x). The windows-2025
+    # label migrated to Visual Studio 2026 (MSVC 19.51) starting 2026-06-08, and
+    # CUDA 12.6 does not support VS 2026: CMake's enable_language(CUDA) fails with
+    # "No CUDA toolset found" (the CUDA MSBuild integration has no v180 customization),
+    # and nvcc's host_config.h #error rejects the newer MSVC. GitHub's documented
+    # fallback for VS 2022 is the windows-2022 image.
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
