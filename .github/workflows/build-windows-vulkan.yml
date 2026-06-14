@@ -335,10 +335,35 @@ jobs:
           }
           $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           Write-Host "OK: s2-cuda.exe generado ($sizeMB MB)"
+
+          # s2-cuda.exe links dynamically against cublas64_12.dll / cublasLt64_12.dll.
+          # Windows resolves those imports at process load time -- BEFORE main() runs --
+          # so running the bare exe out of build\Release\ fails with 0xC0000135
+          # (STATUS_DLL_NOT_FOUND, surfaced as exit code -1073741515) even though the
+          # binary is fine. Copy the CUDA runtime DLLs next to the exe before running.
+          $cudaPath = $env:CUDA_PATH
+          if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
+          foreach ($dll in @("cublas64_12.dll", "cublasLt64_12.dll")) {
+              $src = Join-Path $cudaPath "bin\$dll"
+              if (Test-Path $src) {
+                  Copy-Item $src "build\Release\" -Force
+                  Write-Host "OK: $dll copiada junto al exe para verificacion"
+              } else {
+                  Write-Warning "$dll no encontrada en $cudaPath\bin"
+              }
+          }
+
+          # --help returns 0 (or 1 on builds that require models). Anything else is a
+          # real failure. 0xC0000135 here would mean a DLL is still missing; a negative
+          # AVX-class code (0xC000001D) would mean an illegal-instruction crash.
           & $exe --help 2>&1 | Out-Null
           $ec = $LASTEXITCODE
+          if ($ec -eq -1073741515) {
+            Write-Error "s2-cuda.exe failed with STATUS_DLL_NOT_FOUND (0xC0000135) -- a required CUDA DLL is missing next to the exe"
+            exit 1
+          }
           if ($ec -ne 0 -and $ec -ne 1) {
-            Write-Error "s2-cuda.exe terminated abnormally (exit code: $ec -- likely CPU instruction crash)"
+            Write-Error "s2-cuda.exe terminated abnormally (exit code: $ec)"
             exit 1
           }
           $global:LASTEXITCODE = 0
