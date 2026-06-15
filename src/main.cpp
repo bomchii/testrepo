@@ -9,6 +9,7 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <stdexcept>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -95,6 +96,12 @@ int main(int argc, char** argv) {
     // --- Parse des arguments ---
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
+        // std::stoi / std::stof throw std::invalid_argument on non-numeric input
+        // and std::out_of_range on oversized values. Guard every iteration so a
+        // bad value (e.g. "-v abc", "--port 9e99", or "--port --segment") yields a
+        // clean error + exit code 1 instead of an uncaught exception -> std::terminate()
+        // -> process abort. (Critical Pattern #2 — was missing from the parse loop.)
+        try {
         if ((arg == "-m" || arg == "--model") && i + 1 < argc) {
             params.model_path = argv[++i];
         } else if (arg == "--model-codec" && i + 1 < argc) {
@@ -380,6 +387,11 @@ HTTP EXAMPLES:
             return 0;
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
+            std::cerr << "Use --help for usage information." << std::endl;
+            return 1;
+        }
+        } catch (const std::exception & e) {
+            std::cerr << "Invalid value for option '" << arg << "': " << e.what() << std::endl;
             std::cerr << "Use --help for usage information." << std::endl;
             return 1;
         }
