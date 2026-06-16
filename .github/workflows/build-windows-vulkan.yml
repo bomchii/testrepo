@@ -381,63 +381,64 @@ jobs:
           $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           Write-Host "OK: s2-cuda.exe generado ($sizeMB MB)"
 
-          $cudaPath = $env:CUDA_PATH
-          if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
-          if (-Not $cudaPath) { Write-Error "CUDA_PATH no definido en el smoke test"; exit 1 }
+          # DO NOT run s2-cuda.exe on this runner. A CUDA-enabled binary has a
+          # LOAD-TIME import on nvcuda.dll -- the CUDA *Driver* API, which the
+          # NVIDIA *display driver* installs into System32. It is NOT part of the
+          # CUDA toolkit and is NOT redistributable. GitHub-hosted windows-2022
+          # runners have no NVIDIA GPU and no driver, so nvcuda.dll is absent and
+          # ANY launch (even `--help`) fails at process load with 0xC0000135
+          # (STATUS_DLL_NOT_FOUND / -1073741515) before main() runs. That is
+          # expected on a GPU-less box and is NOT a build defect -- so instead of
+          # executing the exe we verify its import table is exactly what we expect.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-Not (Test-Path $vswhere)) { Write-Error "vswhere no encontrado"; exit 1 }
+          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+          if (-Not $dumpbin) { Write-Error "dumpbin no encontrado -- no se pueden verificar dependencias"; exit 1 }
 
-          # s2-cuda.exe dynamically imports the CUDA runtime DLLs below. cublas has
-          # no static Windows build (NVIDIA ships no cublas_static.lib on Windows),
-          # and cudart64_12.dll is ALSO imported dynamically in practice even with
-          # CMAKE_CUDA_RUNTIME_LIBRARY=Static -- ggml-cuda's link does not fully
-          # embed it. All three must sit next to the exe; Windows resolves them at
-          # load time, before main(), so ONE missing DLL -> 0xC0000135
-          # (STATUS_DLL_NOT_FOUND, surfaced as -1073741515). The previous list
-          # omitted cudart64_12.dll, which is exactly what failed this job.
-          foreach ($dll in @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")) {
-              $src = Join-Path $cudaPath "bin\$dll"
-              if (Test-Path $src) {
-                  Copy-Item $src "build\Release\" -Force
-                  Write-Host "OK: $dll copiada junto al exe para verificacion"
-              } else {
-                  Write-Error "$dll no encontrada en $cudaPath\bin -- no se puede ejecutar el smoke test"
-                  exit 1
-              }
+          $deps = & $dumpbin.FullName /dependents $exe |
+                  Select-String -Pattern '^\s+\S+\.dll\s*$' |
+                  ForEach-Object { $_.ToString().Trim() }
+          Write-Host "`n--- s2-cuda.exe dependents ---"
+          $deps | ForEach-Object { Write-Host "    $_" }
+          Write-Host "------------------------------`n"
+
+          # Buckets of acceptable dependencies:
+          #  - Windows system DLLs + UCRT api-sets + VC/OpenMP runtime: present on
+          #    Windows and on end-user machines via the VC++ Redistributable.
+          #  - nvcuda.dll: the NVIDIA driver provides this on the user's GPU box.
+          #  - cublas/cublasLt/cudart: shipped next to the exe in the release step.
+          # Anything else is an unexpected new dependency that would break users, so
+          # fail here -- this catches packaging regressions WITHOUT needing a GPU.
+          $allowSystem  = @('kernel32.dll','advapi32.dll','ws2_32.dll','mswsock.dll',
+                            'user32.dll','ole32.dll','shell32.dll','msvcp140.dll',
+                            'vcomp140.dll','vcruntime140.dll','vcruntime140_1.dll')
+          $allowDriver  = @('nvcuda.dll')
+          $allowShipped = @('cublas64_12.dll','cublaslt64_12.dll','cudart64_12.dll')
+
+          $hasNvcuda  = $false
+          $unexpected = @()
+          foreach ($d in $deps) {
+              $name = $d.ToLower()
+              if ($name -eq 'nvcuda.dll') { $hasNvcuda = $true }
+              if ($name -like 'api-ms-win-*') { continue }
+              if ($allowSystem  -contains $name) { continue }
+              if ($allowDriver  -contains $name) { continue }
+              if ($allowShipped -contains $name) { continue }
+              $unexpected += $d
           }
 
-          # Best-effort: dump the exe's real DLL imports to the log so any future
-          # missing-DLL failure is obvious. dumpbin lives in the MSVC toolchain;
-          # locate it via vswhere. Never fatal.
-          try {
-              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-              if (Test-Path $vswhere) {
-                  $vsRoot  = & $vswhere -latest -products * -property installationPath
-                  $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
-                             Select-Object -First 1
-                  if ($dumpbin) {
-                      Write-Host "`n--- s2-cuda.exe dependents (dumpbin) ---"
-                      & $dumpbin.FullName /dependents $exe |
-                          Select-String -Pattern "\.dll" |
-                          ForEach-Object { "    " + $_.ToString().Trim() }
-                      Write-Host "----------------------------------------`n"
-                  }
-              }
-          } catch { Write-Host "dumpbin no disponible (diagnostico omitido)" }
+          if (-Not $hasNvcuda) {
+              Write-Warning "nvcuda.dll no figura como dependencia -- el backend CUDA podria no haberse enlazado."
+          }
+          if ($unexpected.Count -gt 0) {
+              Write-Error ("Dependencias inesperadas (revisar empaquetado): " + ($unexpected -join ', '))
+              exit 1
+          }
 
-          # --help returns 0 (or 1 on builds that require models). Anything else is a
-          # real failure. 0xC0000135 here would mean a DLL is still missing; a negative
-          # AVX-class code (0xC000001D) would mean an illegal-instruction crash.
-          & $exe --help 2>&1 | Out-Null
-          $ec = $LASTEXITCODE
-          if ($ec -eq -1073741515) {
-            Write-Error "s2-cuda.exe failed with STATUS_DLL_NOT_FOUND (0xC0000135) -- a required CUDA DLL is missing next to the exe"
-            exit 1
-          }
-          if ($ec -ne 0 -and $ec -ne 1) {
-            Write-Error "s2-cuda.exe terminated abnormally (exit code: $ec)"
-            exit 1
-          }
-          $global:LASTEXITCODE = 0
-          Write-Host "OK: s2-cuda.exe ejecuta correctamente"
+          Write-Host "OK: s2-cuda.exe solo depende de (sistema + VC runtime) + nvcuda (driver) + cublas (incluida en el release)."
+          Write-Host "NOTA: la ejecucion real (incl. --help) requiere una GPU NVIDIA con driver; validar en hardware o en un runner self-hosted con GPU."
 
       - name: Empaquetar release CUDA
         shell: pwsh
@@ -445,18 +446,22 @@ jobs:
           New-Item -ItemType Directory -Force -Path release-cuda | Out-Null
           Copy-Item build\Release\s2-cuda.exe release-cuda\
 
-          # Runtime DLLs that MUST ship next to s2-cuda.exe. cublas/cublasLt have
-          # no static Windows build, and cudart64_12.dll is imported dynamically in
-          # practice (the static CUDA runtime is not fully embedded by ggml-cuda's
-          # link), so all three are required. A single missing one gives the user
-          # 0xC0000135 (STATUS_DLL_NOT_FOUND) at launch, before main() runs --
-          # which is precisely the failure this release step previously shipped
-          # (cudart64_12.dll was omitted on the assumption it was static).
+          # Runtime DLLs that ship next to s2-cuda.exe. The exe's actual imports
+          # (verified via dumpbin in the previous step) are cublas64_12.dll plus
+          # nvcuda.dll; cudart64_12.dll is NOT imported (the static CUDA runtime
+          # linked correctly). We ship:
+          #   - cublas64_12.dll   : directly imported by the exe (no static build on Windows).
+          #   - cublasLt64_12.dll : loaded by cuBLAS at runtime; ship alongside it.
+          #   - cudart64_12.dll   : shipped defensively (cuBLAS may pull it); ~harmless if unused.
+          # nvcuda.dll is intentionally NOT shipped: it is the NVIDIA *driver* API,
+          # provided by the user's installed GPU driver in System32, and is not
+          # redistributable. End users also need the VC++ Redistributable
+          # (MSVCP140/VCRUNTIME140*/VCOMP140), standard on most Windows machines.
           $cudaPath = $env:CUDA_PATH
           if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
           if (-Not $cudaPath) { Write-Error "CUDA_PATH no definido"; exit 1 }
 
-          foreach ($dll in @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")) {
+          foreach ($dll in @("cublas64_12.dll", "cublasLt64_12.dll", "cudart64_12.dll")) {
               $src = Join-Path $cudaPath "bin\$dll"
               if (Test-Path $src) {
                   Copy-Item $src release-cuda\
