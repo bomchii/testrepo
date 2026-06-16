@@ -160,12 +160,46 @@ jobs:
           }
           $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           Write-Host "OK: s2.exe generado ($sizeMB MB)"
-          # --help returns 0. A crash (e.g. illegal instruction) returns a
-          # negative code like 0xC000001D. Allow 0 or 1; anything else is a crash.
+          # s2.exe imports the Vulkan loader (vulkan-1.dll) because it links the
+          # ggml Vulkan backend. On a headless windows-2022 runner there is no GPU
+          # driver, so vulkan-1.dll is NOT in System32 -- the loader cannot resolve
+          # the import at process-load time and the exe exits with 0xC0000135
+          # (STATUS_DLL_NOT_FOUND, surfaced as -1073741515) BEFORE main() runs.
+          # That is a missing-DLL error, NOT a CPU / illegal-instruction crash.
+          # Copy the loader next to the exe so the smoke test can load the binary.
+          # (End-user releases do not bundle it: real machines provide vulkan-1.dll
+          #  via their GPU drivers; this copy is only for the headless CI check.)
+          $vkDll = $null
+          foreach ($cand in @(
+              (Join-Path $env:VULKAN_SDK "Bin\vulkan-1.dll"),
+              (Join-Path $env:VULKAN_SDK "runtime\x64\vulkan-1.dll"),
+              "C:\Windows\System32\vulkan-1.dll")) {
+              if ($cand -and (Test-Path $cand)) { $vkDll = $cand; break }
+          }
+          if ($vkDll) {
+              Copy-Item $vkDll "build\Release\" -Force
+              Write-Host "OK: vulkan-1.dll copiada junto al exe ($vkDll)"
+          } else {
+              Write-Error "vulkan-1.dll no encontrada (VULKAN_SDK=$env:VULKAN_SDK). El smoke test no puede cargar s2.exe."
+              exit 1
+          }
+
+          # --help is handled in the arg parser and returns 0 BEFORE any Vulkan
+          # init, so it only needs the import table to resolve. Decode the exit
+          # code precisely instead of guessing: 0xC0000135 (-1073741515) = missing
+          # DLL; 0xC000001D (-1073741795) = illegal instruction (AVX). Allow 0 or 1.
           & $exe --help 2>&1 | Out-Null
           $ec = $LASTEXITCODE
+          if ($ec -eq -1073741515) {
+            Write-Error "s2.exe failed with STATUS_DLL_NOT_FOUND (0xC0000135) -- a required DLL (likely vulkan-1.dll) is missing next to the exe"
+            exit 1
+          }
+          if ($ec -eq -1073741795) {
+            Write-Error "s2.exe failed with STATUS_ILLEGAL_INSTRUCTION (0xC000001D) -- CPU executed an unsupported instruction (check AVX level / GGML_AVX512)"
+            exit 1
+          }
           if ($ec -ne 0 -and $ec -ne 1) {
-            Write-Error "s2.exe terminated abnormally (exit code: $ec -- likely CPU instruction crash)"
+            Write-Error "s2.exe terminated abnormally (exit code: $ec)"
             exit 1
           }
           $global:LASTEXITCODE = 0
@@ -347,22 +381,47 @@ jobs:
           $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           Write-Host "OK: s2-cuda.exe generado ($sizeMB MB)"
 
-          # s2-cuda.exe links dynamically against cublas64_12.dll / cublasLt64_12.dll.
-          # Windows resolves those imports at process load time -- BEFORE main() runs --
-          # so running the bare exe out of build\Release\ fails with 0xC0000135
-          # (STATUS_DLL_NOT_FOUND, surfaced as exit code -1073741515) even though the
-          # binary is fine. Copy the CUDA runtime DLLs next to the exe before running.
           $cudaPath = $env:CUDA_PATH
           if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
-          foreach ($dll in @("cublas64_12.dll", "cublasLt64_12.dll")) {
+          if (-Not $cudaPath) { Write-Error "CUDA_PATH no definido en el smoke test"; exit 1 }
+
+          # s2-cuda.exe dynamically imports the CUDA runtime DLLs below. cublas has
+          # no static Windows build (NVIDIA ships no cublas_static.lib on Windows),
+          # and cudart64_12.dll is ALSO imported dynamically in practice even with
+          # CMAKE_CUDA_RUNTIME_LIBRARY=Static -- ggml-cuda's link does not fully
+          # embed it. All three must sit next to the exe; Windows resolves them at
+          # load time, before main(), so ONE missing DLL -> 0xC0000135
+          # (STATUS_DLL_NOT_FOUND, surfaced as -1073741515). The previous list
+          # omitted cudart64_12.dll, which is exactly what failed this job.
+          foreach ($dll in @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")) {
               $src = Join-Path $cudaPath "bin\$dll"
               if (Test-Path $src) {
                   Copy-Item $src "build\Release\" -Force
                   Write-Host "OK: $dll copiada junto al exe para verificacion"
               } else {
-                  Write-Warning "$dll no encontrada en $cudaPath\bin"
+                  Write-Error "$dll no encontrada en $cudaPath\bin -- no se puede ejecutar el smoke test"
+                  exit 1
               }
           }
+
+          # Best-effort: dump the exe's real DLL imports to the log so any future
+          # missing-DLL failure is obvious. dumpbin lives in the MSVC toolchain;
+          # locate it via vswhere. Never fatal.
+          try {
+              $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+              if (Test-Path $vswhere) {
+                  $vsRoot  = & $vswhere -latest -products * -property installationPath
+                  $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+                             Select-Object -First 1
+                  if ($dumpbin) {
+                      Write-Host "`n--- s2-cuda.exe dependents (dumpbin) ---"
+                      & $dumpbin.FullName /dependents $exe |
+                          Select-String -Pattern "\.dll" |
+                          ForEach-Object { "    " + $_.ToString().Trim() }
+                      Write-Host "----------------------------------------`n"
+                  }
+              }
+          } catch { Write-Host "dumpbin no disponible (diagnostico omitido)" }
 
           # --help returns 0 (or 1 on builds that require models). Anything else is a
           # real failure. 0xC0000135 here would mean a DLL is still missing; a negative
@@ -386,28 +445,26 @@ jobs:
           New-Item -ItemType Directory -Force -Path release-cuda | Out-Null
           Copy-Item build\Release\s2-cuda.exe release-cuda\
 
-          # cudart esta linkeado estaticamente en el exe (GGML_STATIC=ON +
-          # CMAKE_CUDA_RUNTIME_LIBRARY=Static). NO se necesita cudart64_12.dll.
-          #
-          # cublas NO tiene version estatica en Windows (NVIDIA no la provee).
-          # cublas64_12.dll y cublasLt64_12.dll son las unicas DLLs obligatorias.
+          # Runtime DLLs that MUST ship next to s2-cuda.exe. cublas/cublasLt have
+          # no static Windows build, and cudart64_12.dll is imported dynamically in
+          # practice (the static CUDA runtime is not fully embedded by ggml-cuda's
+          # link), so all three are required. A single missing one gives the user
+          # 0xC0000135 (STATUS_DLL_NOT_FOUND) at launch, before main() runs --
+          # which is precisely the failure this release step previously shipped
+          # (cudart64_12.dll was omitted on the assumption it was static).
           $cudaPath = $env:CUDA_PATH
           if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
+          if (-Not $cudaPath) { Write-Error "CUDA_PATH no definido"; exit 1 }
 
-          $cublas = Join-Path $cudaPath "bin\cublas64_12.dll"
-          if (Test-Path $cublas) {
-              Copy-Item $cublas release-cuda\
-              Write-Host "OK: cublas64_12.dll incluida"
-          } else {
-              Write-Warning "cublas64_12.dll no encontrada en $cudaPath\bin"
-          }
-
-          $cublasLt = Join-Path $cudaPath "bin\cublasLt64_12.dll"
-          if (Test-Path $cublasLt) {
-              Copy-Item $cublasLt release-cuda\
-              Write-Host "OK: cublasLt64_12.dll incluida"
-          } else {
-              Write-Warning "cublasLt64_12.dll no encontrada -- puede faltar en runtime"
+          foreach ($dll in @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll")) {
+              $src = Join-Path $cudaPath "bin\$dll"
+              if (Test-Path $src) {
+                  Copy-Item $src release-cuda\
+                  Write-Host "OK: $dll incluida"
+              } else {
+                  Write-Error "$dll no encontrada en $cudaPath\bin -- el release quedaria incompleto"
+                  exit 1
+              }
           }
 
           $sizeMB = [math]::Round((Get-Item release-cuda\s2-cuda.exe).Length / 1MB, 1)
