@@ -22,6 +22,11 @@ public:
     AudioCodec();
     ~AudioCodec();
 
+    AudioCodec(const AudioCodec &) = delete;
+    AudioCodec & operator=(const AudioCodec &) = delete;
+    AudioCodec(AudioCodec &&) = delete;
+    AudioCodec & operator=(AudioCodec &&) = delete;
+
     // Load codec from GGUF (unified or standalone). vulkan_device=-1 = CPU only.
     bool load(const std::string & gguf_path, int32_t vulkan_device = -1);
 
@@ -46,7 +51,11 @@ public:
 
     int32_t sample_rate()     const { return sample_rate_; }
     int32_t hop_length()      const { return hop_length_; }
-    int32_t num_codebooks()   const { return num_codebooks_; }
+    int32_t num_codebooks()            const { return num_codebooks_; }
+    int32_t semantic_codebook_size()   const { return semantic_codebook_size_; }
+    int32_t residual_codebook_size()   const { return residual_codebook_size_; }
+    int32_t max_decode_frames()        const { return max_decode_frames_; }
+    std::string backend_name() const;
 
     // Model state (opaque, holds all codec tensors)
     struct Impl;
@@ -54,9 +63,12 @@ public:
 
 private:
 
-    int32_t sample_rate_    = 44100;
-    int32_t hop_length_     = 512;
-    int32_t num_codebooks_  = 10;
+    int32_t sample_rate_              = 44100;
+    int32_t hop_length_               = 512;
+    int32_t num_codebooks_            = 10;
+    int32_t semantic_codebook_size_   = 4096;
+    int32_t residual_codebook_size_   = 4096;
+    int32_t max_decode_frames_        = 0;
 };
 
 } // namespace s2

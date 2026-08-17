@@ -63,8 +63,17 @@ private:
     std::vector<std::pair<std::string, std::string>> merges_;
     std::unordered_map<std::string, int32_t> merge_rank_;
 
-    // Special tokens: text → ID (matched before BPE)
+    // Added tokens: text → ID (matched atomically before normalization/BPE)
     std::vector<std::pair<std::string, int32_t>> special_tokens_;
+
+    // Byte trie for AddedToken matching. Fish/Qwen tokenizers contain thousands
+    // of semantic markers; scanning the full text once per token is quadratic-ish
+    // and becomes a trivial request-level DoS.
+    struct SpecialTrieNode {
+        std::unordered_map<unsigned char, size_t> next;
+        int32_t id = -1;
+    };
+    std::vector<SpecialTrieNode> special_trie_;
 
     // Internal BPE encoding of a single word
     std::vector<int32_t> bpe_encode_word(const std::string & word) const;

@@ -1,6 +1,7 @@
 #include "../include/s2_prompt.h"
 #include <iostream>
 #include <cstring>
+#include <limits>
 
 namespace s2 {
 
@@ -28,15 +29,33 @@ PromptTensor build_prompt(
     int32_t T_prompt
 ) {
     PromptTensor result;
+    if (!tokenizer.is_loaded() || num_codebooks <= 0 || num_codebooks > 1024 || T_prompt < 0) {
+        return result;
+    }
+    // A reference is all-or-nothing. Silently ignoring codes because their
+    // transcript is empty produces the wrong voice while reporting success.
+    const bool any_reference_arg = (prompt_codes != nullptr || T_prompt > 0 || !prompt_text.empty());
+    const bool complete_reference = (prompt_codes != nullptr && T_prompt > 0 && !prompt_text.empty());
+    if (any_reference_arg && !complete_reference) return result;
+
     result.rows = num_codebooks + 1;
 
     const TokenizerConfig & cfg = tokenizer.config();
     const int32_t im_end_id     = cfg.im_end_id;
     const int32_t voice_id      = cfg.voice_id;
     const int32_t sem_begin     = cfg.semantic_begin_id;
+    const int32_t codebook_size = cfg.codebook_size;
+    if (im_end_id < 0 || voice_id < 0 || sem_begin < 0 || codebook_size <= 0 ||
+        cfg.vocab_size <= 0 ||
+        static_cast<int64_t>(sem_begin) + codebook_size > cfg.vocab_size) {
+        return result;
+    }
 
-    // NEWLINE token (byte 0x0A = 198 in Qwen vocabulary)
-    const std::vector<int32_t> NEWLINE = { 198 };
+    // Derive newline from the loaded tokenizer instead of hard-coding Qwen's
+    // current ID (198). This keeps prompt construction correct for compatible
+    // tokenizer variants and also detects an incomplete tokenizer cleanly.
+    const std::vector<int32_t> NEWLINE = tokenizer.encode("\n");
+    if (NEWLINE.empty()) return result;
 
     bool has_reference = (prompt_codes != nullptr && T_prompt > 0 && !prompt_text.empty());
 
@@ -89,12 +108,18 @@ PromptTensor build_prompt(
         app(sys_post, { voice_id });
     }
 
-    // total columns
-    int32_t total_len = (int32_t)sys_pre.size() + (has_reference ? T_prompt : 0) + (int32_t)sys_post.size();
+    // total columns -- calculate in size_t first so malformed/huge inputs cannot
+    // overflow int32_t and become a massive allocation.
+    const size_t total_size = sys_pre.size() + (has_reference ? static_cast<size_t>(T_prompt) : 0u) + sys_post.size();
+    if (total_size == 0 || total_size > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        total_size > std::numeric_limits<size_t>::max() / static_cast<size_t>(result.rows)) {
+        return {};
+    }
+    const int32_t total_len = static_cast<int32_t>(total_size);
     result.cols = total_len;
 
     // Allocate and zero-fill
-    result.data.assign(static_cast<size_t>(result.rows) * total_len, 0);
+    result.data.assign(static_cast<size_t>(result.rows) * total_size, 0);
 
     int32_t pos = 0;
 
@@ -106,14 +131,31 @@ PromptTensor build_prompt(
 
     // Write VQ section
     if (has_reference && T_prompt > 0) {
+        // Validate before touching the output.  This function is public and
+        // should not rely solely on VoiceProfile/codec callers to provide IDs
+        // suitable for ggml_get_rows().  Use size_t indexing so cb*T_prompt
+        // cannot overflow signed int32 arithmetic.
+        const size_t prompt_stride = static_cast<size_t>(T_prompt);
+        for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+            const size_t base = static_cast<size_t>(cb) * prompt_stride;
+            for (int32_t t = 0; t < T_prompt; ++t) {
+                const int32_t code = prompt_codes[base + static_cast<size_t>(t)];
+                if (code < 0 || code >= codebook_size) return {};
+            }
+        }
+
         // Row 0: semantic token IDs = prompt_codes[0][t] + semantic_begin_id
         for (int32_t t = 0; t < T_prompt; ++t) {
-            result.data[0 * total_len + pos + t] = prompt_codes[0 * T_prompt + t] + sem_begin;
+            result.data[static_cast<size_t>(pos + t)] =
+                prompt_codes[static_cast<size_t>(t)] + sem_begin;
         }
         // Rows 1..num_cb: prompt_codes[cb][t] (codebook-space 0-indexed)
         for (int32_t cb = 0; cb < num_codebooks; ++cb) {
+            const size_t src_base = static_cast<size_t>(cb) * prompt_stride;
+            const size_t dst_base = static_cast<size_t>(cb + 1) * total_size + static_cast<size_t>(pos);
             for (int32_t t = 0; t < T_prompt; ++t) {
-                result.data[(cb + 1) * total_len + pos + t] = prompt_codes[cb * T_prompt + t];
+                result.data[dst_base + static_cast<size_t>(t)] =
+                    prompt_codes[src_base + static_cast<size_t>(t)];
             }
         }
         pos += T_prompt;

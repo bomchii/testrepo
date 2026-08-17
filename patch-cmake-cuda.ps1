@@ -12,27 +12,33 @@ New-Item -ItemType Directory -Force -Path $depsDir | Out-Null
 # Usamos el source tarball en vez de crow_all.h porque:
 # - crow_all.h incluye asio::ssl incondicionalmente
 # - Los headers originales tienen #ifdef CROW_ENABLE_SSL
+$crowVersion = "1.3.3"
 $crowDir  = "$depsDir\crow-include"
 $crowFile = "$crowDir\crow.h"   # el tarball pone crow.h directamente en include/
-if (-Not (Test-Path $crowFile)) {
-    Write-Host "Descargando Crow v1.3.1 source tarball..."
+$crowMarker = "$crowDir\.s2-crow-version"
+$crowVersionOk = (Test-Path $crowMarker) -and ((Get-Content $crowMarker -Raw).Trim() -eq $crowVersion)
+if (-Not (Test-Path $crowFile) -or -Not $crowVersionOk) {
+    # A local build may reuse build/_deps from an older script revision. Do not
+    # silently keep stale Crow headers merely because crow.h exists.
+    if (Test-Path $crowDir) { Remove-Item $crowDir -Recurse -Force }
+    Write-Host "Descargando Crow v$($crowVersion) source tarball..."
     $crowTar = "$depsDir\crow.tar.gz"
     Invoke-WebRequest `
-        -Uri "https://github.com/CrowCpp/Crow/archive/refs/tags/v1.3.1.tar.gz" `
+        -Uri "https://github.com/CrowCpp/Crow/archive/refs/tags/v$crowVersion.tar.gz" `
         -OutFile $crowTar -UseBasicParsing
     # Extraer con tar (disponible en Windows 10+ y en todos los runners de GitHub)
     New-Item -ItemType Directory -Force -Path "$depsDir\crow-extracted" | Out-Null
     tar -xzf $crowTar -C "$depsDir\crow-extracted"
-    # El tarball extrae como Crow-1.3.1/include/crow/
-    $crowSrc = "$depsDir\crow-extracted\Crow-1.3.1\include"
+    # El tarball extrae como Crow-1.3.3/include/crow/
+    $crowSrc = "$depsDir\crow-extracted\Crow-$crowVersion\include"
     if (-Not (Test-Path $crowSrc)) {
         # Fallback: buscar include/ en cualquier subdirectorio
         $crowSrc = Get-ChildItem "$depsDir\crow-extracted" -Recurse -Filter "crow.h" |
-                   Select-Object -First 1 |
-                   ForEach-Object { $_.DirectoryName | Split-Path -Parent }
+                   Select-Object -First 1 -ExpandProperty DirectoryName
     }
     New-Item -ItemType Directory -Force -Path $crowDir | Out-Null
     Copy-Item "$crowSrc\*" $crowDir -Recurse -Force
+    Set-Content -Path $crowMarker -Value $crowVersion -Encoding ASCII
     Remove-Item $crowTar -Force
     Write-Host "OK: Crow headers en $crowDir"
     Write-Host "   crow.h existe: $(Test-Path $crowFile)"
@@ -41,10 +47,14 @@ if (-Not (Test-Path $crowFile)) {
 }
 
 # ── 2. Descargar Asio headers ─────────────────────────────────────────────────
+$asioVersion = "1.30.2"
 $asioDir  = "$depsDir\asio-include"
 $asioFile = "$asioDir\asio.hpp"
-if (-Not (Test-Path $asioFile)) {
-    Write-Host "Descargando Asio 1.30.2..."
+$asioMarker = "$asioDir\.s2-asio-version"
+$asioVersionOk = (Test-Path $asioMarker) -and ((Get-Content $asioMarker -Raw).Trim() -eq $asioVersion)
+if (-Not (Test-Path $asioFile) -or -Not $asioVersionOk) {
+    if (Test-Path $asioDir) { Remove-Item $asioDir -Recurse -Force }
+    Write-Host "Descargando Asio $asioVersion..."
     $asioZip = "$depsDir\asio.zip"
     Invoke-WebRequest `
         -Uri "https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.zip" `
@@ -54,6 +64,7 @@ if (-Not (Test-Path $asioFile)) {
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
     Remove-Item $asioZip -Force
+    Set-Content -Path $asioMarker -Value $asioVersion -Encoding ASCII
     # Reemplazar asio/ssl.hpp y asio/ssl/ con stubs vacíos.
     # Crow puede incluir asio/ssl.hpp aunque CROW_ENABLE_SSL=0 esté definido,
     # porque algunos headers de Crow lo incluyen antes de que la macro sea visible.
@@ -142,13 +153,18 @@ set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GGML_AVX512         OFF CACHE BOOL "" FORCE)
 set(GGML_AVX2           ON  CACHE BOOL "" FORCE)
 
+if((S2_VULKAN AND S2_CUDA) OR (S2_VULKAN AND S2_METAL) OR (S2_CUDA AND S2_METAL))
+    message(FATAL_ERROR "Choose only one GPU backend per executable")
+endif()
+
+set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+set(GGML_CUDA   OFF CACHE BOOL "" FORCE)
+set(GGML_METAL  OFF CACHE BOOL "" FORCE)
 if(S2_VULKAN)
     set(GGML_VULKAN ON CACHE BOOL "" FORCE)
-endif()
-if(S2_CUDA)
+elseif(S2_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
-endif()
-if(S2_METAL)
+elseif(S2_METAL)
     set(GGML_METAL ON CACHE BOOL "" FORCE)
 endif()
 
@@ -173,19 +189,6 @@ target_include_directories(asio_iface INTERFACE `${ASIO_INCLUDE_DIR})
 target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE)
 
 # ---------------------------------------------------------------------------
-# cxxopts
-# ---------------------------------------------------------------------------
-include(FetchContent)
-find_package(cxxopts QUIET)
-if(NOT cxxopts_FOUND)
-    FetchContent_Declare(cxxopts
-        GIT_REPOSITORY https://github.com/jarro2783/cxxopts.git
-        GIT_TAG        v3.2.1
-        GIT_SHALLOW    TRUE)
-    FetchContent_MakeAvailable(cxxopts)
-endif()
-
-# ---------------------------------------------------------------------------
 # s2 executable
 # ---------------------------------------------------------------------------
 set(S2_SOURCES
@@ -201,11 +204,16 @@ set(S2_SOURCES
     src/main.cpp
 )
 
-# tokenizer_data.cpp generado por el workflow (unsigned char[], ~12MB).
-# Se incluye solo si existe — build local sin workflow usa tokenizer.json en disco.
-if(EXISTS "`${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer_data.cpp")
+# tokenizer_data.{h,cpp} son un par generado por CI. main.cpp activa el
+# tokenizer embebido al ver el header, por lo que aceptar solo uno de los dos
+# produciria un link roto o una configuracion ambigua.
+set(S2_TOKENIZER_HEADER "`${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer_data.h")
+set(S2_TOKENIZER_SOURCE "`${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer_data.cpp")
+if(EXISTS "`${S2_TOKENIZER_HEADER}" AND EXISTS "`${S2_TOKENIZER_SOURCE}")
     list(APPEND S2_SOURCES src/tokenizer_data.cpp)
     message(STATUS "tokenizer embebido: src/tokenizer_data.cpp incluido")
+elseif(EXISTS "`${S2_TOKENIZER_HEADER}" OR EXISTS "`${S2_TOKENIZER_SOURCE}")
+    message(FATAL_ERROR "Incomplete embedded tokenizer pair: both src/tokenizer_data.h and src/tokenizer_data.cpp are required")
 else()
     message(STATUS "tokenizer: se usara tokenizer.json en disco (build local)")
 endif()
@@ -231,7 +239,6 @@ target_include_directories(s2-cuda PRIVATE
 target_link_libraries(s2-cuda PRIVATE
     ggml
     asio_iface
-    cxxopts::cxxopts
 )
 
 if(S2_CUDA)

@@ -23,6 +23,24 @@ GenerateResult generate(
     const int32_t im_end_id    = config.im_end_id;
     const int32_t num_cb       = out.num_codebooks;
 
+    if (params.max_new_tokens <= 0 || params.max_new_tokens > 32768 ||
+        params.n_threads <= 0 || params.n_threads > 256 ||
+        !std::isfinite(params.temperature) || params.temperature < 0.0f || params.temperature > 10.0f ||
+        !std::isfinite(params.top_p) || params.top_p <= 0.0f || params.top_p > 1.0f ||
+        params.top_k < 0 || params.top_k > 1000000 ||
+        params.min_tokens_before_end < 0 ||
+        params.ras_window_size < 0 || params.ras_window_size > 32768 ||
+        !std::isfinite(params.ras_high_temp) || params.ras_high_temp < 0.0f || params.ras_high_temp > 10.0f ||
+        !std::isfinite(params.ras_high_top_p) || params.ras_high_top_p <= 0.0f || params.ras_high_top_p > 1.0f ||
+        vocab_size <= 0 || codebook_size <= 0 ||
+        sem_begin < 0 || sem_begin >= vocab_size || sem_end < sem_begin || sem_end >= vocab_size ||
+        im_end_id < 0 || im_end_id >= vocab_size ||
+        prompt.rows != num_cb + 1 || prompt.cols <= 0 ||
+        prompt.data.size() != static_cast<size_t>(prompt.rows) * static_cast<size_t>(prompt.cols)) {
+        std::cerr << "[Generate] Invalid generation parameters/model/prompt dimensions.\n";
+        return out;
+    }
+
     // Build semantic mask: -inf everywhere except [sem_begin, sem_end] and im_end
     std::vector<float> sem_mask(vocab_size, -std::numeric_limits<float>::infinity());
     for (int32_t i = sem_begin; i <= sem_end && i < vocab_size; ++i) {
@@ -49,8 +67,9 @@ GenerateResult generate(
     if (params.verbose) {
         std::cout << "[Generate] Prefilling " << prompt.cols << " tokens..." << std::endl;
     }
-    if (!model.prefill(prompt_tm, prompt.cols, params.n_threads, state)) {
-        std::cerr << "[Generate] Prefill failed." << std::endl;
+    if (!model.prefill(prompt_tm, prompt.cols, params.n_threads, state) ||
+        state.logits.size() < static_cast<size_t>(vocab_size)) {
+        std::cerr << "[Generate] Prefill failed or returned invalid logits." << std::endl;
         return out;
     }
 
@@ -77,6 +96,10 @@ GenerateResult generate(
     // Sample first main_token
     bool block_end = (params.min_tokens_before_end > 0);
     int32_t main_token = apply_mask_and_sample(state.logits, block_end);
+    if (main_token < 0) {
+        std::cerr << "[Generate] Sampling failed (non-finite logits).\n";
+        return out;
+    }
 
     // Pre-allocate codes array
     out.codes.resize(static_cast<size_t>(num_cb) * params.max_new_tokens, 0);
@@ -120,18 +143,39 @@ GenerateResult generate(
             ras_sparams.top_k       = params.top_k;
             const int32_t ras_force_id = (step < params.min_tokens_before_end) ? -1 : im_end_id;
             main_token = sample_token(biased.data(), vocab_size, ras_sparams, ras_force_id);
+            if (main_token < 0) {
+                std::cerr << "[Generate] RAS sampling failed.\n";
+                out.codes.clear();
+                out.n_frames = 0;
+                return out;
+            }
         }
 
-        // Update RAS window
-        ras_window.push_back(main_token);
-        if ((int32_t)ras_window.size() > ras_window_size) {
-            ras_window.erase(ras_window.begin());
+        // RAS can legitimately resample to EOS.  Stop immediately rather than
+        // turning EOS into a clamped (and bogus) semantic codebook frame.
+        if (main_token == im_end_id) {
+            break;
+        }
+        if (main_token < sem_begin || main_token > sem_end) {
+            std::cerr << "[Generate] Sampler returned a non-semantic token: " << main_token << "\n";
+            out.codes.clear();
+            out.n_frames = 0;
+            return out;
         }
 
-        // sem_code: convert from vocabulary space to codebook space
-        int32_t sem_code = main_token - sem_begin;
-        if (sem_code < 0)           sem_code = 0;
-        if (sem_code >= codebook_size) sem_code = codebook_size - 1;
+        // Update RAS window only with semantic tokens.
+        if (ras_window_size > 0) {
+            ras_window.push_back(main_token);
+            if (static_cast<int32_t>(ras_window.size()) > ras_window_size) {
+                ras_window.erase(ras_window.begin());
+            }
+        } else {
+            ras_window.clear();
+        }
+
+        // Metadata validation guarantees the semantic span is exactly one
+        // codebook, so this conversion must be in range without clamping.
+        const int32_t sem_code = main_token - sem_begin;
 
         // Build codebook prefix for fast decoder
         // codebooks_cb[0] = sem_code (codebook-space index)
@@ -144,13 +188,24 @@ GenerateResult generate(
             // prefix = codebooks_cb[0..cb_idx-1]
             if (!model.fast_decode(state.hidden, codebooks_cb, params.n_threads, fast_logits)) {
                 std::cerr << "[Generate] fast_decode failed at cb " << cb_idx << std::endl;
-                // fill remaining with zeros
-                for (int32_t r = cb_idx; r < num_cb; ++r) {
-                    codebooks_cb.push_back(0);
-                }
-                break;
+                out.codes.clear();
+                out.n_frames = 0;
+                return out;
             }
-            int32_t cb_token = sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams);
+            if (fast_logits.size() != static_cast<size_t>(codebook_size)) {
+                std::cerr << "[Generate] Fast decoder returned " << fast_logits.size()
+                          << " logits; expected codebook_size=" << codebook_size << std::endl;
+                out.codes.clear();
+                out.n_frames = 0;
+                return out;
+            }
+            int32_t cb_token = sample_token(fast_logits.data(), codebook_size, sparams);
+            if (cb_token < 0 || cb_token >= codebook_size) {
+                std::cerr << "[Generate] Fast-decoder sampling failed/out of range at cb " << cb_idx << std::endl;
+                out.codes.clear();
+                out.n_frames = 0;
+                return out;
+            }
             codebooks_cb.push_back(cb_token);
         }
 
@@ -167,9 +222,12 @@ GenerateResult generate(
             step_input[cb + 1] = codebooks_cb[cb];
         }
 
-        if (!model.step(step_input, params.n_threads, state)) {
-            std::cerr << "[Generate] step() failed at step " << step << std::endl;
-            break;
+        if (!model.step(step_input, params.n_threads, state) ||
+            state.logits.size() < static_cast<size_t>(vocab_size)) {
+            std::cerr << "[Generate] step() failed or returned invalid logits at step " << step << std::endl;
+            out.codes.clear();
+            out.n_frames = 0;
+            return out;
         }
 
         step++;
@@ -180,6 +238,12 @@ GenerateResult generate(
         // Apply semantic mask and sample next main token
         bool block_next_end = (step < params.min_tokens_before_end);
         main_token = apply_mask_and_sample(state.logits, block_next_end);
+        if (main_token < 0) {
+            std::cerr << "[Generate] Sampling failed at step " << step << ".\n";
+            out.codes.clear();
+            out.n_frames = 0;
+            return out;
+        }
     }
 
     if (params.verbose) {
@@ -202,6 +266,7 @@ GenerateResult generate(
         out.codes.resize(static_cast<size_t>(num_cb) * n_frames);
     }
 
+    out.success = true;
     return out;
 }
 
@@ -228,6 +293,24 @@ GenerateResult generate_streaming(
     const int32_t im_end_id     = config.im_end_id;
     const int32_t num_cb        = out.num_codebooks;
 
+    if (params.max_new_tokens <= 0 || params.max_new_tokens > 32768 ||
+        params.n_threads <= 0 || params.n_threads > 256 || !frame_cb ||
+        !std::isfinite(params.temperature) || params.temperature < 0.0f || params.temperature > 10.0f ||
+        !std::isfinite(params.top_p) || params.top_p <= 0.0f || params.top_p > 1.0f ||
+        params.top_k < 0 || params.top_k > 1000000 ||
+        params.min_tokens_before_end < 0 ||
+        params.ras_window_size < 0 || params.ras_window_size > 32768 ||
+        !std::isfinite(params.ras_high_temp) || params.ras_high_temp < 0.0f || params.ras_high_temp > 10.0f ||
+        !std::isfinite(params.ras_high_top_p) || params.ras_high_top_p <= 0.0f || params.ras_high_top_p > 1.0f ||
+        vocab_size <= 0 || codebook_size <= 0 ||
+        sem_begin < 0 || sem_begin >= vocab_size || sem_end < sem_begin || sem_end >= vocab_size ||
+        im_end_id < 0 || im_end_id >= vocab_size ||
+        prompt.rows != num_cb + 1 || prompt.cols <= 0 ||
+        prompt.data.size() != static_cast<size_t>(prompt.rows) * static_cast<size_t>(prompt.cols)) {
+        std::cerr << "[GenerateStream] Invalid generation parameters/model/prompt dimensions.\n";
+        return out;
+    }
+
     std::vector<float> sem_mask(vocab_size, -std::numeric_limits<float>::infinity());
     for (int32_t i = sem_begin; i <= sem_end && i < vocab_size; ++i) sem_mask[i] = 0.0f;
     if (im_end_id >= 0 && im_end_id < vocab_size) sem_mask[im_end_id] = 0.0f;
@@ -242,8 +325,9 @@ GenerateResult generate_streaming(
 
     StepResult state;
     if (params.verbose) std::cout << "[GenerateStream] Prefilling " << cols << " tokens...\n";
-    if (!model.prefill(prompt_tm, cols, params.n_threads, state)) {
-        std::cerr << "[GenerateStream] Prefill failed.\n";
+    if (!model.prefill(prompt_tm, cols, params.n_threads, state) ||
+        state.logits.size() < static_cast<size_t>(vocab_size)) {
+        std::cerr << "[GenerateStream] Prefill failed or returned invalid logits.\n";
         return out;
     }
 
@@ -260,6 +344,10 @@ GenerateResult generate_streaming(
 
     bool block_end = (params.min_tokens_before_end > 0);
     int32_t main_token = apply_mask_and_sample(state.logits, block_end);
+    if (main_token < 0) {
+        std::cerr << "[GenerateStream] Sampling failed (non-finite logits).\n";
+        return out;
+    }
 
     std::vector<float> fast_logits;
     SamplerParams sparams;
@@ -277,6 +365,7 @@ GenerateResult generate_streaming(
 
     if (params.verbose) std::cout << "[GenerateStream] Generating...\n";
 
+    bool internal_ok = true;
     int32_t step = 0;
     while (main_token != im_end_id && step < params.max_new_tokens) {
         // RAS check
@@ -292,14 +381,30 @@ GenerateResult generate_streaming(
             ras_sp.temperature = ras_high_temp; ras_sp.top_p = ras_high_top_p; ras_sp.top_k = params.top_k;
             main_token = sample_token(biased.data(), vocab_size, ras_sp,
                                       (step < params.min_tokens_before_end) ? -1 : im_end_id);
+            if (main_token < 0) {
+                std::cerr << "[GenerateStream] RAS sampling failed.\n";
+                internal_ok = false;
+                break;
+            }
         }
 
-        ras_window.push_back(main_token);
-        if ((int32_t)ras_window.size() > ras_window_size) ras_window.erase(ras_window.begin());
+        if (main_token == im_end_id) {
+            break;
+        }
+        if (main_token < sem_begin || main_token > sem_end) {
+            std::cerr << "[GenerateStream] Sampler returned a non-semantic token: " << main_token << "\n";
+            internal_ok = false;
+            break;
+        }
 
-        int32_t sem_code = main_token - sem_begin;
-        if (sem_code < 0)              sem_code = 0;
-        if (sem_code >= codebook_size) sem_code = codebook_size - 1;
+        if (ras_window_size > 0) {
+            ras_window.push_back(main_token);
+            if (static_cast<int32_t>(ras_window.size()) > ras_window_size) ras_window.erase(ras_window.begin());
+        } else {
+            ras_window.clear();
+        }
+
+        const int32_t sem_code = main_token - sem_begin;
 
         std::vector<int32_t> codebooks_cb;
         codebooks_cb.reserve(num_cb);
@@ -307,11 +412,26 @@ GenerateResult generate_streaming(
 
         for (int32_t cb_idx = 1; cb_idx < num_cb; ++cb_idx) {
             if (!model.fast_decode(state.hidden, codebooks_cb, params.n_threads, fast_logits)) {
-                for (int32_t r = cb_idx; r < num_cb; ++r) codebooks_cb.push_back(0);
+                std::cerr << "[GenerateStream] fast_decode failed at cb " << cb_idx << "\n";
+                internal_ok = false;
                 break;
             }
-            codebooks_cb.push_back(sample_token(fast_logits.data(), (int32_t)fast_logits.size(), sparams));
+            if (fast_logits.size() != static_cast<size_t>(codebook_size)) {
+                std::cerr << "[GenerateStream] Fast decoder returned " << fast_logits.size()
+                          << " logits; expected codebook_size=" << codebook_size << "\n";
+                internal_ok = false;
+                break;
+            }
+            const int32_t cb_token = sample_token(fast_logits.data(), codebook_size, sparams);
+            if (cb_token < 0 || cb_token >= codebook_size) {
+                std::cerr << "[GenerateStream] Fast-decoder sampling failed/out of range at cb " << cb_idx << "\n";
+                internal_ok = false;
+                break;
+            }
+            codebooks_cb.push_back(cb_token);
         }
+
+        if (!internal_ok) break;
 
         // Fire the per-frame callback immediately
         for (int32_t cb = 0; cb < num_cb; ++cb) frame_codes[cb] = codebooks_cb[cb];
@@ -322,8 +442,10 @@ GenerateResult generate_streaming(
         step_input[0] = main_token;
         for (int32_t cb = 0; cb < num_cb; ++cb) step_input[cb + 1] = codebooks_cb[cb];
 
-        if (!model.step(step_input, params.n_threads, state)) {
-            std::cerr << "[GenerateStream] step() failed at step " << step << "\n";
+        if (!model.step(step_input, params.n_threads, state) ||
+            state.logits.size() < static_cast<size_t>(vocab_size)) {
+            std::cerr << "[GenerateStream] step() failed or returned invalid logits at step " << step << "\n";
+            internal_ok = false;
             break;
         }
 
@@ -333,12 +455,18 @@ GenerateResult generate_streaming(
 
         bool block_next_end = (step < params.min_tokens_before_end);
         main_token = apply_mask_and_sample(state.logits, block_next_end);
+        if (main_token < 0) {
+            std::cerr << "[GenerateStream] Sampling failed at step " << step << ".\n";
+            internal_ok = false;
+            break;
+        }
     }
 
     if (params.verbose) std::cout << "\n[GenerateStream] Done: " << out.n_frames << " frames.\n";
 
     // Out.codes is empty — the caller consumed frames via callback.
     // n_frames is set so callers can report totals.
+    out.success = internal_ok;
     return out;
 }
 

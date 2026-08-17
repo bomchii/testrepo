@@ -1,0 +1,758 @@
+name: Build s2.cpp - CPU + Vulkan + CUDA + Metal
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows Server 2022 - MSVC - Vulkan
+    # Pinned to windows-2022 (VS 2022 / MSVC 19.4x) to match the last verified-green
+    # toolchain. windows-2025 moved to VS 2026 (MSVC 19.51, C++20 default, stricter
+    # diagnostics) on 2026-06-08; pinning keeps both jobs on one consistent compiler
+    # and avoids surprise breakage in the Crow/Asio/ggml compile. Revisit when ready
+    # to validate against VS 2026 (test via the windows-2025-vs2026 label on a branch).
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Instalar Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: Verificar y exportar rutas del Vulkan SDK
+        shell: pwsh
+        run: |
+          # El action escribe VULKAN_SDK al entorno, pero CMake a veces
+          # no lo recoge. Lo exportamos explicitamente con las rutas exactas.
+          $sdk = $env:VULKAN_SDK
+          if (-Not $sdk) {
+            # Fallback: buscar en la ruta tipica de instalacion de LunarG
+            $sdk = Get-ChildItem "C:\VulkanSDK" -Directory |
+                   Sort-Object Name -Descending |
+                   Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-Not $sdk) { Write-Error "VULKAN_SDK no encontrado"; exit 1 }
+
+          Write-Host "VULKAN_SDK = $sdk"
+
+          $inc  = "$sdk\Include"
+          $lib  = "$sdk\Lib\vulkan-1.lib"
+
+          if (-Not (Test-Path $inc))  { Write-Error "Include dir no existe: $inc";  exit 1 }
+          if (-Not (Test-Path $lib))  { Write-Error "vulkan-1.lib no existe: $lib"; exit 1 }
+
+          # Persistir para los steps siguientes
+          "VULKAN_SDK=$sdk"             >> $env:GITHUB_ENV
+          "Vulkan_INCLUDE_DIR=$inc"     >> $env:GITHUB_ENV
+          "Vulkan_LIBRARY=$lib"         >> $env:GITHUB_ENV
+          "$sdk\Bin"                    >> $env:GITHUB_PATH
+
+          Write-Host "Include : $inc"
+          Write-Host "Library : $lib"
+
+      # Los shaders se generan desde cero durante el build.
+      # No usamos los precompilados del ZIP porque fueron generados sin
+      # soporte coopmat, y el Vulkan SDK actual los detecta como disponibles,
+      # causando una discrepancia entre el .hpp y el .cpp.
+
+      - name: Cache Crow/Asio headers
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/_deps/crow-include
+            build/_deps/asio-include
+          key: crow-asio-${{ runner.os }}-crow1.3.3-asio1.30.2
+
+      - name: Parchear CMakeLists.txt para Windows
+        shell: pwsh
+        run: pwsh -File patch-cmake.ps1
+
+      - name: Generar tokenizer_data embebido en el exe
+        shell: pwsh
+        run: |
+          $json = "tokenizer.json"
+          if (-Not (Test-Path $json)) { Write-Error "tokenizer.json no encontrado"; exit 1 }
+
+          $bytes  = [System.IO.File]::ReadAllBytes((Resolve-Path $json).Path)
+          $nBytes = $bytes.Length
+          Write-Host "tokenizer.json: $nBytes bytes ($([math]::Round($nBytes/1MB,2)) MB)"
+
+          # tokenizer_data.h — solo declaraciones extern
+          # Escribir linea a linea para evitar conflictos YAML/heredoc con comillas
+          $hLines = [System.Collections.Generic.List[string]]::new()
+          $hLines.Add("// tokenizer_data.h -- generado por el workflow. NO editar.")
+          $hLines.Add("#pragma once")
+          $hLines.Add("#include <stddef.h>")
+          $hLines.Add("extern const unsigned char tokenizer_json_data[];")
+          $hLines.Add("extern const size_t tokenizer_json_size;")
+          [System.IO.File]::WriteAllLines(
+              (Join-Path (Get-Location) "src/tokenizer_data.h"),
+              $hLines,
+              [System.Text.UTF8Encoding]::new($false))
+          Write-Host "OK: src/tokenizer_data.h"
+
+          # tokenizer_data.cpp — definicion del array (unsigned char, pragma warnings)
+          $sb = [System.Text.StringBuilder]::new($nBytes * 6)
+          $sb.AppendLine("// tokenizer_data.cpp -- generado por el workflow. NO editar.") | Out-Null
+          $sb.AppendLine("#ifdef _MSC_VER")                                               | Out-Null
+          $sb.AppendLine("#  pragma warning(push)")                                        | Out-Null
+          $sb.AppendLine("#  pragma warning(disable: 4838 4309 4365 4267)")                | Out-Null
+          $sb.AppendLine("#endif")                                                         | Out-Null
+          $sb.AppendLine("#include <stddef.h>")                                            | Out-Null
+          $sb.AppendLine("extern const size_t tokenizer_json_size = static_cast<size_t>(${nBytes}ULL);")   | Out-Null
+          $sb.AppendLine("extern const unsigned char tokenizer_json_data[] = {")                  | Out-Null
+
+          $COLS = 32
+          for ($i = 0; $i -lt $nBytes; $i += $COLS) {
+              $end   = [Math]::Min($i + $COLS, $nBytes)
+              $chunk = $bytes[$i..($end - 1)]
+              $hexes = ($chunk | ForEach-Object { "0x{0:x2}u" -f $_ }) -join ","
+              $sb.AppendLine("    $hexes,") | Out-Null
+          }
+
+          $sb.AppendLine("    0x00u")   | Out-Null
+          $sb.AppendLine("};")          | Out-Null
+          $sb.AppendLine("#ifdef _MSC_VER")   | Out-Null
+          $sb.AppendLine("#  pragma warning(pop)") | Out-Null
+          $sb.AppendLine("#endif")      | Out-Null
+
+          [System.IO.File]::WriteAllText(
+              (Join-Path (Get-Location) "src/tokenizer_data.cpp"),
+              $sb.ToString(),
+              [System.Text.UTF8Encoding]::new($false))
+          Write-Host "OK: src/tokenizer_data.cpp ($([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1KB,1)) KB)"
+
+      - name: CMake Configure
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DS2_VULKAN=ON `
+            -DGGML_VULKAN=ON `
+            -DS2_CUDA=OFF `
+            -DS2_METAL=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_VULKAN_FLASH_ATTENTION=ON `
+            -DVulkan_INCLUDE_DIR="$env:Vulkan_INCLUDE_DIR" `
+            -DVulkan_LIBRARY="$env:Vulkan_LIBRARY" `
+            -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=OFF `
+            -DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT=OFF `
+            -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=OFF `
+            -DGGML_AVX512=OFF
+
+      - name: CMake Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Verificar ejecutable
+        shell: pwsh
+        run: |
+          $exe = "build\Release\s2.exe"
+          if (-Not (Test-Path $exe)) {
+            Write-Error "s2.exe no fue generado."
+            exit 1
+          }
+          $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "OK: s2.exe generado ($sizeMB MB)"
+
+          # ---- Structural check (always runs; needs no GPU and no loader) --------
+          # s2.exe links ggml statically, so its only non-system imports should be
+          # vulkan-1.dll (the Vulkan loader) plus the VC runtime and a few Win32
+          # libs. Enumerate the import table with dumpbin and fail on anything
+          # unexpected -- this catches packaging/link regressions regardless of
+          # whether the exe can actually be launched on this headless runner.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-Not (Test-Path $vswhere)) { Write-Error "vswhere no encontrado"; exit 1 }
+          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+          if (-Not $dumpbin) { Write-Error "dumpbin no encontrado -- no se pueden verificar dependencias"; exit 1 }
+
+          $deps = & $dumpbin.FullName /dependents $exe |
+                  Select-String -Pattern '^\s+\S+\.dll\s*$' |
+                  ForEach-Object { $_.ToString().Trim() }
+          Write-Host "`n--- s2.exe dependents ---"
+          $deps | ForEach-Object { Write-Host "    $_" }
+          Write-Host "-------------------------`n"
+
+          # Classify each dependency. A dependency is safe if it is the Vulkan
+          # loader, a UCRT api-set, or any DLL actually present in System32 (i.e.
+          # OS-provided / VC++ redistributable. The VC++ runtime is intentionally
+          # not bundled; end users must have the Microsoft VC++ 2015-2022 x64
+          # Redistributable installed. Only a DLL that is NONE of these would
+          # indicate an unexpected backend/build dependency,
+          # so flag just those. (Using live System32 presence instead of a fixed
+          # name list avoids false failures on benign system DLLs like bcrypt.dll.)
+          $sys32 = Join-Path $env:WINDIR "System32"
+          $hasVulkan  = $false
+          $unexpected = @()
+          foreach ($d in $deps) {
+              $name = $d.ToLower()
+              if ($name -eq 'vulkan-1.dll') { $hasVulkan = $true; continue }
+              if ($name -like 'api-ms-win-*') { continue }
+              if ($name -match '^(msvcp140|vcruntime140|vcomp140|concrt140)') { continue }  # VC++ redist
+              if (Test-Path (Join-Path $sys32 $name)) { continue }   # OS-provided
+              $unexpected += $d
+          }
+          if (-Not $hasVulkan) {
+              Write-Error "vulkan-1.dll no figura como dependencia -- el artefacto no es un build Vulkan valido."
+              exit 1
+          }
+          if ($unexpected.Count -gt 0) {
+              Write-Error ("Dependencias no resolubles en una maquina Windows estandar (revisar link/empaquetado): " + ($unexpected -join ', '))
+              exit 1
+          }
+          Write-Host "OK: s2.exe solo importa vulkan-1.dll + DLLs del sistema / runtime VC++."
+
+          # ---- Opportunistic execution (only if the loader is available) ---------
+          # s2.exe imports the Vulkan loader (vulkan-1.dll). On a headless runner
+          # there is no GPU driver, and humbletim/install-vulkan-sdk lays down a
+          # minimal SDK that does NOT reliably ship the prebuilt loader DLL, so it
+          # may be absent. If we can find a loader we copy it next to the exe and
+          # run `--help` (which returns in the arg parser BEFORE any Vulkan init, so
+          # it only needs the import table to resolve) -- this additionally proves
+          # the binary loads and is not an AVX/illegal-instruction crash. If no
+          # loader is available, we SKIP execution (the structural check above
+          # already gates the build) rather than fail. End-user machines always
+          # have vulkan-1.dll via their GPU drivers; this is a CI-only concern.
+          $vkDll = $null
+          $cands = @(
+              (Join-Path $env:VULKAN_SDK "Bin\vulkan-1.dll"),
+              (Join-Path $env:VULKAN_SDK "bin\vulkan-1.dll"),
+              (Join-Path $env:VULKAN_SDK "runtime\x64\vulkan-1.dll"),
+              "C:\Windows\System32\vulkan-1.dll")
+          foreach ($c in $cands) { if ($c -and (Test-Path $c)) { $vkDll = $c; break } }
+          if (-Not $vkDll -and $env:VULKAN_SDK -and (Test-Path $env:VULKAN_SDK)) {
+              $vkDll = Get-ChildItem -Path $env:VULKAN_SDK -Recurse -Filter vulkan-1.dll -ErrorAction SilentlyContinue |
+                       Select-Object -First 1 -ExpandProperty FullName
+          }
+
+          if (-Not $vkDll) {
+              Write-Host "NOTA: vulkan-1.dll no disponible en el runner; se omite la ejecucion de --help."
+              Write-Host "      (La verificacion estructural ya valido las dependencias. La ejecucion real"
+              Write-Host "       requiere vulkan-1.dll, presente en cualquier maquina con drivers de GPU.)"
+              Write-Host "OK: s2.exe verificado (sin ejecucion)."
+          } else {
+              Copy-Item $vkDll "build\Release\" -Force
+              Write-Host "OK: vulkan-1.dll encontrada y copiada junto al exe ($vkDll)"
+              & $exe --help 2>&1 | Out-Null
+              $ec = $LASTEXITCODE
+              if ($ec -eq -1073741515) {
+                Write-Error "s2.exe failed with STATUS_DLL_NOT_FOUND (0xC0000135) -- a required DLL is still missing next to the exe"
+                exit 1
+              }
+              if ($ec -eq -1073741795) {
+                Write-Error "s2.exe failed with STATUS_ILLEGAL_INSTRUCTION (0xC000001D) -- CPU executed an unsupported instruction (check AVX level / GGML_AVX512)"
+                exit 1
+              }
+              if ($ec -ne 0 -and $ec -ne 1) {
+                Write-Error "s2.exe terminated abnormally (exit code: $ec)"
+                exit 1
+              }
+              $global:LASTEXITCODE = 0
+              Write-Host "OK: s2.exe ejecuta correctamente (--help)"
+          }
+
+      - name: Empaquetar release
+        shell: pwsh
+        run: |
+          # Con BUILD_SHARED_LIBS=OFF y CROW_ENABLE_SSL=0, el exe no necesita
+          # DLLs de ggml ni de OpenSSL. El runtime de MSVC se enlaza dinamicamente
+          # y NO se empaqueta: el usuario debe tener instalado Microsoft Visual C++
+          # 2015-2022 Redistributable (x64). vulkan-1.dll lo proporciona el driver
+          # Vulkan de la GPU (NVIDIA/AMD/Intel).
+          #
+          # Resultado: no se distribuyen DLLs de ggml/OpenSSL junto al ejecutable.
+
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+
+          Copy-Item build\Release\s2.exe release\
+
+          # tokenizer.json ya esta embebido en s2.exe — no se distribuye por separado.
+          # Solo se incluye si el build fallo en embeber (fallback de seguridad).
+          $hasFallback = $false
+          if (Test-Path tokenizer.json) {
+              # Comprobar si el exe tiene el simbolo embebido
+              # (si tokenizer_data.h se genero correctamente, no hace falta el .json)
+              Write-Host "INFO: tokenizer.json presente en repo pero NO incluido en release (embebido en exe)"
+          }
+
+          $sizeMB = [math]::Round((Get-Item release\s2.exe).Length / 1MB, 1)
+          Write-Host "`nContenido del release:"
+          Get-ChildItem release\ | Format-Table Name, Length -AutoSize
+          Write-Host "Tamanio de s2.exe: $sizeMB MB (incluye tokenizer embebido)"
+
+      - name: Subir artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: s2-windows-vulkan
+          path: release/
+          retention-days: 30
+
+  build-cuda:
+    name: Windows Server 2022 - MSVC - CUDA 12
+    # Pinned to windows-2022 (Visual Studio 2022 / MSVC 19.4x). The windows-2025
+    # label migrated to Visual Studio 2026 (MSVC 19.51) starting 2026-06-08, and
+    # CUDA 12.6 does not support VS 2026: CMake's enable_language(CUDA) fails with
+    # "No CUDA toolset found" (the CUDA MSBuild integration has no v180 customization),
+    # and nvcc's host_config.h #error rejects the newer MSVC. GitHub's documented
+    # fallback for VS 2022 is the windows-2022 image.
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Instalar CUDA Toolkit 12.6
+        uses: Jimver/cuda-toolkit@v0.2.23
+        with:
+          cuda: '12.6.3'
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - name: Verificar CUDA
+        shell: pwsh
+        run: |
+          nvcc --version
+          $cudaPath = $env:CUDA_PATH
+          if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
+          if (-Not $cudaPath) { Write-Error "CUDA_PATH no encontrado"; exit 1 }
+          Write-Host "CUDA_PATH = $cudaPath"
+          "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+
+      - name: Cache Crow/Asio headers
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/_deps/crow-include
+            build/_deps/asio-include
+          key: crow-asio-${{ runner.os }}-crow1.3.3-asio1.30.2
+
+      - name: Parchear CMakeLists.txt para CUDA
+        shell: pwsh
+        run: pwsh -File patch-cmake-cuda.ps1
+
+      - name: Generar tokenizer_data embebido en el exe
+        shell: pwsh
+        run: |
+          $json = "tokenizer.json"
+          if (-Not (Test-Path $json)) { Write-Error "tokenizer.json no encontrado"; exit 1 }
+
+          $bytes  = [System.IO.File]::ReadAllBytes((Resolve-Path $json).Path)
+          $nBytes = $bytes.Length
+          Write-Host "tokenizer.json: $nBytes bytes ($([math]::Round($nBytes/1MB,2)) MB)"
+
+          $hLines = [System.Collections.Generic.List[string]]::new()
+          $hLines.Add("// tokenizer_data.h -- generado por el workflow. NO editar.")
+          $hLines.Add("#pragma once")
+          $hLines.Add("#include <stddef.h>")
+          $hLines.Add("extern const unsigned char tokenizer_json_data[];")
+          $hLines.Add("extern const size_t tokenizer_json_size;")
+          [System.IO.File]::WriteAllLines(
+              (Join-Path (Get-Location) "src/tokenizer_data.h"),
+              $hLines,
+              [System.Text.UTF8Encoding]::new($false))
+          Write-Host "OK: src/tokenizer_data.h"
+
+          $sb = [System.Text.StringBuilder]::new($nBytes * 6)
+          $sb.AppendLine("// tokenizer_data.cpp -- generado por el workflow. NO editar.") | Out-Null
+          $sb.AppendLine("#ifdef _MSC_VER")                                               | Out-Null
+          $sb.AppendLine("#  pragma warning(push)")                                        | Out-Null
+          $sb.AppendLine("#  pragma warning(disable: 4838 4309 4365 4267)")                | Out-Null
+          $sb.AppendLine("#endif")                                                         | Out-Null
+          $sb.AppendLine("#include <stddef.h>")                                            | Out-Null
+          $sb.AppendLine("extern const size_t tokenizer_json_size = static_cast<size_t>(${nBytes}ULL);")   | Out-Null
+          $sb.AppendLine("extern const unsigned char tokenizer_json_data[] = {")                  | Out-Null
+
+          $COLS = 32
+          for ($i = 0; $i -lt $nBytes; $i += $COLS) {
+              $end   = [Math]::Min($i + $COLS, $nBytes)
+              $chunk = $bytes[$i..($end - 1)]
+              $hexes = ($chunk | ForEach-Object { "0x{0:x2}u" -f $_ }) -join ","
+              $sb.AppendLine("    $hexes,") | Out-Null
+          }
+
+          $sb.AppendLine("    0x00u")   | Out-Null
+          $sb.AppendLine("};")          | Out-Null
+          $sb.AppendLine("#ifdef _MSC_VER")   | Out-Null
+          $sb.AppendLine("#  pragma warning(pop)") | Out-Null
+          $sb.AppendLine("#endif")      | Out-Null
+
+          [System.IO.File]::WriteAllText(
+              (Join-Path (Get-Location) "src/tokenizer_data.cpp"),
+              $sb.ToString(),
+              [System.Text.UTF8Encoding]::new($false))
+          Write-Host "OK: src/tokenizer_data.cpp ($([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1KB,1)) KB)"
+
+      - name: CMake Configure (CUDA)
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DS2_CUDA=ON `
+            -DGGML_CUDA=ON `
+            -DS2_VULKAN=OFF `
+            -DS2_METAL=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_CUDA_ARCHITECTURES=86 `
+            -DGGML_AVX2=ON `
+            -DGGML_STATIC=ON `
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static `
+            -DGGML_AVX512=OFF `
+            -DGGML_VULKAN_FLASH_ATTENTION=OFF
+
+      - name: CMake Build (CUDA)
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Verificar ejecutable CUDA
+        shell: pwsh
+        run: |
+          $exe = "build\Release\s2-cuda.exe"
+          if (-Not (Test-Path $exe)) {
+            Write-Error "s2-cuda.exe no fue generado."
+            exit 1
+          }
+          $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "OK: s2-cuda.exe generado ($sizeMB MB)"
+
+          # DO NOT run s2-cuda.exe on this runner. A CUDA-enabled binary has a
+          # LOAD-TIME import on nvcuda.dll -- the CUDA *Driver* API, which the
+          # NVIDIA *display driver* installs into System32. It is NOT part of the
+          # CUDA toolkit and is NOT redistributable. GitHub-hosted windows-2022
+          # runners have no NVIDIA GPU and no driver, so nvcuda.dll is absent and
+          # ANY launch (even `--help`) fails at process load with 0xC0000135
+          # (STATUS_DLL_NOT_FOUND / -1073741515) before main() runs. That is
+          # expected on a GPU-less box and is NOT a build defect -- so instead of
+          # executing the exe we verify its import table is exactly what we expect.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-Not (Test-Path $vswhere)) { Write-Error "vswhere no encontrado"; exit 1 }
+          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+          if (-Not $dumpbin) { Write-Error "dumpbin no encontrado -- no se pueden verificar dependencias"; exit 1 }
+
+          $deps = & $dumpbin.FullName /dependents $exe |
+                  Select-String -Pattern '^\s+\S+\.dll\s*$' |
+                  ForEach-Object { $_.ToString().Trim() }
+          Write-Host "`n--- s2-cuda.exe dependents ---"
+          $deps | ForEach-Object { Write-Host "    $_" }
+          Write-Host "------------------------------`n"
+
+          # Buckets of acceptable dependencies:
+          #  - Windows system DLLs + UCRT api-sets + VC/OpenMP runtime: present on
+          #    Windows and on end-user machines via the VC++ Redistributable.
+          #  - nvcuda.dll: the NVIDIA driver provides this on the user's GPU box.
+          #  - cublas/cublasLt/cudart: shipped next to the exe in the release step.
+          # Anything else is an unexpected new dependency that would break users, so
+          # fail here -- this catches packaging regressions WITHOUT needing a GPU.
+          $allowDriver  = @('nvcuda.dll')
+          $allowShipped = @('cublas64_12.dll','cublaslt64_12.dll','cudart64_12.dll')
+          $sys32 = Join-Path $env:WINDIR "System32"
+
+          $hasNvcuda  = $false
+          $unexpected = @()
+          foreach ($d in $deps) {
+              $name = $d.ToLower()
+              if ($name -eq 'nvcuda.dll') { $hasNvcuda = $true }
+              if ($name -like 'api-ms-win-*') { continue }
+              if ($allowDriver  -contains $name) { continue }
+              if ($allowShipped -contains $name) { continue }
+              if ($name -match '^(msvcp140|vcruntime140|vcomp140|concrt140)') { continue }
+              if (Test-Path (Join-Path $sys32 $name)) { continue }
+              $unexpected += $d
+          }
+
+          if (-Not $hasNvcuda) {
+              Write-Error "nvcuda.dll no figura como dependencia -- el artefacto no es un build CUDA valido."
+              exit 1
+          }
+          if ($unexpected.Count -gt 0) {
+              Write-Error ("Dependencias inesperadas (revisar empaquetado): " + ($unexpected -join ', '))
+              exit 1
+          }
+
+          Write-Host "OK: s2-cuda.exe solo depende de (sistema + VC runtime) + nvcuda (driver) + cublas (incluida en el release)."
+          Write-Host "NOTA: la ejecucion real (incl. --help) requiere una GPU NVIDIA con driver; validar en hardware o en un runner self-hosted con GPU."
+
+      - name: Empaquetar release CUDA
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-cuda | Out-Null
+          Copy-Item build\Release\s2-cuda.exe release-cuda\
+
+          # Runtime DLLs that ship next to s2-cuda.exe. The exe's actual imports
+          # (verified via dumpbin in the previous step) are cublas64_12.dll plus
+          # nvcuda.dll; cudart64_12.dll is NOT imported (the static CUDA runtime
+          # linked correctly). We ship:
+          #   - cublas64_12.dll   : directly imported by the exe (no static build on Windows).
+          #   - cublasLt64_12.dll : loaded by cuBLAS at runtime; ship alongside it.
+          #   - cudart64_12.dll   : shipped defensively (cuBLAS may pull it); ~harmless if unused.
+          # nvcuda.dll is intentionally NOT shipped: it is the NVIDIA *driver* API,
+          # provided by the user's installed GPU driver in System32, and is not
+          # redistributable. End users also need the VC++ Redistributable
+          # (MSVCP140/VCRUNTIME140*/VCOMP140), standard on most Windows machines.
+          $cudaPath = $env:CUDA_PATH
+          if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
+          if (-Not $cudaPath) { Write-Error "CUDA_PATH no definido"; exit 1 }
+
+          foreach ($dll in @("cublas64_12.dll", "cublasLt64_12.dll", "cudart64_12.dll")) {
+              $src = Join-Path $cudaPath "bin\$dll"
+              if (Test-Path $src) {
+                  Copy-Item $src release-cuda\
+                  Write-Host "OK: $dll incluida"
+              } else {
+                  Write-Error "$dll no encontrada en $cudaPath\bin -- el release quedaria incompleto"
+                  exit 1
+              }
+          }
+
+          $sizeMB = [math]::Round((Get-Item release-cuda\s2-cuda.exe).Length / 1MB, 1)
+          Write-Host "`nContenido del release CUDA:"
+          Get-ChildItem release-cuda\ | Format-Table Name, Length -AutoSize
+          Write-Host "Tamanio de s2-cuda.exe: $sizeMB MB (cudart embebido, cublas dinamica)"
+
+      - name: Subir artifact CUDA
+        uses: actions/upload-artifact@v7
+        with:
+          name: s2-windows-cuda
+          path: release-cuda/
+          retention-days: 30
+
+  build-cpu:
+    name: Windows Server 2022 - MSVC - CPU only
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Cache Crow/Asio headers
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/_deps/crow-include
+            build/_deps/asio-include
+          key: crow-asio-${{ runner.os }}-crow1.3.3-asio1.30.2
+
+      - name: Prepare portable CMake/Crow
+        shell: pwsh
+        run: pwsh -File patch-cmake.ps1
+
+      - name: CMake Configure (CPU only)
+        shell: pwsh
+        run: |
+          cmake -B build-cpu -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DS2_VULKAN=OFF `
+            -DS2_CUDA=OFF `
+            -DS2_METAL=OFF `
+            -DGGML_VULKAN=OFF `
+            -DGGML_CUDA=OFF `
+            -DGGML_METAL=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_AVX512=OFF
+
+      - name: CMake Build (CPU only)
+        shell: pwsh
+        run: cmake --build build-cpu --config Release --parallel
+
+      - name: Verify CPU-only executable
+        shell: pwsh
+        run: |
+          $exe = "build-cpu\Release\s2.exe"
+          if (-Not (Test-Path $exe)) { Write-Error "CPU s2.exe was not generated"; exit 1 }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+                     Select-Object -First 1
+          if (-Not $dumpbin) { Write-Error "dumpbin not found"; exit 1 }
+          $deps = & $dumpbin.FullName /dependents $exe |
+                  Select-String -Pattern '^\s+\S+\.dll\s*$' |
+                  ForEach-Object { $_.ToString().Trim().ToLower() }
+          if ($deps -contains 'vulkan-1.dll' -or $deps -contains 'nvcuda.dll' -or
+              ($deps | Where-Object { $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' })) {
+              Write-Error "CPU artifact unexpectedly links a GPU runtime: $($deps -join ', ')"
+              exit 1
+          }
+
+          & $exe --help 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error "CPU executable failed --help"; exit 1 }
+          Write-Host "OK: CPU-only executable has no Vulkan/CUDA imports and starts successfully."
+
+      - name: Package CPU release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-cpu | Out-Null
+          Copy-Item build-cpu\Release\s2.exe release-cpu\s2-cpu.exe
+          # CPU build intentionally does not embed the large tokenizer blob.
+          # Keep it beside the executable so get_exe_dir() resolves it automatically.
+          Copy-Item tokenizer.json release-cpu\tokenizer.json
+
+      - name: Upload CPU artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: s2-windows-cpu
+          path: release-cpu/
+          retention-days: 30
+
+  build-metal:
+    name: macOS - Clang - Metal
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Fetch header-only Crow and Asio
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-deps
+          curl -fL --retry 3 \
+            https://github.com/CrowCpp/Crow/archive/refs/tags/v1.3.3.tar.gz \
+            -o build-deps/crow.tar.gz
+          tar -xzf build-deps/crow.tar.gz -C build-deps
+
+          curl -fL --retry 3 \
+            https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.tar.gz \
+            -o build-deps/asio.tar.gz
+          tar -xzf build-deps/asio.tar.gz -C build-deps
+
+          test -f build-deps/Crow-1.3.3/include/crow.h
+          test -f build-deps/asio-asio-1-30-2/asio/include/asio.hpp
+
+      - name: CMake Configure (Metal only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -B build-metal -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DS2_VULKAN=OFF \
+            -DS2_CUDA=OFF \
+            -DS2_METAL=ON \
+            -DGGML_VULKAN=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DS2_CROW_INCLUDE_DIR="$PWD/build-deps/Crow-1.3.3/include" \
+            -DS2_ASIO_INCLUDE_DIR="$PWD/build-deps/asio-asio-1-30-2/asio/include"
+
+      - name: CMake Build (Metal)
+        shell: bash
+        run: cmake --build build-metal --parallel
+
+      - name: Verify Metal executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=build-metal/s2
+          test -x "$exe"
+          "$exe" --help >/dev/null
+
+          # Static linking can hide framework names from a naive filename check,
+          # so verify the actual Metal backend symbol is present in the executable.
+          symbols="$(nm "$exe")"
+          if ! grep -q 'ggml_backend_metal_init' <<<"$symbols"; then
+            echo "Metal backend symbol is missing from the artifact" >&2
+            exit 1
+          fi
+          if grep -Eq 'ggml_backend_cuda_init|ggml_backend_vk_init' <<<"$symbols"; then
+            echo "Metal artifact unexpectedly contains CUDA/Vulkan backend symbols" >&2
+            exit 1
+          fi
+          echo "OK: Metal backend present and CUDA/Vulkan backends absent."
+
+      - name: Package Metal release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-metal
+          cp build-metal/s2 release-metal/s2-metal
+          cp tokenizer.json release-metal/tokenizer.json
+          chmod +x release-metal/s2-metal
+          # Package on macOS so the executable bit is preserved inside the ZIP.
+          ditto -c -k --sequesterRsrc --keepParent release-metal s2-macos-metal.zip
+
+      - name: Upload Metal artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: s2-macos-metal
+          path: s2-macos-metal.zip
+          retention-days: 30
+
+  release:
+    name: Publish all backend release assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, build-cuda, build-cpu, build-metal]
+    runs-on: windows-2022
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Vulkan artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: s2-windows-vulkan
+          path: artifacts/vulkan
+
+      - name: Download CUDA artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: s2-windows-cuda
+          path: artifacts/cuda
+
+      - name: Download CPU artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: s2-windows-cpu
+          path: artifacts/cpu
+
+      - name: Download Metal artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: s2-macos-metal
+          path: artifacts/metal
+
+      - name: Create release ZIPs
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
+          Compress-Archive -Path artifacts\vulkan\* -DestinationPath "s2-$tag-windows-vulkan.zip"
+          Compress-Archive -Path artifacts\cuda\*   -DestinationPath "s2-$tag-windows-cuda.zip"
+          Compress-Archive -Path artifacts\cpu\*    -DestinationPath "s2-$tag-windows-cpu.zip"
+          $metalZip = Get-ChildItem artifacts\metal\s2-macos-metal.zip | Select-Object -First 1
+          if (-Not $metalZip) { Write-Error "Metal release ZIP is missing"; exit 1 }
+          Copy-Item $metalZip.FullName "s2-$tag-macos-metal.zip"
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v3.0.1
+        with:
+          files: |
+            s2-*-windows-vulkan.zip
+            s2-*-windows-cuda.zip
+            s2-*-windows-cpu.zip
+            s2-*-macos-metal.zip
+          generate_release_notes: true

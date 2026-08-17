@@ -79,7 +79,7 @@ struct PipelineParams {
     std::string output_path;
     GenerateParams gen;
     int32_t vulkan_device       = -1;
-    int32_t codec_vulkan_device = -1;
+    int32_t codec_vulkan_device = -2;
     bool    segment_sentences      = false;
     int32_t codec_chunk_frames     = 0;
     int32_t codec_overlap_frames   = 0;
@@ -92,9 +92,27 @@ struct PipelineParams {
     int32_t stream_decode_stride_frames = 0;
 };
 
+static int parse_int_arg(const char * raw) {
+    if (!raw) throw std::invalid_argument("missing numeric value");
+    const std::string value(raw);
+    size_t pos = 0;
+    const int parsed = std::stoi(value, &pos, 10);
+    if (pos != value.size()) throw std::invalid_argument("trailing characters in integer: " + value);
+    return parsed;
+}
+
+static float parse_float_arg(const char * raw) {
+    if (!raw) throw std::invalid_argument("missing numeric value");
+    const std::string value(raw);
+    size_t pos = 0;
+    const float parsed = std::stof(value, &pos);
+    if (pos != value.size()) throw std::invalid_argument("trailing characters in number: " + value);
+    return parsed;
+}
+
 // Returns 0 = parsed OK, 1 = error/exit, 2 = --help.
 int parse_args(int argc, char** argv,
-               PipelineParams& params, int& port, bool& list_voices) {
+               PipelineParams& params, int& port, std::string& bind_host, bool& list_voices) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         // std::stoi / std::stof throw std::invalid_argument on non-numeric input
@@ -110,39 +128,41 @@ int parse_args(int argc, char** argv,
         } else if ((arg == "-t" || arg == "--tokenizer") && i + 1 < argc) {
             params.tokenizer_path = argv[++i];
         } else if ((arg == "-v" || arg == "--vulkan") && i + 1 < argc) {
-            params.vulkan_device = std::stoi(argv[++i]);
+            params.vulkan_device = parse_int_arg(argv[++i]);
         } else if (arg == "--codec-vulkan" && i + 1 < argc) {
-            params.codec_vulkan_device = std::stoi(argv[++i]);
+            params.codec_vulkan_device = parse_int_arg(argv[++i]);
         } else if (arg == "--segment") {
             params.segment_sentences = true;
         } else if (arg == "--codec-chunk" && i + 1 < argc) {
-            params.codec_chunk_frames = std::stoi(argv[++i]);
+            params.codec_chunk_frames = parse_int_arg(argv[++i]);
         } else if (arg == "--codec-overlap" && i + 1 < argc) {
-            params.codec_overlap_frames = std::stoi(argv[++i]);
+            params.codec_overlap_frames = parse_int_arg(argv[++i]);
         } else if (arg == "--min-seg-chars" && i + 1 < argc) {
-            params.min_seg_chars = std::stoi(argv[++i]);
+            params.min_seg_chars = parse_int_arg(argv[++i]);
         } else if ((arg == "--temperature" || arg == "--temp") && i + 1 < argc) {
-            params.gen.temperature = std::stof(argv[++i]);
+            params.gen.temperature = parse_float_arg(argv[++i]);
         } else if (arg == "--top-p" && i + 1 < argc) {
-            params.gen.top_p = std::stof(argv[++i]);
+            params.gen.top_p = parse_float_arg(argv[++i]);
         } else if (arg == "--top-k" && i + 1 < argc) {
-            params.gen.top_k = std::stoi(argv[++i]);
+            params.gen.top_k = parse_int_arg(argv[++i]);
         } else if (arg == "--min-end-tokens" && i + 1 < argc) {
-            params.gen.min_tokens_before_end = std::stoi(argv[++i]);
+            params.gen.min_tokens_before_end = parse_int_arg(argv[++i]);
         } else if (arg == "--ras-window" && i + 1 < argc) {
-            params.gen.ras_window_size = std::stoi(argv[++i]);
+            params.gen.ras_window_size = parse_int_arg(argv[++i]);
         } else if (arg == "--ras-temp" && i + 1 < argc) {
-            params.gen.ras_high_temp = std::stof(argv[++i]);
+            params.gen.ras_high_temp = parse_float_arg(argv[++i]);
         } else if (arg == "--ras-top-p" && i + 1 < argc) {
-            params.gen.ras_high_top_p = std::stof(argv[++i]);
+            params.gen.ras_high_top_p = parse_float_arg(argv[++i]);
         } else if (arg == "--max-seg-tokens" && i + 1 < argc) {
-            params.max_tokens_per_segment = std::stoi(argv[++i]);
+            params.max_tokens_per_segment = parse_int_arg(argv[++i]);
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
-            port = std::stoi(argv[++i]);
+            port = parse_int_arg(argv[++i]);
+        } else if (arg == "--host" && i + 1 < argc) {
+            bind_host = argv[++i];
         } else if ((arg == "-threads" || arg == "--threads") && i + 1 < argc) {
-            params.gen.n_threads = std::stoi(argv[++i]);
+            params.gen.n_threads = parse_int_arg(argv[++i]);
         } else if ((arg == "--max-tokens") && i + 1 < argc) {
-            params.gen.max_new_tokens = std::stoi(argv[++i]);
+            params.gen.max_new_tokens = parse_int_arg(argv[++i]);
         } else if ((arg == "--text") && i + 1 < argc) {
             params.text = argv[++i];
         } else if ((arg == "-pa" || arg == "--prompt-audio") && i + 1 < argc) {
@@ -164,7 +184,7 @@ int parse_args(int argc, char** argv,
         } else if (arg == "--no-trim-silence") {
             params.trim_silence = false;
         } else if (arg == "--stream-decode-stride" && i + 1 < argc) {
-            params.stream_decode_stride_frames = std::stoi(argv[++i]);
+            params.stream_decode_stride_frames = parse_int_arg(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             return 2; /* help sentinel (usage text elided for tests) */
         } else {
@@ -202,8 +222,9 @@ static int g_fail = 0;
 struct RunResult {
     int          rc = 0;
     PipelineParams params;
-    int          port = 8080;          // mirror main.cpp default (main.cpp:93)
-    bool         list_voices = false;  // mirror main.cpp default (main.cpp:94)
+    int          port = 8080;
+    std::string  bind_host = "127.0.0.1";
+    bool         list_voices = false;
     std::string  err;                  // captured std::cerr
 };
 
@@ -222,7 +243,7 @@ static RunResult run(const std::vector<std::string>& args) {
     RunResult r;
     std::ostringstream capture;
     std::streambuf* old = std::cerr.rdbuf(capture.rdbuf());
-    r.rc = parse_args((int)argv.size(), argv.data(), r.params, r.port, r.list_voices);
+    r.rc = parse_args((int)argv.size(), argv.data(), r.params, r.port, r.bind_host, r.list_voices);
     std::cerr.rdbuf(old);
     r.err = capture.str();
     return r;
@@ -283,6 +304,7 @@ int main() {
     { RunResult r = run({"--max-seg-tokens","300"});     ok(r.rc==0 && r.params.max_tokens_per_segment==300, "--max-seg-tokens sets max_tokens_per_segment"); }
     { RunResult r = run({"-p","9090"});                  ok(r.rc==0 && r.port==9090, "-p sets port"); }
     { RunResult r = run({"--port","8000"});              ok(r.rc==0 && r.port==8000, "--port sets port"); }
+    { RunResult r = run({"--host","0.0.0.0"});            ok(r.rc==0 && r.bind_host=="0.0.0.0", "--host sets bind_host"); }
     { RunResult r = run({"--threads","8"});              ok(r.rc==0 && r.params.gen.n_threads==8, "--threads sets gen.n_threads"); }
     { RunResult r = run({"-threads","6"});               ok(r.rc==0 && r.params.gen.n_threads==6, "-threads (single-dash alias) sets gen.n_threads"); }
     { RunResult r = run({"--max-tokens","512"});         ok(r.rc==0 && r.params.gen.max_new_tokens==512, "--max-tokens sets gen.max_new_tokens"); }
@@ -353,6 +375,7 @@ int main() {
     expect_rc({"-v"}, 1, "trailing -v with no value -> rc 1 (no crash)");
     expect_rc({"--port"}, 1, "trailing --port with no value -> rc 1 (no crash)");
     expect_rc({"--model"}, 1, "trailing --model with no value -> rc 1 (no crash)");
+    expect_rc({"--host"}, 1, "trailing --host with no value -> rc 1 (no crash)");
 
     // ----------------------------------------------------------------------
     // 7. Unknown options and empty string.
@@ -363,18 +386,20 @@ int main() {
     expect_rc({""}, 1, "empty-string arg -> rc 1");
 
     // ----------------------------------------------------------------------
-    // 8. Negative device index is valid (stoi parses "-1").
+    // 8. Negative device indices are valid (-2=inherit, -1=CPU).
     // ----------------------------------------------------------------------
     std::cout << "[group] negative numeric values are valid\n";
     { RunResult r = run({"-v","-1"});                    ok(r.rc==0 && r.params.vulkan_device==-1, "-v -1 -> vulkan_device=-1 (CPU)"); }
+    { RunResult r = run({"--codec-vulkan","-2"});        ok(r.rc==0 && r.params.codec_vulkan_device==-2, "--codec-vulkan -2 -> -2 (inherit)"); }
     { RunResult r = run({"--codec-vulkan","-1"});        ok(r.rc==0 && r.params.codec_vulkan_device==-1, "--codec-vulkan -1 -> -1 (CPU)"); }
 
     // ----------------------------------------------------------------------
-    // 9. std::stoi trailing-garbage gotcha: "12abc" parses as 12 (documented).
+    // 9. Trailing garbage must be rejected instead of silently truncating.
     // ----------------------------------------------------------------------
-    std::cout << "[group] stoi trailing-garbage gotcha (documented behaviour)\n";
-    { RunResult r = run({"--max-tokens","12abc"});       ok(r.rc==0 && r.params.gen.max_new_tokens==12, "--max-tokens 12abc -> 12 (stoi stops at non-digit)"); }
-    { RunResult r = run({"-v","3x"});                    ok(r.rc==0 && r.params.vulkan_device==3, "-v 3x -> 3 (stoi trailing garbage ignored)"); }
+    std::cout << "[group] trailing garbage rejected\n";
+    expect_rc({"--max-tokens","12abc"}, 1, "--max-tokens 12abc rejected");
+    expect_rc({"-v","3x"}, 1, "-v 3x rejected");
+    expect_rc({"--temperature","0.7oops"}, 1, "--temperature trailing garbage rejected");
 
     // ----------------------------------------------------------------------
     // 10. Duplicate flags: last occurrence wins.
@@ -401,7 +426,8 @@ int main() {
             "--model-codec","s2-pro-q4_k_m-codec-only.gguf",
             "-v","1","--codec-vulkan","1","--segment","--codec-chunk","32",
             "--max-seg-tokens","300","--min-seg-chars","60",
-            "--temperature","0.8","--top-p","0.8","--top-k","40","--port","8080"
+            "--temperature","0.8","--top-p","0.8","--top-k","40","--port","8080",
+            "--host","127.0.0.1"
         });
         ok(r.rc==0
            && r.params.model_path=="s2-pro-q4_k_m-transformer-only.gguf"
@@ -415,7 +441,8 @@ int main() {
            && feq(r.params.gen.temperature,0.8f)
            && feq(r.params.gen.top_p,0.8f)
            && r.params.gen.top_k==40
-           && r.port==8080,
+           && r.port==8080
+           && r.bind_host=="127.0.0.1",
            "full optimal Vulkan command line parses with all fields correct");
     }
     // A full voice-cloning CLI line exercising -pa/-pt/-o together.
@@ -444,9 +471,9 @@ int main() {
     std::cout << "[group] no arguments\n";
     {
         RunResult r = run({});
-        ok(r.rc==0 && r.port==8080 && r.list_voices==false
-           && r.params.vulkan_device==-1 && r.params.segment_sentences==false
-           && r.params.max_tokens_per_segment==300,
+        ok(r.rc==0 && r.port==8080 && r.bind_host=="127.0.0.1" && r.list_voices==false
+           && r.params.vulkan_device==-1 && r.params.codec_vulkan_device==-2
+           && r.params.segment_sentences==false && r.params.max_tokens_per_segment==300,
            "no args -> rc 0 with defaults intact");
     }
 

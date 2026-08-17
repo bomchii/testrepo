@@ -70,6 +70,7 @@ struct ModelWeights {
     ggml_backend_buffer_t model_buf = nullptr;
 
     ggml_tensor * embeddings           = nullptr;
+    ggml_tensor * output               = nullptr; // separate LM head when embeddings are not tied
     ggml_tensor * codebook_embeddings  = nullptr;
     ggml_tensor * norm                 = nullptr;
     ggml_tensor * fast_project_in      = nullptr;
@@ -91,12 +92,21 @@ public:
     SlowARModel();
     ~SlowARModel();
 
+    SlowARModel(const SlowARModel &) = delete;
+    SlowARModel & operator=(const SlowARModel &) = delete;
+    SlowARModel(SlowARModel &&) = delete;
+    SlowARModel & operator=(SlowARModel &&) = delete;
+
     // Load model from GGUF. vulkan_device=-1 means CPU only.
     bool load(const std::string & gguf_path, int32_t vulkan_device = -1);
 
+    // Release all model/backend state. load() calls this automatically, so a
+    // failed GPU attempt or an explicit reload cannot retain stale buffers.
+    void unload();
+
     // Initialize KV cache for generation
     bool init_kv_cache(int32_t max_seq_len);
-    void free_kv_cache();  // <- AJOUTER
+    void free_kv_cache();
 
     // Reset KV cache (for new generation)
     void reset();
@@ -116,6 +126,10 @@ public:
                      std::vector<float> & logits_out);
 
     const ModelHParams & hparams() const { return hparams_; }
+    std::string backend_name() const {
+        const char * name = backend_ ? ggml_backend_name(backend_) : nullptr;
+        return name ? std::string(name) : std::string("unloaded");
+    }
 
 private:
     ModelHParams   hparams_;
@@ -132,6 +146,12 @@ private:
     ggml_tensor *  memory_v_   = nullptr;
     int32_t        max_seq_len_ = 0;
     int32_t        n_past_     = 0;
+
+    // GGML graph-metadata arenas are model-instance state. The model/KV cache is
+    // already non-reentrant, so keeping these per instance avoids retaining an
+    // extra ~18 MiB for every Crow worker thread that ever runs inference.
+    std::vector<uint8_t> graph_ctx_buf_;
+    std::vector<uint8_t> fast_graph_ctx_buf_;
 
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
                      int32_t n_tokens, int32_t n_threads,

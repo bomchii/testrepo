@@ -38,6 +38,7 @@ struct GenerateResult {
     std::vector<int32_t> codes;
     int32_t num_codebooks = 0;
     int32_t n_frames      = 0;
+    bool    success       = false; // false on validation/compute failure
 };
 
 GenerateResult generate(

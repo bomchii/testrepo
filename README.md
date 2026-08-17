@@ -3,7 +3,7 @@
 > **ALPHA — EXPERIMENTAL AND PROOF OF CONCEPT SOFTWARE**
 > This is an early-stage, community-built inference engine. Expect rough edges, missing features, and breaking changes. Not production-ready.
 
-**s2.cpp** — Fish Audio's S2 Pro Dual-AR text-to-speech model running locally via a pure C++/GGML inference engine with CPU, Vulkan backends. No Python runtime required after build.
+**s2.cpp** — Fish Audio's S2 Pro Dual-AR text-to-speech model running locally via a pure C++/GGML inference engine with separate CPU, Vulkan, CUDA, and Metal backends. No Python runtime required after build.
 
 > **Built on Fish Audio S2 Pro**
 > The model weights are licensed under the Fish Audio Research License, Copyright © 39 AI, INC. All Rights Reserved.
@@ -17,7 +17,7 @@ This repository is a fork of https://github.com/rodrigomatta/s2.cpp which is cur
 
 This version of s2.cpp is an API server version, compatible with the Fish Audio API endpoint /v1/tts . On good GPUs, it can achieve real-time performance while taking advantage of quantized models. If needed, VRAM savings can be used to run multiple services simultaneously.
 
-Tested only with Nvidia RTX GPU on Debian Linux platform using Vulkan.
+The original project was tested primarily on NVIDIA RTX hardware with Vulkan. This fork also contains dedicated Windows CPU/CUDA/Vulkan and macOS Metal build workflows; those platform builds should be treated as experimental until their GitHub Actions jobs and target hardware tests pass.
 
 This version of s2.cpp offers less flexibility and fewer features than the original s2.cpp version.
 
@@ -76,6 +76,8 @@ All variants include both the transformer weights and the audio codec in a singl
 - C++17 compiler (GCC ≥ 10, Clang ≥ 11, MSVC 2019+)
 - Crow
 - For Vulkan GPU support: Vulkan SDK and `glslc`
+- For CUDA GPU support: a CUDA Toolkit supported by your compiler/toolchain
+- For Metal GPU support: macOS with Xcode command-line tools
 
 ```bash
 # Ubuntu / Debian
@@ -90,19 +92,34 @@ sudo apt install vulkan-tools libvulkan-dev glslc
 
 ### Runtime
 
-No Python or PyTorch required. The binary links only against the ggml shared libraries built alongside it.
+No Python or PyTorch is required. Runtime dependencies depend on the selected backend and how GGML was linked. The GitHub Actions release jobs build one backend per artifact and package the backend-specific runtime files they require.
+
+Windows release artifacts use the MSVC runtime dynamically, so the **Microsoft Visual C++ 2015–2022 Redistributable (x64)** must be installed unless it is already present. The Vulkan build also needs the Vulkan loader supplied by a working GPU driver; the CUDA build needs a compatible NVIDIA driver (its selected CUDA runtime DLLs are packaged with the artifact).
 
 ---
 
 ## Building
 
-Clone (ggml is NOT a submodule):
+Clone including the GGML submodule:
 
 ```bash
-git clone https://github.com/mach92432/s2.cpp.git
+git clone --recurse-submodules https://github.com/mach92432/s2.cpp.git
 cd s2.cpp
 ```
 
+If the repository was already cloned without submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+### CPU only
+
+```bash
+cmake -B build-cpu -DCMAKE_BUILD_TYPE=Release \
+  -DS2_VULKAN=OFF -DS2_CUDA=OFF -DS2_METAL=OFF
+cmake --build build-cpu --parallel
+```
 
 ### With Vulkan GPU support
 
@@ -112,6 +129,23 @@ cmake --build build --parallel $(nproc)
 ```
 
 The binary is produced at `build/s2`.
+
+### With CUDA GPU support
+
+```bash
+cmake -B build-cuda -DCMAKE_BUILD_TYPE=Release -DS2_CUDA=ON
+cmake --build build-cuda --parallel
+```
+
+### With Metal GPU support (macOS only)
+
+```bash
+cmake -B build-metal -DCMAKE_BUILD_TYPE=Release -DS2_METAL=ON \
+  -DGGML_METAL_EMBED_LIBRARY=ON
+cmake --build build-metal --parallel
+```
+
+Only one GPU backend should be enabled in a build directory. Prefer separate build directories (`build-cpu`, `build-vulkan`, `build-cuda`, `build-metal`) so cached CMake options cannot leak between artifacts.
 
 ---
 
@@ -130,11 +164,12 @@ build/s2 -v 0 --codec-vulkan 0 --model-codec codec.gguf --port 8081
 ```
 
 `--model model.gguf` to specify the path to a GGUF model (default model.gguf)
-`--model-codec codec.gguf` to specify the path to a GGUF model for 'codec' processing only. By default, it's the model specified by '--model' or 'model.gguf'. 
-`-v 0` selects the first Vulkan device. The transformer runs on GPU.
-`--codec-vulkan 0` selects the first Vulkan device for audio codec. It is possible to use the CPU instead whith `--codec-vulkan -1`.
-`--port 8081` : port to listen
-`--help` for other options
+`--model-codec codec.gguf` to specify the path to a GGUF model for 'codec' processing only. By default, it's the model specified by '--model' or 'model.gguf'.
+`-v 0` selects the first device of the GPU backend compiled into that executable (Vulkan/CUDA; Metal exposes device 0).
+`--codec-vulkan 0` selects the first GPU device for the audio codec. The name is kept for compatibility, but it also works in CUDA builds; Metal maps any GPU selection to device 0. Omit it to inherit the transformer device, or pass `--codec-vulkan -1` to force the codec to CPU.
+`--host 127.0.0.1` is the default bind address. Use `--host 0.0.0.0` only when LAN access is intentional.
+`--port 8081` selects the listening port.
+`--help` shows the complete option list.
 
 ### GPU inference via Vulkan with curl
 
@@ -146,15 +181,25 @@ curl -X POST http://localhost:8081/v1/tts \
   -o output.wav
 ```
 
+The server binds to `127.0.0.1` by default. This matters because reference/voice-management endpoints can be given local audio paths. If you opt in to `--host 0.0.0.0`, place the service behind an access-control layer before using it on an untrusted LAN or the public Internet.
 
-
-### All options
+### Common options
 
 | Flag | Default | Description |
-|---|---|---|
-| `-v ` | Vulkan device id for Model (e.g. `-v 0`)|
-| `--codec-vulkan ` | Vulkan device id for Codec (e.g. `--codec-vulkan 0`) |
-| `--port ` | Server port ti listen (e.g. `--port 8081`) |
+|---|---:|---|
+| `-v`, `--vulkan <N>` | `-1` | Transformer backend device. `-1` = CPU; `0+` = compiled GPU backend device. |
+| `--codec-vulkan <N>` | `-2` (inherit) | Codec device. `-2` inherits transformer device, `-1` forces CPU, `0+` selects the compiled GPU backend device (Metal normalizes to 0). |
+| `--host <IP>` | `127.0.0.1` | Server bind address. Use `0.0.0.0` only for intentional LAN exposure. |
+| `--port <N>` | `8080` | HTTP/WebSocket listening port. |
+| `--segment` | off | Split long text before generation. |
+| `--codec-chunk <N>` | `0` (auto) | Codec frames per decode call. |
+| `--codec-overlap <N>` | `0` | Context overlap used for codec chunk/stream boundaries. |
+| `--stream-decode-stride <N>` | `0` (auto = 4) | Streaming decode stride; negative disables stride mode. |
+| `--voice <id>` | — | Reuse a saved `.s2voice` profile. |
+| `--save-voice` | off | Encode/save `--prompt-audio` + `--prompt-text` as `--voice` and exit unless `--output` is also supplied. |
+| `--output <path>` | — | One-shot CLI synthesis to WAV; no server is started. |
+
+Run `s2 --help` for the complete set of sampling, segmentation, RAS, reference-audio and generation-limit options.
 
 ---
 
@@ -165,17 +210,17 @@ For speed, we don't recommend using the CPU for the codec. Using the CPU for the
 
 I suggest choosing transformer and codec quantized version that can fit in the allocated VRAM. Only a few hundred MB will be used extra during inference. It's possible to use two GPUs.
 
-The audio generation speed is approximately 0.8x on an RTX3090 (RTF 1.3). 
+The audio generation speed is approximately 0.8x on an RTX3090 (RTF 1.3).
 
 The speed is roughly the same regardless of the model.
 
-The sound quality remains acceptable for the smallest model . 
+The sound quality remains acceptable for the smallest model .
 
-Voice cloning works correctly. 
+Voice cloning works correctly.
 
 Tags may be less respected with high levels of quantization.
 
-Generating short texts often results in artifacts at the end. Whenever possible, long texts should be split into segments of at least 90 characters. 
+Generating short texts often results in artifacts at the end. Whenever possible, long texts should be split into segments of at least 90 characters.
 
 ---
 
@@ -195,22 +240,22 @@ Total: ~4.56B parameters.
 
 The C++ engine (`src/`) is built entirely on [ggml](https://github.com/ggml-org/ggml) include in this code. Key design decisions:
 
-- **Reference audio** To avoid processing the reference audio during each request, it is processed at server startup and kept in memory.
+- **Reference audio caching** — the optional global `reference.wav`/`reference.txt` pair is prepared at startup; per-request reference files are encoded on demand and cached by path plus file fingerprint.
 - **Separate persistent `gallocr` allocators** for Slow-AR and Fast-AR — each path keeps its own compute buffer, avoiding memory re-planning per token
 - **Temporary prefill allocator** — freed immediately after prefill, so the large compute buffer does not persist into the generation loop
-- **Codec on GPU or CPU** — the audio codec executes on codec-vulkan id. -1 value for CPU
-- **posix_fadvise(DONTNEED)** after mmap — releases the GGUF file from kernel page cache after weights are loaded to VRAM, preventing RAM duplication equal to the model file size
+- **Independent model/codec placement** — transformer and codec may use different devices. The codec defaults to inheriting the transformer device (`-2` internally); `--codec-vulkan -1` explicitly forces CPU.
+- **posix_fadvise(DONTNEED)** after weight loading on supported POSIX systems — advises the kernel that model-file pages are no longer needed once weights have been copied to their backend buffers
 - **Correct ByteLevel tokenization** — the GPT-2 byte-to-unicode table is applied before BPE, producing token IDs identical to the HuggingFace reference tokenizer
 
 ---
 
 ## Known limitations (alpha)
 
-- No streaming output — WAV is return to the client only after full generation completes
+- HTTP WAV/PCM responses are returned after the requested synthesis finishes; low-latency incremental PCM is available separately through WebSocket `/ws/tts`.
+- Inference is serialized through one shared pipeline/model instance, so concurrent HTTP/WebSocket requests queue rather than execute model inference in parallel.
 - No batch inference
 - Voice cloning quality depends heavily on reference audio length and SNR
-- Windows is untested
-- macOS is untested
+- Windows CPU/Vulkan/CUDA and macOS Metal builds have CI jobs, but target-hardware behavior still needs validation on the GPUs/OS versions you intend to support.
 - Only Nvidia GPUs were tested with Vulkan. Other Vulkan-compatible GPUs were not tested.
 
 ---

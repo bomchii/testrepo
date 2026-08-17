@@ -33,7 +33,8 @@ struct PipelineParams {
     GenerateParams gen;
 
     int32_t vulkan_device       = -1;
-    int32_t codec_vulkan_device = -1;
+    // -2 = inherit transformer device (default), -1 = force CPU, >=0 = GPU device.
+    int32_t codec_vulkan_device = -2;
 
     bool    segment_sentences      = false;
     int32_t codec_chunk_frames     = 0;
@@ -56,6 +57,9 @@ struct PipelineParams {
 struct VoiceCache {
     std::vector<int32_t> codes;
     int32_t              T_prompt = 0;
+    uintmax_t             source_size = 0;
+    int64_t               source_mtime_ns = 0;
+    bool                  has_fingerprint = false;
 };
 
 // Callback para synthesize_streaming().
@@ -75,9 +79,14 @@ public:
     Pipeline();
     ~Pipeline();
 
+    Pipeline(const Pipeline &) = delete;
+    Pipeline & operator=(const Pipeline &) = delete;
+    Pipeline(Pipeline &&) = delete;
+    Pipeline & operator=(Pipeline &&) = delete;
+
     bool init(const PipelineParams & params);
 
-    // HTTP clásico: todo el audio en un archivo temporal, Crow lo sirve con sendfile.
+    // HTTP clásico: todo el audio en un archivo temporal; el llamador toma ownership de la ruta.
     bool synthesize_to_file(const PipelineParams & params, std::string & out_wav_path);
 
     // HTTP clásico: todo el audio en un buffer (para clientes simples).
@@ -87,7 +96,8 @@ public:
     bool synthesize(const PipelineParams & params);
 
     // WebSocket / streaming: llama al callback una vez por segmento de oración.
-    bool synthesize_streaming(const PipelineParams & params, StreamCallback callback);
+    bool synthesize_streaming(const PipelineParams & params, StreamCallback callback,
+                              int32_t * segments_out = nullptr);
 
     int32_t sample_rate()    const { return codec_.sample_rate(); }
     int32_t num_codebooks()  const { return model_.hparams().num_codebooks; }
@@ -134,6 +144,7 @@ private:
     bool        reference_loaded_ = false;
     std::string reference_embedding_;
     std::string reference_text_;
+    std::string active_voice_transcript_; // transcript loaded from a persisted .s2voice
 
     static constexpr size_t VOICE_CACHE_MAX = 8;
     std::unordered_map<std::string, VoiceCache> voice_cache_;

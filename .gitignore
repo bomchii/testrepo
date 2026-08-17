@@ -8,3 +8,26 @@ build/
 *.d
 compile_commands.json
 .cache/
+
+# CMake generated files (including accidental in-source builds)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+build-*/
+
+# GGML Vulkan generated shaders/binaries (build out-of-source)
+ggml/src/ggml-vulkan/*.comp.cpp
+ggml/src/ggml-vulkan/ggml-vulkan-shaders.hpp
+ggml/src/ggml-vulkan/vulkan-shaders.spv/
+ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/
+
+# Static-analyzer / accidental in-source build leftovers
+*.plist
+/ggml/Makefile
+/ggml/ggml-config.cmake
+/ggml/ggml-version.cmake
+
+# CI-generated embedded tokenizer sources
+/src/tokenizer_data.cpp
+/src/tokenizer_data.h
