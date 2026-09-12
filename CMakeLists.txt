@@ -1,4 +1,10 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.15)
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+# Apply the static MSVC CRT to this target and all GGML subtargets.  CMP0091
+# must be NEW before project()/language enablement for this variable to work.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded" CACHE STRING "MSVC runtime library" FORCE)
 project(s2cpp LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -45,6 +51,7 @@ elseif(S2_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
 elseif(S2_METAL)
     set(GGML_METAL ON CACHE BOOL "" FORCE)
+    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
 endif()
 
 
@@ -81,6 +88,8 @@ endif()
 
 set(S2_SOURCES
     src/s2_audio.cpp
+    src/s2_json.cpp
+    src/s2_text.cpp
     src/s2_tokenizer.cpp
     src/s2_sampler.cpp
     src/s2_model.cpp
@@ -105,6 +114,12 @@ elseif(EXISTS "${S2_TOKENIZER_HEADER}" OR EXISTS "${S2_TOKENIZER_SOURCE}")
 endif()
 
 add_executable(s2 ${S2_SOURCES})
+
+if(WIN32 AND S2_CUDA)
+    add_executable(s2-cuda-launcher tools/cuda_launcher.cpp)
+    target_compile_features(s2-cuda-launcher PRIVATE cxx_std_17)
+    target_link_libraries(s2-cuda-launcher PRIVATE bcrypt shell32)
+endif()
 
 if(MSVC AND EXISTS "${S2_TOKENIZER_SOURCE}")
     set_source_files_properties(src/tokenizer_data.cpp PROPERTIES COMPILE_OPTIONS "/wd4309;/wd4365;/wd4838")

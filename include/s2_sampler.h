@@ -1,7 +1,5 @@
 #pragma once
-// s2_sampler.h — Top-k / top-p / temperature sampling with RAS
-//
-// Pure C++ port of the numpy sampler from ggml_pure.py.
+// s2_sampler.h — deterministic top-k / top-p / temperature sampling with RAS
 
 #include <cstdint>
 #include <vector>
@@ -14,12 +12,26 @@ struct SamplerParams {
     int32_t top_k       = 30;
 };
 
+// Small fully-specified RNG.  A non-zero seed is reproducible across supported
+// standard libraries because token selection does not depend on
+// std::uniform_*_distribution or std::discrete_distribution mappings.
+class SamplerRng {
+public:
+    explicit SamplerRng(uint64_t seed = 0);
+    uint64_t next_u64() noexcept;
+    double next_unit() noexcept; // [0, 1)
+
+private:
+    uint64_t state_ = 0;
+};
+
 // Sample a single token from logits using top-k + top-p + temperature.
 // always_include_id: if >= 0 and has a finite logit, this token is guaranteed
-// to survive both top-k and top-p truncation (used to ensure EOS is always
-// reachable regardless of GPU numerical precision differences).
+// to survive both top-k and top-p truncation (used to ensure EOS is reachable).
+// rng==nullptr creates an independent random stream for this call; generation
+// code passes one request-local RNG through every sampling decision.
 int32_t sample_token(const float * logits, int32_t vocab_size, const SamplerParams & params,
-                     int32_t always_include_id = -1);
+                     int32_t always_include_id = -1, SamplerRng * rng = nullptr);
 
 // Repetition Aware Sampling (RAS):
 // Tracks a window of recent tokens, resamples with high temp if repeating.
@@ -29,7 +41,6 @@ public:
                float high_temp = 1.0f,
                float high_top_p = 0.9f);
 
-    // Sample with RAS check. sem_begin/sem_end define the semantic token range.
     int32_t sample(const float * logits, int32_t vocab_size,
                    const SamplerParams & params,
                    int32_t sem_begin, int32_t sem_end);
@@ -41,6 +52,7 @@ private:
     float   high_temp_;
     float   high_top_p_;
     std::vector<int32_t> window_;
+    SamplerRng rng_;
 };
 
 } // namespace s2

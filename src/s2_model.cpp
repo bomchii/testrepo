@@ -27,6 +27,14 @@ static std::FILE * open_binary_input_utf8(const std::string & path) {
     return path.empty() ? nullptr : ggml_fopen(path.c_str(), "rb");
 }
 
+#if defined(GGML_USE_CUDA)
+static bool cuda_problem_embedding_type(enum ggml_type type) {
+    return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K ||
+           type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+           type == GGML_TYPE_Q6_K;
+}
+#endif
+
 static bool file_size_u64(std::FILE * f, uint64_t & out) {
     if (!f) return false;
 #ifdef _WIN32
@@ -53,6 +61,72 @@ static ggml_tensor * repeat_checked(ggml_context * ctx, ggml_tensor * a, ggml_te
     }
     return ggml_repeat(ctx, a, b);
 }
+
+static bool same_shape(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!a || !b) return false;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (a->ne[i] != b->ne[i]) return false;
+    }
+    return true;
+}
+
+static ggml_tensor * add_same_shape_checked(ggml_context * ctx, ggml_tensor * a,
+                                             ggml_tensor * b, const char * label) {
+    if (!ctx || !same_shape(a, b)) {
+        throw std::runtime_error(std::string(label) + ": incompatible add shapes");
+    }
+    return ggml_add(ctx, a, b);
+}
+
+static ggml_tensor * cpy_same_shape_checked(ggml_context * ctx, ggml_tensor * src,
+                                             ggml_tensor * dst, const char * label) {
+    if (!ctx || !same_shape(src, dst)) {
+        throw std::runtime_error(std::string(label) + ": incompatible copy shapes");
+    }
+    return ggml_cpy(ctx, src, dst);
+}
+
+static ggml_tensor * swiglu_split_checked(ggml_context * ctx, ggml_tensor * gate,
+                                           ggml_tensor * up, const char * label) {
+    if (!ctx || !same_shape(gate, up)) {
+        throw std::runtime_error(std::string(label) + ": incompatible gate/up shapes");
+    }
+    return ggml_swiglu_split(ctx, gate, up);
+}
+
+static bool active_backend_is_metal(ggml_backend_t backend) {
+#if defined(GGML_USE_METAL)
+    return backend != nullptr && ggml_backend_is_metal(backend);
+#else
+    (void) backend;
+    return false;
+#endif
+}
+
+struct GgmlContextGuard {
+    ggml_context * ptr = nullptr;
+    explicit GgmlContextGuard(ggml_context * p) : ptr(p) {}
+    ~GgmlContextGuard() { if (ptr) ggml_free(ptr); }
+    GgmlContextGuard(const GgmlContextGuard &) = delete;
+    GgmlContextGuard & operator=(const GgmlContextGuard &) = delete;
+};
+
+class GallocrSwapGuard {
+public:
+    GallocrSwapGuard(ggml_gallocr_t & slot, ggml_gallocr_t replacement)
+        : slot_(slot), displaced_(replacement) {
+        std::swap(slot_, displaced_);
+    }
+    ~GallocrSwapGuard() {
+        std::swap(slot_, displaced_);
+        if (displaced_) ggml_gallocr_free(displaced_);
+    }
+    GallocrSwapGuard(const GallocrSwapGuard &) = delete;
+    GallocrSwapGuard & operator=(const GallocrSwapGuard &) = delete;
+private:
+    ggml_gallocr_t & slot_;
+    ggml_gallocr_t displaced_ = nullptr;
+};
 
 static ggml_tensor * mul_mat_checked(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b,
                                      const char * label = "mul_mat") {
@@ -118,7 +192,6 @@ SlowARModel::~SlowARModel() {
 
 void SlowARModel::unload() {
     free_kv_cache();
-    if (emb_buf_cpu_)       ggml_backend_buffer_free(emb_buf_cpu_);
     if (weights_.model_buf) ggml_backend_buffer_free(weights_.model_buf);
     if (weights_.ctx_w)     ggml_free(weights_.ctx_w);
     if (fast_allocr_)       ggml_gallocr_free(fast_allocr_);
@@ -130,8 +203,13 @@ void SlowARModel::unload() {
     weights_       = ModelWeights{};
     backend_       = nullptr;
     backend_cpu_   = nullptr;
-    emb_buf_cpu_   = nullptr;
     cuda_mode_     = false;
+    cuda_host_embeddings_ = false;
+    cuda_host_codebook_embeddings_ = false;
+    cuda_fast_host_embeddings_ = false;
+    host_embeddings_.clear();
+    host_codebook_embeddings_.clear();
+    host_fast_embeddings_.clear();
     allocr_        = nullptr;
     fast_allocr_   = nullptr;
     ctx_kv_        = nullptr;
@@ -181,14 +259,17 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
         std::cerr << "[Model] No GPU backend compiled, falling back to CPU." << std::endl;
     }
 #endif
-    // Always keep a CPU backend for embedding tables (CUDA get_rows workaround)
-    backend_cpu_ = ggml_backend_cpu_init();
-    if (!backend_cpu_) {
-        std::cerr << "[Model] Failed to init CPU backend." << std::endl;
-        unload();
-        return false;
-    }
+    // The CUDA embedding workaround below performs host row dequantization
+    // directly from retained GGUF bytes, so a second GGML CPU backend is not
+    // needed when a GPU backend initialized successfully. Create CPU only as
+    // the actual model fallback/backend.
     if (!backend_) {
+        backend_cpu_ = ggml_backend_cpu_init();
+        if (!backend_cpu_) {
+            std::cerr << "[Model] Failed to init CPU backend." << std::endl;
+            unload();
+            return false;
+        }
         backend_ = backend_cpu_;
     }
     if (!backend_) {
@@ -233,6 +314,16 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
         std::cout << "[GGUF] " << key << " = " << v << "\n";
         return v;
     };
+    auto get_i32_from_u32 = [&](const char * key, uint32_t def) -> int32_t {
+        const uint32_t v = get_u32(key, def);
+        if (v > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+            std::cerr << "[GGUF] out-of-range UINT32 for signed model field "
+                      << key << ": " << v << "\n";
+            metadata_types_ok = false;
+            return 0;
+        }
+        return static_cast<int32_t>(v);
+    };
     auto get_f32 = [&](const char * key, float def) -> float {
         int64_t id = gguf_find_key(ctx_gguf, key);
         if (id < 0) { std::cerr << "[GGUF] missing key: " << key << " (using default " << def << ")\n"; return def; }
@@ -272,34 +363,34 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
     }
 
     // Main model hparams (from arch-prefixed keys)
-    hparams_.context_length      = (int32_t)get_u32((arch_prefix + "context_length").c_str(), 32768);
-    hparams_.vocab_size          = (int32_t)get_u32((arch_prefix + "vocab_size").c_str(), 155776);
-    hparams_.embedding_length    = (int32_t)get_u32((arch_prefix + "embedding_length").c_str(), 2560);
-    hparams_.feed_forward_length = (int32_t)get_u32((arch_prefix + "feed_forward_length").c_str(), 9728);
-    hparams_.block_count         = (int32_t)get_u32((arch_prefix + "block_count").c_str(), 36);
-    hparams_.head_count          = (int32_t)get_u32((arch_prefix + "attention.head_count").c_str(), 32);
-    hparams_.head_count_kv       = (int32_t)get_u32((arch_prefix + "attention.head_count_kv").c_str(), 8);
+    hparams_.context_length      = get_i32_from_u32((arch_prefix + "context_length").c_str(), 32768);
+    hparams_.vocab_size          = get_i32_from_u32((arch_prefix + "vocab_size").c_str(), 155776);
+    hparams_.embedding_length    = get_i32_from_u32((arch_prefix + "embedding_length").c_str(), 2560);
+    hparams_.feed_forward_length = get_i32_from_u32((arch_prefix + "feed_forward_length").c_str(), 9728);
+    hparams_.block_count         = get_i32_from_u32((arch_prefix + "block_count").c_str(), 36);
+    hparams_.head_count          = get_i32_from_u32((arch_prefix + "attention.head_count").c_str(), 32);
+    hparams_.head_count_kv       = get_i32_from_u32((arch_prefix + "attention.head_count_kv").c_str(), 8);
     hparams_.rope_freq_base      = get_f32((arch_prefix + "rope.freq_base").c_str(), 1e6f);
     hparams_.rms_norm_eps        = get_f32((arch_prefix + "attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
 
     // Fish-speech specific keys
-    hparams_.codebook_size            = (int32_t)get_u32("fish_speech.codebook_size", 4096);
-    hparams_.num_codebooks            = (int32_t)get_u32("fish_speech.num_codebooks", 10);
-    hparams_.semantic_begin_id        = (int32_t)get_u32("fish_speech.semantic_begin_id", 151678);
-    hparams_.semantic_end_id          = (int32_t)get_u32("fish_speech.semantic_end_id", 155773);
+    hparams_.codebook_size            = get_i32_from_u32("fish_speech.codebook_size", 4096);
+    hparams_.num_codebooks            = get_i32_from_u32("fish_speech.num_codebooks", 10);
+    hparams_.semantic_begin_id        = get_i32_from_u32("fish_speech.semantic_begin_id", 151678);
+    hparams_.semantic_end_id          = get_i32_from_u32("fish_speech.semantic_end_id", 155773);
     hparams_.tie_word_embeddings      = get_bool("fish_speech.tie_word_embeddings", true);
     hparams_.attention_qk_norm        = get_bool("fish_speech.attention_qk_norm", false);
     hparams_.scale_codebook_embeddings = get_bool("fish_speech.scale_codebook_embeddings", false);
 
     // Fast decoder hparams
     if (hparams_.has_fast_decoder) {
-        hparams_.fast_context_length   = (int32_t)get_u32("fish_speech.fast_context_length", 11);
-        hparams_.fast_embedding_length = (int32_t)get_u32("fish_speech.fast_embedding_length", 2560);
-        hparams_.fast_feed_forward_length = (int32_t)get_u32("fish_speech.fast_feed_forward_length", 9728);
-        hparams_.fast_block_count      = (int32_t)get_u32("fish_speech.fast_block_count", 4);
-        hparams_.fast_head_count       = (int32_t)get_u32("fish_speech.fast_head_count", 32);
-        hparams_.fast_head_count_kv    = (int32_t)get_u32("fish_speech.fast_head_count_kv", 8);
-        hparams_.fast_head_dim         = (int32_t)get_u32("fish_speech.fast_head_dim", 128);
+        hparams_.fast_context_length   = get_i32_from_u32("fish_speech.fast_context_length", 11);
+        hparams_.fast_embedding_length = get_i32_from_u32("fish_speech.fast_embedding_length", 2560);
+        hparams_.fast_feed_forward_length = get_i32_from_u32("fish_speech.fast_feed_forward_length", 9728);
+        hparams_.fast_block_count      = get_i32_from_u32("fish_speech.fast_block_count", 4);
+        hparams_.fast_head_count       = get_i32_from_u32("fish_speech.fast_head_count", 32);
+        hparams_.fast_head_count_kv    = get_i32_from_u32("fish_speech.fast_head_count_kv", 8);
+        hparams_.fast_head_dim         = get_i32_from_u32("fish_speech.fast_head_dim", 128);
         hparams_.fast_rope_freq_base   = get_f32("fish_speech.fast_rope_freq_base", 1e6f);
         hparams_.fast_rms_norm_eps     = get_f32("fish_speech.fast_layer_norm_rms_eps", 1e-6f);
         hparams_.fast_attention_qk_norm = get_bool("fish_speech.fast_attention_qk_norm", false);
@@ -535,45 +626,23 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
     }
 
 #if defined(GGML_USE_CUDA)
-    // CUDA get_rows cannot consume the large K-quant embedding tables. Retag
-    // those tensors BEFORE backend allocation, then dequantize while reading
-    // their original GGUF bytes below.
-    if (cuda_mode_) {
-        for (ggml_tensor * t : {weights_.embeddings, weights_.codebook_embeddings, weights_.fast_embeddings}) {
-            if (t && (t->type == GGML_TYPE_Q4_K || t->type == GGML_TYPE_Q5_K || t->type == GGML_TYPE_Q6_K)) {
-                // A GGML tensor's strides are type-dependent. Merely changing
-                // t->type leaves quantized nb[] values behind and under-allocates
-                // the F16 destination buffer. Recompute the contiguous layout the
-                // same way gguf_set_tensor_type()/ggml_new_tensor_impl do.
-                t->type = GGML_TYPE_F16;
-                const size_t type_size = ggml_type_size(GGML_TYPE_F16);
-                const int64_t blck_size = ggml_blck_size(GGML_TYPE_F16);
-                if (t->ne[0] % blck_size != 0) {
-                    std::cerr << "[Model] Invalid embedding width for F16 conversion.\n";
-                    gguf_free(ctx_gguf);
-                    unload();
-                    return false;
-                }
-                t->nb[0] = type_size;
-                t->nb[1] = t->nb[0] * static_cast<size_t>(t->ne[0] / blck_size);
-                for (int d = 2; d < GGML_MAX_DIMS; ++d) {
-                    t->nb[d] = t->nb[d - 1] * static_cast<size_t>(t->ne[d - 1]);
-                }
-            }
-        }
-    }
+    // K-quant get_rows has historically been problematic on CUDA, including
+    // Q2_K/Q3_K and voice-prefill paths.  Keep the tensors in their original
+    // quantized layout and retain a host-side copy only for the embedding tables
+    // that need the workaround.  During inference we dequantize just the rows
+    // referenced by the current batch and upload the resulting F32 activations.
+    // This avoids both CUDA get_rows and V5's full-table F32 + F16 RAM spike.
+    cuda_host_embeddings_ = cuda_mode_ &&
+        cuda_problem_embedding_type(weights_.embeddings->type);
+    cuda_host_codebook_embeddings_ = cuda_mode_ &&
+        cuda_problem_embedding_type(weights_.codebook_embeddings->type);
+    cuda_fast_host_embeddings_ = cuda_mode_ && weights_.fast_embeddings &&
+        cuda_problem_embedding_type(weights_.fast_embeddings->type);
 #endif
 
-    // Allocate backend buffer for all weight tensors
-    weights_.model_buf = ggml_backend_alloc_ctx_tensors(weights_.ctx_w, backend_);
-    if (!weights_.model_buf) {
-        std::cerr << "[Model] Failed to allocate backend buffer for weights." << std::endl;
-        gguf_free(ctx_gguf);
-        unload();
-        return false;
-    }
-
-    // Load tensor data from GGUF file
+    // Validate the physical file before allocating the potentially very large
+    // backend weight buffer. A truncated/hostile GGUF must fail cheaply rather
+    // than first consuming RAM/VRAM and only then discovering missing bytes.
     const size_t data_offset = gguf_get_data_offset(ctx_gguf);
     const int64_t n_tensors  = gguf_get_n_tensors(ctx_gguf);
     std::FILE * f = open_binary_input_utf8(gguf_path);
@@ -586,6 +655,35 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
     uint64_t physical_file_size = 0;
     if (!file_size_u64(f, physical_file_size)) {
         std::cerr << "[Model] Cannot determine GGUF file size." << std::endl;
+        std::fclose(f); gguf_free(ctx_gguf); unload(); return false;
+    }
+
+    try {
+        for (int64_t ti = 0; ti < n_tensors; ++ti) {
+            const char * tname = gguf_get_tensor_name(ctx_gguf, ti);
+            ggml_tensor * t = ggml_get_tensor(weights_.ctx_w, tname);
+            if (!t) continue;
+            const size_t tensor_offset = gguf_get_tensor_offset(ctx_gguf, ti);
+            if (tensor_offset > std::numeric_limits<size_t>::max() - data_offset)
+                throw std::runtime_error(std::string("invalid tensor offset: ") + tname);
+            const size_t toff = data_offset + tensor_offset;
+            const size_t file_bytes = gguf_get_tensor_size(ctx_gguf, ti);
+            const uint64_t toff64 = static_cast<uint64_t>(toff);
+            if (toff64 > physical_file_size ||
+                static_cast<uint64_t>(file_bytes) > physical_file_size - toff64)
+                throw std::runtime_error(std::string("tensor extends past end of GGUF file: ") + tname);
+            const enum ggml_type file_type = gguf_get_tensor_type(ctx_gguf, ti);
+            if (file_type != t->type || file_bytes != ggml_nbytes(t))
+                throw std::runtime_error(std::string("GGUF/backend tensor byte-size mismatch: ") + tname);
+        }
+    } catch (const std::exception & e) {
+        std::cerr << "[Model] GGUF physical validation failed: " << e.what() << std::endl;
+        std::fclose(f); gguf_free(ctx_gguf); unload(); return false;
+    }
+
+    weights_.model_buf = ggml_backend_alloc_ctx_tensors(weights_.ctx_w, backend_);
+    if (!weights_.model_buf) {
+        std::cerr << "[Model] Failed to allocate backend buffer for weights." << std::endl;
         std::fclose(f); gguf_free(ctx_gguf); unload(); return false;
     }
 
@@ -605,17 +703,36 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
                 static_cast<uint64_t>(file_size) > physical_file_size - toff64)
                 throw std::runtime_error(std::string("tensor extends past end of GGUF file: ") + tname);
 
-#if defined(GGML_USE_CUDA)
             const enum ggml_type file_type = gguf_get_tensor_type(ctx_gguf, ti);
-            const bool convert_embedding = cuda_mode_ && t->type == GGML_TYPE_F16 && file_type != GGML_TYPE_F16 &&
-                (t == weights_.embeddings || t == weights_.codebook_embeddings || t == weights_.fast_embeddings);
-#else
-            const bool convert_embedding = false;
-#endif
-            if (!convert_embedding && file_size != ggml_nbytes(t))
+            if (file_type != t->type || file_size != ggml_nbytes(t))
                 throw std::runtime_error(std::string("GGUF/backend tensor byte-size mismatch: ") + tname);
 
-            if (tmp.size() < file_size) tmp.resize(file_size);
+#if defined(GGML_USE_CUDA)
+            HostEmbeddingTable * host_table = nullptr;
+            if (cuda_host_embeddings_ && t == weights_.embeddings) {
+                host_table = &host_embeddings_;
+            } else if (cuda_host_codebook_embeddings_ && t == weights_.codebook_embeddings) {
+                host_table = &host_codebook_embeddings_;
+            } else if (cuda_fast_host_embeddings_ && t == weights_.fast_embeddings) {
+                host_table = &host_fast_embeddings_;
+            }
+#endif
+
+            // Read CUDA host-lookup tables directly into their retained compressed
+            // storage. Moving the reusable scratch vector would also transfer its
+            // potentially much larger capacity from a previously-read tensor.
+            uint8_t * tensor_bytes = nullptr;
+#if defined(GGML_USE_CUDA)
+            if (host_table) {
+                host_table->data.resize(file_size);
+                tensor_bytes = host_table->data.data();
+            } else
+#endif
+            {
+                if (tmp.size() < file_size) tmp.resize(file_size);
+                tensor_bytes = tmp.data();
+            }
+
 #ifdef _WIN32
             const int seek_rc = (toff > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
                                 ? -1 : _fseeki64(f, static_cast<int64_t>(toff), SEEK_SET);
@@ -623,33 +740,29 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
             const int seek_rc = (toff > static_cast<size_t>(std::numeric_limits<off_t>::max()))
                                 ? -1 : fseeko(f, static_cast<off_t>(toff), SEEK_SET);
 #endif
-            if (seek_rc != 0 || (file_size > 0 && std::fread(tmp.data(), 1, file_size, f) != file_size))
+            if (seek_rc != 0 || (file_size > 0 && std::fread(tensor_bytes, 1, file_size, f) != file_size))
                 throw std::runtime_error(std::string("failed to read tensor: ") + tname);
 
+            ggml_backend_tensor_set(t, tensor_bytes, 0, file_size);
+
 #if defined(GGML_USE_CUDA)
-            if (convert_embedding) {
-                const int64_t n_elems_i64 = ggml_nelements(t);
-                if (n_elems_i64 <= 0 || static_cast<uint64_t>(n_elems_i64) >
-                    static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
-                    throw std::runtime_error(std::string("invalid embedding element count: ") + tname);
-                const size_t n_elems = static_cast<size_t>(n_elems_i64);
-                if (n_elems > std::numeric_limits<size_t>::max() / sizeof(ggml_fp16_t) ||
-                    n_elems * sizeof(ggml_fp16_t) != ggml_nbytes(t))
-                    throw std::runtime_error(std::string("invalid F16 embedding destination size: ") + tname);
-                const ggml_type_traits * tt = ggml_get_type_traits(file_type);
-                if (!tt || !tt->to_float)
-                    throw std::runtime_error(std::string("GGUF type cannot be dequantized: ") + tname);
-                std::vector<float> f32(n_elems);
-                tt->to_float(tmp.data(), f32.data(), n_elems_i64);
-                std::vector<ggml_fp16_t> f16(n_elems);
-                ggml_fp32_to_fp16_row(f32.data(), f16.data(), n_elems_i64);
-                ggml_backend_tensor_set(t, f16.data(), 0, f16.size() * sizeof(ggml_fp16_t));
-                std::cout << "[Model] CUDA dequantized embedding: " << tname << " -> F16\n";
-            } else
-#endif
-            {
-                ggml_backend_tensor_set(t, tmp.data(), 0, file_size);
+            if (host_table) {
+                const int64_t rows = ggml_nrows(t);
+                if (t->ne[0] <= 0 || rows <= 0)
+                    throw std::runtime_error(std::string("invalid host embedding shape: ") + tname);
+                const size_t row_bytes = ggml_row_size(file_type, t->ne[0]);
+                if (row_bytes == 0 || static_cast<uint64_t>(rows) >
+                    static_cast<uint64_t>(std::numeric_limits<size_t>::max() / row_bytes) ||
+                    row_bytes * static_cast<size_t>(rows) != file_size)
+                    throw std::runtime_error(std::string("invalid host embedding row layout: ") + tname);
+                host_table->type = file_type;
+                host_table->width = t->ne[0];
+                host_table->rows = rows;
+                host_table->row_bytes = row_bytes;
+                std::cout << "[Model] CUDA host embedding lookup: " << tname
+                          << " (" << ggml_type_name(file_type) << ")\n";
             }
+#endif
         }
     } catch (const std::exception & e) {
         std::cerr << "[Model] Weight loading failed: " << e.what() << std::endl;
@@ -681,6 +794,39 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
     return true;
 }
 
+bool SlowARModel::decode_host_embedding_row(const HostEmbeddingTable & table,
+                                            int64_t row, float * out) const {
+    if (!table.valid() || !out || row < 0 || row >= table.rows || table.width <= 0) {
+        return false;
+    }
+    if (static_cast<uint64_t>(row) >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max() / table.row_bytes)) {
+        return false;
+    }
+    const size_t offset = static_cast<size_t>(row) * table.row_bytes;
+    if (offset > table.data.size() || table.row_bytes > table.data.size() - offset) {
+        return false;
+    }
+    const void * src = table.data.data() + offset;
+
+    if (table.type == GGML_TYPE_F32) {
+        if (static_cast<uint64_t>(table.width) >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float)) ||
+            static_cast<size_t>(table.width) * sizeof(float) != table.row_bytes) {
+            return false;
+        }
+        std::memcpy(out, src, table.row_bytes);
+        return true;
+    }
+
+    const ggml_type_traits * tt = ggml_get_type_traits(table.type);
+    if (!tt || !tt->to_float) {
+        return false;
+    }
+    tt->to_float(src, out, table.width);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // init_kv_cache()
 // ---------------------------------------------------------------------------
@@ -691,19 +837,29 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
                   << " (model context=" << hparams_.context_length << ")" << std::endl;
         return false;
     }
-    // Reinitialization must release the old GGML context/buffer first.
+    // Reinitialization must release the old GGML context/buffer first.  Keep
+    // the externally observable cache state empty until every validation and
+    // allocation succeeds; hostile/custom metadata must not leave a non-zero
+    // max_seq_len_ paired with null K/V storage after a failed re-init.
     free_kv_cache();
-    max_seq_len_ = max_seq_len;
-    n_past_      = 0;
 
     const int32_t dim = hparams_.embedding_length;
-    if (dim == 0) return true;
+    if (dim <= 0) return false;
 
     // head_dim: if attention_qk_norm, get from q_norm weight shape; else dim/head_count
     int32_t head_dim = 0;
     if (hparams_.attention_qk_norm && !weights_.layers.empty() && weights_.layers[0].q_norm) {
+        if (weights_.layers[0].q_norm->ne[0] <= 0 ||
+            weights_.layers[0].q_norm->ne[0] > std::numeric_limits<int32_t>::max()) {
+            std::cerr << "[Model] Invalid QK norm head dimension." << std::endl;
+            return false;
+        }
         head_dim = static_cast<int32_t>(weights_.layers[0].q_norm->ne[0]);
     } else {
+        if (hparams_.head_count <= 0 || hparams_.embedding_length % hparams_.head_count != 0) {
+            std::cerr << "[Model] Embedding dimension is not divisible by head count." << std::endl;
+            return false;
+        }
         head_dim = hparams_.embedding_length / hparams_.head_count;
     }
 
@@ -711,6 +867,28 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
     const int32_t n_layer   = hparams_.block_count;
     if (head_dim <= 0 || n_head_kv <= 0 || n_layer <= 0) {
         std::cerr << "[Model] Invalid KV cache dimensions." << std::endl;
+        return false;
+    }
+
+    // ggml_new_tensor_4d() assumes the element-count arithmetic is representable.
+    // Validate hostile/custom metadata before entering GGML so this is a clean
+    // load failure rather than an assertion/overflow inside the allocator.
+    uint64_t kv_elems = static_cast<uint64_t>(head_dim);
+    const uint64_t kv_dims[] = {
+        static_cast<uint64_t>(n_head_kv),
+        static_cast<uint64_t>(max_seq_len),
+        static_cast<uint64_t>(n_layer),
+    };
+    for (uint64_t d : kv_dims) {
+        if (d == 0 || kv_elems > std::numeric_limits<uint64_t>::max() / d) {
+            std::cerr << "[Model] KV cache shape overflow." << std::endl;
+            return false;
+        }
+        kv_elems *= d;
+    }
+    if (kv_elems > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        kv_elems > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(uint16_t))) {
+        std::cerr << "[Model] KV cache is too large for this process." << std::endl;
         return false;
     }
 
@@ -739,6 +917,9 @@ bool SlowARModel::init_kv_cache(int32_t max_seq_len) {
     ggml_backend_tensor_memset(memory_k_, 0, 0, ggml_nbytes(memory_k_));
     ggml_backend_tensor_memset(memory_v_, 0, 0, ggml_nbytes(memory_v_));
 
+    // Publish capacity only after the cache is fully usable.
+    max_seq_len_ = max_seq_len;
+    n_past_ = 0;
     return true;
 }
 
@@ -757,14 +938,51 @@ void SlowARModel::reset() {
 
 bool SlowARModel::prefill(const std::vector<int32_t> & flat_tokens, int32_t n_tokens,
                           int32_t n_threads, StepResult & result) {
+    if (n_tokens <= 0) return false;
+
+    const int32_t codebook_dim = hparams_.num_codebooks + 1;
+    if (codebook_dim <= 0 ||
+        static_cast<uint64_t>(n_tokens) * static_cast<uint64_t>(codebook_dim) != flat_tokens.size()) {
+        return false;
+    }
+
+    // CUDA voice prefill is more stable when semantic/codebook prompt tokens are
+    // evaluated individually. Keep ordinary text prefill batched, but once the
+    // prompt contains multiple semantic frames, process one timestep at a time.
+    int32_t chunk_tokens = n_tokens;
+    if (cuda_mode_) {
+        int32_t semantic_prompt_tokens = 0;
+        for (int32_t t = 0; t < n_tokens; ++t) {
+            const int32_t semantic = flat_tokens[static_cast<size_t>(t) * codebook_dim];
+            if (semantic >= hparams_.semantic_begin_id && semantic <= hparams_.semantic_end_id) {
+                if (++semantic_prompt_tokens > 1) {
+                    chunk_tokens = 1;
+                    break;
+                }
+            }
+        }
+    }
+
     // Use a temporary gallocr for prefill so the large compute buffer
     // (sized for n_tokens) is freed immediately after, not kept for steps.
     ggml_gallocr_t prefill_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend_));
     if (!prefill_allocr) return false;
-    std::swap(allocr_, prefill_allocr);
-    bool ok = eval_cached(flat_tokens, n_tokens, n_threads, result);
-    std::swap(allocr_, prefill_allocr);
-    ggml_gallocr_free(prefill_allocr);
+    GallocrSwapGuard allocator_guard(allocr_, prefill_allocr);
+
+    bool ok = true;
+    if (chunk_tokens >= n_tokens) {
+        ok = eval_cached(flat_tokens, n_tokens, n_threads, result);
+    } else {
+        std::cout << "[Model] CUDA semantic prefill: " << n_tokens << " tokens one-by-one\n";
+        StepResult chunk_result;
+        std::vector<int32_t> chunk(static_cast<size_t>(codebook_dim));
+        for (int32_t start = 0; start < n_tokens && ok; ++start) {
+            const auto begin = flat_tokens.begin() + static_cast<ptrdiff_t>(start) * codebook_dim;
+            std::copy(begin, begin + codebook_dim, chunk.begin());
+            ok = eval_cached(chunk, 1, n_threads, chunk_result);
+        }
+        if (ok) result = std::move(chunk_result);
+    }
     return ok;
 }
 
@@ -820,17 +1038,41 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     const int32_t dim       = hparams_.embedding_length;
     const int32_t n_head    = hparams_.head_count;
     const int32_t n_head_kv = hparams_.head_count_kv;
+    if (dim <= 0 || n_head <= 0 || n_head_kv <= 0 || n_head % n_head_kv != 0 ||
+        weights_.layers.empty() || !weights_.layers[0].wo) {
+        std::fprintf(stderr, "[eval_cached] invalid attention dimensions/weights\n");
+        return false;
+    }
 
     // head_dim: from q_norm when qk_norm, else wo/head_count
     int32_t head_dim = 0;
     if (hparams_.attention_qk_norm && !weights_.layers.empty() && weights_.layers[0].q_norm) {
+        if (weights_.layers[0].q_norm->ne[0] <= 0 ||
+            weights_.layers[0].q_norm->ne[0] > std::numeric_limits<int32_t>::max()) {
+            return false;
+        }
         head_dim = static_cast<int32_t>(weights_.layers[0].q_norm->ne[0]);
     } else {
+        if (weights_.layers[0].wo->ne[0] <= 0 ||
+            weights_.layers[0].wo->ne[0] > std::numeric_limits<int32_t>::max() ||
+            weights_.layers[0].wo->ne[0] % n_head != 0) {
+            return false;
+        }
         head_dim = static_cast<int32_t>(weights_.layers[0].wo->ne[0] / n_head);
     }
 
-    const int32_t q_size   = n_head * head_dim;
-    const int32_t kv_size  = n_head_kv * head_dim;
+    const int64_t q_size64  = static_cast<int64_t>(n_head) * head_dim;
+    const int64_t kv_size64 = static_cast<int64_t>(n_head_kv) * head_dim;
+    if (head_dim <= 0 || q_size64 <= 0 || kv_size64 <= 0 ||
+        q_size64 > std::numeric_limits<int32_t>::max() ||
+        kv_size64 > std::numeric_limits<int32_t>::max() ||
+        q_size64 > std::numeric_limits<int64_t>::max() - 2 * kv_size64) {
+        std::fprintf(stderr, "[eval_cached] attention shape overflow\n");
+        return false;
+    }
+    const int32_t q_size   = static_cast<int32_t>(q_size64);
+    const int32_t kv_size  = static_cast<int32_t>(kv_size64);
+    const int64_t qkv_size = q_size64 + 2 * kv_size64;
     const float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const float sem_scale  = 1.0f / std::sqrt(static_cast<float>(codebook_dim));
 
@@ -840,11 +1082,30 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     std::vector<float>   semantic_mask_vals(n_tokens, 0.0f);
     std::vector<float>   token_scale_vals;
     std::vector<std::vector<int32_t>> cb_vals(hparams_.num_codebooks, std::vector<int32_t>(n_tokens, 0));
+    std::vector<float> host_embedding_vals;
+    std::vector<float> host_codebook_sum_vals;
+
+    const bool use_host_semantic = cuda_host_embeddings_;
+    const bool use_host_codebooks = cuda_host_codebook_embeddings_;
+    if (use_host_semantic &&
+        (!host_embeddings_.valid() || host_embeddings_.width != dim ||
+         host_embeddings_.rows < hparams_.vocab_size)) {
+        std::fprintf(stderr, "[eval_cached] CUDA host semantic embedding table is incomplete/incompatible\n");
+        return false;
+    }
+    if (use_host_codebooks &&
+        (!host_codebook_embeddings_.valid() || host_codebook_embeddings_.width != dim ||
+         host_codebook_embeddings_.rows <
+             static_cast<int64_t>(hparams_.num_codebooks) * hparams_.codebook_size)) {
+        std::fprintf(stderr, "[eval_cached] CUDA host codebook embedding table is incomplete/incompatible\n");
+        return false;
+    }
 
     if (hparams_.scale_codebook_embeddings) {
         token_scale_vals.resize(n_tokens);
     }
 
+    bool has_semantic = false;
     for (int32_t t = 0; t < n_tokens; ++t) {
         const int32_t semantic = flat_tokens[t * codebook_dim];
         const bool is_semantic = (semantic >= hparams_.semantic_begin_id &&
@@ -853,6 +1114,7 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         semantic_vals[t]      = semantic;
         pos_vals[t]           = n_past_ + t;
         semantic_mask_vals[t] = is_semantic ? 1.0f : 0.0f;
+        has_semantic = has_semantic || is_semantic;
 
         if (!token_scale_vals.empty()) {
             token_scale_vals[t] = is_semantic ? sem_scale : 1.0f;
@@ -865,6 +1127,47 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         }
     }
 
+    if (use_host_semantic || (use_host_codebooks && has_semantic)) {
+        const uint64_t host_elems = static_cast<uint64_t>(dim) * static_cast<uint64_t>(n_tokens);
+        if (host_elems > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) {
+            return false;
+        }
+        if (use_host_semantic) {
+            host_embedding_vals.resize(static_cast<size_t>(host_elems));
+            for (int32_t t = 0; t < n_tokens; ++t) {
+                float * dst = host_embedding_vals.data() + static_cast<size_t>(t) * dim;
+                if (!decode_host_embedding_row(host_embeddings_, semantic_vals[t], dst)) {
+                    std::fprintf(stderr, "[eval_cached] failed to decode semantic embedding row %d\n", semantic_vals[t]);
+                    return false;
+                }
+            }
+        }
+        if (use_host_codebooks && has_semantic) {
+            // If semantic embeddings are also host-side, accumulate codebooks
+            // directly into that same activation buffer. Otherwise build one
+            // separate F32 codebook-sum input; no full table is dequantized.
+            if (!use_host_semantic) {
+                host_codebook_sum_vals.assign(static_cast<size_t>(host_elems), 0.0f);
+            }
+            std::vector<float> row_tmp(static_cast<size_t>(dim));
+            for (int32_t t = 0; t < n_tokens; ++t) {
+                if (semantic_mask_vals[t] == 0.0f) continue;
+                float * dst = use_host_semantic
+                    ? host_embedding_vals.data() + static_cast<size_t>(t) * dim
+                    : host_codebook_sum_vals.data() + static_cast<size_t>(t) * dim;
+                for (int32_t cb = 0; cb < hparams_.num_codebooks; ++cb) {
+                    const int64_t row = static_cast<int64_t>(cb_vals[cb][t]);
+                    if (!decode_host_embedding_row(host_codebook_embeddings_, row, row_tmp.data())) {
+                        std::fprintf(stderr, "[eval_cached] failed to decode codebook embedding row %lld\n",
+                                     static_cast<long long>(row));
+                        return false;
+                    }
+                    for (int32_t i = 0; i < dim; ++i) dst[i] += row_tmp[static_cast<size_t>(i)];
+                }
+            }
+        }
+    }
+
     // Build computation graph. Reuse one arena per model instance. The KV-backed
     // model is not re-entrant, and the server serializes inference, so a
     // thread_local arena only multiplies retained host memory across workers.
@@ -873,37 +1176,77 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     ggml_init_params p = { ctx_size, graph_ctx_buf_.data(), true };
     ggml_context * ctx0 = ggml_init(p);
     if (!ctx0) return false;
+    GgmlContextGuard ctx_guard(ctx0);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 32768, false);
 
-    ggml_tensor * semantic_ids   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * semantic_ids   = nullptr;
     ggml_tensor * positions      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_tensor * semantic_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+    ggml_tensor * semantic_mask  = nullptr;
     ggml_tensor * token_scale    = nullptr;
-    if (hparams_.scale_codebook_embeddings) {
-        token_scale = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+    std::vector<ggml_tensor *> cb_id_tensors(hparams_.num_codebooks, nullptr);
+    ggml_tensor * host_embedding_input = nullptr;
+    ggml_tensor * host_codebook_input = nullptr;
+    ggml_tensor * causal_mask = nullptr;
+    std::vector<float> causal_mask_vals;
+
+    if (active_backend_is_metal(backend_)) {
+        const int64_t total_k = static_cast<int64_t>(n_past_) + n_tokens;
+        const uint64_t mask_elems = static_cast<uint64_t>(total_k) * static_cast<uint64_t>(n_tokens);
+        if (total_k <= 0 || mask_elems > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) {
+            return false;
+        }
+        causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, total_k, n_tokens);
+        causal_mask_vals.resize(static_cast<size_t>(mask_elems));
+        for (int32_t q = 0; q < n_tokens; ++q) {
+            const int64_t max_k = static_cast<int64_t>(n_past_) + q;
+            for (int64_t k = 0; k < total_k; ++k) {
+                causal_mask_vals[static_cast<size_t>(q) * static_cast<size_t>(total_k) + static_cast<size_t>(k)] =
+                    (k <= max_k) ? 0.0f : -1.0e9f;
+            }
+        }
     }
 
-    ggml_tensor * x = ggml_get_rows(ctx0, weights_.embeddings, semantic_ids);
-    if (x->type != GGML_TYPE_F32) x = ggml_cast(ctx0, x, GGML_TYPE_F32);
+    ggml_tensor * x = nullptr;
+    if (use_host_semantic) {
+        host_embedding_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, n_tokens);
+        x = host_embedding_input;
+    } else {
+        semantic_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        x = ggml_get_rows(ctx0, weights_.embeddings, semantic_ids);
+        if (x->type != GGML_TYPE_F32) x = ggml_cast(ctx0, x, GGML_TYPE_F32);
+    }
 
-    std::vector<ggml_tensor *> cb_id_tensors(hparams_.num_codebooks);
     ggml_tensor * codebook_sum = nullptr;
-    for (int32_t cb = 0; cb < hparams_.num_codebooks; ++cb) {
-        ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        cb_id_tensors[cb] = ids;
-        ggml_tensor * emb = ggml_get_rows(ctx0, weights_.codebook_embeddings, ids);
-        if (emb->type != GGML_TYPE_F32) emb = ggml_cast(ctx0, emb, GGML_TYPE_F32);
-        codebook_sum = (codebook_sum == nullptr) ? emb : ggml_add(ctx0, codebook_sum, emb);
+    if (use_host_codebooks) {
+        if (!use_host_semantic && has_semantic) {
+            host_codebook_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, n_tokens);
+            codebook_sum = host_codebook_input;
+        }
+        // When both tables are host-side, codebook rows were already accumulated
+        // into host_embedding_vals above, so no extra graph add is needed.
+    } else {
+        semantic_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        for (int32_t cb = 0; cb < hparams_.num_codebooks; ++cb) {
+            ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+            cb_id_tensors[cb] = ids;
+            ggml_tensor * emb = ggml_get_rows(ctx0, weights_.codebook_embeddings, ids);
+            if (emb->type != GGML_TYPE_F32) emb = ggml_cast(ctx0, emb, GGML_TYPE_F32);
+            codebook_sum = (codebook_sum == nullptr)
+                ? emb
+                : add_same_shape_checked(ctx0, codebook_sum, emb, "add:codebook_sum");
+        }
+        if (codebook_sum != nullptr) {
+            codebook_sum = ggml_mul(ctx0, codebook_sum,
+                                    repeat_checked(ctx0, semantic_mask, codebook_sum, "repeat:semantic_mask"));
+        }
     }
 
     if (codebook_sum != nullptr) {
-        // Mask out codebook embeddings for non-semantic positions
-        codebook_sum = ggml_mul(ctx0, codebook_sum,
-                                repeat_checked(ctx0, semantic_mask, codebook_sum, "repeat:semantic_mask"));
-        x = ggml_add(ctx0, x, codebook_sum);
+        x = add_same_shape_checked(ctx0, x, codebook_sum, "add:semantic_codebooks");
     }
-    if (token_scale != nullptr) {
+    if (hparams_.scale_codebook_embeddings) {
+        token_scale = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
         x = ggml_mul(ctx0, x, repeat_checked(ctx0, token_scale, x, "repeat:token_scale"));
     }
 
@@ -912,11 +1255,23 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
 
         ggml_tensor * attn_in = rms_norm_weighted(ctx0, x, layer.attention_norm, hparams_.rms_norm_eps);
         ggml_tensor * qkv     = mul_mat_checked(ctx0, layer.wqkv, attn_in, "mul_mat:wqkv");
+        if (qkv->ne[0] != qkv_size || qkv->ne[1] != n_tokens || qkv->ne[2] != 1 || qkv->ne[3] != 1) {
+            throw std::runtime_error("wqkv: unexpected output shape");
+        }
         const size_t elem_size = ggml_element_size(qkv);
+        const uint64_t k_offset_elems = static_cast<uint64_t>(q_size64);
+        const uint64_t v_offset_elems = static_cast<uint64_t>(q_size64) + static_cast<uint64_t>(kv_size64);
+        if (elem_size == 0 ||
+            k_offset_elems > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / elem_size) ||
+            v_offset_elems > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / elem_size)) {
+            throw std::runtime_error("wqkv: view offset overflow");
+        }
+        const size_t k_offset = static_cast<size_t>(k_offset_elems) * elem_size;
+        const size_t v_offset = static_cast<size_t>(v_offset_elems) * elem_size;
 
         ggml_tensor * q2d = ggml_view_2d(ctx0, qkv, q_size, n_tokens, qkv->nb[1], 0);
-        ggml_tensor * k2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], q_size * elem_size);
-        ggml_tensor * v2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], (q_size + kv_size) * elem_size);
+        ggml_tensor * k2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], k_offset);
+        ggml_tensor * v2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], v_offset);
 
         ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q2d), head_dim, n_head, n_tokens);
         ggml_tensor * k = ggml_reshape_3d(ctx0, ggml_cont(ctx0, k2d), head_dim, n_head_kv, n_tokens);
@@ -950,8 +1305,8 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
             head_dim, n_head_kv, n_tokens,
             memory_v_->nb[1], memory_v_->nb[2],
             layer_off_v + token_off_v);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, k, k_slot));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, v, v_slot));
+        ggml_build_forward_expand(gf, cpy_same_shape_checked(ctx0, k, k_slot, "cpy:k_cache"));
+        ggml_build_forward_expand(gf, cpy_same_shape_checked(ctx0, v, v_slot, "cpy:v_cache"));
 
         ggml_tensor * k_mem = k;
         ggml_tensor * v_mem = v;
@@ -978,31 +1333,38 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         ggml_tensor * K   = ggml_permute(ctx0, k_rep, 0, 2, 1, 3);
         ggml_tensor * KQ  = mul_mat_checked(ctx0, K, Q, "mul_mat:kq");
         ggml_tensor * KQs = ggml_scale(ctx0, KQ, attn_scale);
-        ggml_tensor * KQm = ggml_diag_mask_inf(ctx0, KQs, n_past_);
+        ggml_tensor * KQm = nullptr;
+        if (causal_mask) {
+            KQm = add_same_shape_checked(
+                ctx0, KQs, repeat_checked(ctx0, causal_mask, KQs, "repeat:causal_mask"),
+                "add:causal_mask");
+        } else {
+            KQm = ggml_diag_mask_inf(ctx0, KQs, n_past_);
+        }
         ggml_tensor * KQf = ggml_soft_max(ctx0, KQm);
 
         ggml_tensor * V       = ggml_cont(ctx0, ggml_permute(ctx0, v_rep, 1, 2, 0, 3));
         ggml_tensor * KQV     = mul_mat_checked(ctx0, V, KQf, "mul_mat:kqv");
         ggml_tensor * KQVm    = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-        ggml_tensor * attn_cur = ggml_cpy(ctx0, KQVm,
-                                          ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens));
+        ggml_tensor * attn_cur = cpy_same_shape_checked(
+            ctx0, KQVm, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens), "cpy:attn");
         ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:wo");
 
-        ggml_tensor * h     = ggml_add(ctx0, x, attn_out);
+        ggml_tensor * h     = add_same_shape_checked(ctx0, x, attn_out, "add:attention_residual");
         ggml_tensor * ff_in = rms_norm_weighted(ctx0, h, layer.ffn_norm, hparams_.rms_norm_eps);
         ggml_tensor * gate  = mul_mat_checked(ctx0, layer.w1, ff_in, "mul_mat:w1");
         ggml_tensor * up    = mul_mat_checked(ctx0, layer.w3, ff_in, "mul_mat:w3");
-        ggml_tensor * ff_h  = ggml_swiglu_split(ctx0, gate, up);
+        ggml_tensor * ff_h  = swiglu_split_checked(ctx0, gate, up, "swiglu:ffn");
         ggml_tensor * ff_out = mul_mat_checked(ctx0, layer.w2, ff_h, "mul_mat:w2");
 
-        x = ggml_add(ctx0, h, ff_out);
+        x = add_same_shape_checked(ctx0, h, ff_out, "add:ffn_residual");
     }
 
     ggml_tensor * slow_out  = rms_norm_weighted(ctx0, x, weights_.norm, hparams_.rms_norm_eps);
     ggml_tensor * slow_cont = ggml_cont(ctx0, slow_out);
-    ggml_tensor * hidden_last = ggml_cpy(ctx0,
-        last_token_view(ctx0, slow_cont, n_tokens),
-        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, 1));
+    ggml_tensor * hidden_last = cpy_same_shape_checked(
+        ctx0, last_token_view(ctx0, slow_cont, n_tokens),
+        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dim, 1), "cpy:hidden_last");
 
     ggml_tensor * logits = mul_mat_checked(ctx0, weights_.output, hidden_last, "mul_mat:logits");
     ggml_build_forward_expand(gf, logits);
@@ -1010,18 +1372,34 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     // Allocate and run
     if (!ggml_gallocr_alloc_graph(allocr_, gf)) {
         std::fprintf(stderr, "[eval_cached] gallocr alloc failed\n");
-        ggml_free(ctx0);
         return false;
     }
 
-    ggml_backend_tensor_set(semantic_ids,  semantic_vals.data(), 0, n_tokens * sizeof(int32_t));
-    ggml_backend_tensor_set(positions,     pos_vals.data(),       0, n_tokens * sizeof(int32_t));
-    ggml_backend_tensor_set(semantic_mask, semantic_mask_vals.data(), 0, n_tokens * sizeof(float));
+    ggml_backend_tensor_set(positions, pos_vals.data(), 0, n_tokens * sizeof(int32_t));
+    if (host_embedding_input) {
+        ggml_backend_tensor_set(host_embedding_input, host_embedding_vals.data(), 0,
+                                host_embedding_vals.size() * sizeof(float));
+    } else if (semantic_ids) {
+        ggml_backend_tensor_set(semantic_ids, semantic_vals.data(), 0, n_tokens * sizeof(int32_t));
+    }
+    if (host_codebook_input) {
+        ggml_backend_tensor_set(host_codebook_input, host_codebook_sum_vals.data(), 0,
+                                host_codebook_sum_vals.size() * sizeof(float));
+    }
+    if (semantic_mask) {
+        ggml_backend_tensor_set(semantic_mask, semantic_mask_vals.data(), 0, n_tokens * sizeof(float));
+    }
     if (token_scale) {
         ggml_backend_tensor_set(token_scale, token_scale_vals.data(), 0, n_tokens * sizeof(float));
     }
+    if (causal_mask) {
+        ggml_backend_tensor_set(causal_mask, causal_mask_vals.data(), 0,
+                                causal_mask_vals.size() * sizeof(float));
+    }
     for (int32_t cb = 0; cb < hparams_.num_codebooks; ++cb) {
-        ggml_backend_tensor_set(cb_id_tensors[cb], cb_vals[cb].data(), 0, n_tokens * sizeof(int32_t));
+        if (cb_id_tensors[cb]) {
+            ggml_backend_tensor_set(cb_id_tensors[cb], cb_vals[cb].data(), 0, n_tokens * sizeof(int32_t));
+        }
     }
 
     if (ggml_backend_is_cpu(backend_)) {
@@ -1029,7 +1407,6 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     }
     if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[eval_cached] compute failed\n");
-        ggml_free(ctx0);
         return false;
     }
 
@@ -1038,7 +1415,6 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
     ggml_backend_tensor_get(hidden_last, result.hidden.data(), 0, dim * sizeof(float));
     ggml_backend_tensor_get(logits,      result.logits.data(), 0, hparams_.vocab_size * sizeof(float));
 
-    ggml_free(ctx0);
     n_past_ += n_tokens;
     return true;
 }
@@ -1055,13 +1431,16 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
         std::fprintf(stderr, "[fast_decode] model has no fast decoder\n");
         return false;
     }
-    if (static_cast<int32_t>(hidden_in.size()) != hparams_.embedding_length) {
+    if (hparams_.embedding_length < 0 ||
+        hidden_in.size() != static_cast<size_t>(hparams_.embedding_length)) {
         std::fprintf(stderr, "[fast_decode] expected hidden size %d, got %zu\n",
             hparams_.embedding_length, hidden_in.size());
         return false;
     }
-    if (static_cast<int32_t>(prefix_tokens.size()) >= hparams_.num_codebooks ||
-        static_cast<int32_t>(prefix_tokens.size()) + 1 > hparams_.fast_context_length) {
+    if (hparams_.num_codebooks <= 0 || hparams_.fast_context_length <= 0 ||
+        prefix_tokens.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+        prefix_tokens.size() >= static_cast<size_t>(hparams_.num_codebooks) ||
+        prefix_tokens.size() + 1u > static_cast<size_t>(hparams_.fast_context_length)) {
         std::fprintf(stderr, "[fast_decode] prefix too long (%zu)\n", prefix_tokens.size());
         return false;
     }
@@ -1075,19 +1454,53 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     const int32_t fast_dim  = hparams_.fast_embedding_length;
     const int32_t n_head    = hparams_.fast_head_count;
     const int32_t n_head_kv = hparams_.fast_head_count_kv;
+    if (fast_dim <= 0 || n_head <= 0 || n_head_kv <= 0 || n_head % n_head_kv != 0) {
+        std::fprintf(stderr, "[fast_decode] invalid attention dimensions\n");
+        return false;
+    }
     const int32_t head_dim  = (hparams_.fast_head_dim > 0)
                                 ? hparams_.fast_head_dim
                                 : fast_dim / n_head;
-    const int32_t q_size    = n_head * head_dim;
-    const int32_t kv_size   = n_head_kv * head_dim;
+    const int64_t q_size64  = static_cast<int64_t>(n_head) * head_dim;
+    const int64_t kv_size64 = static_cast<int64_t>(n_head_kv) * head_dim;
+    if (head_dim <= 0 || q_size64 <= 0 || kv_size64 <= 0 ||
+        q_size64 > std::numeric_limits<int32_t>::max() ||
+        kv_size64 > std::numeric_limits<int32_t>::max()) {
+        std::fprintf(stderr, "[fast_decode] attention shape overflow\n");
+        return false;
+    }
+    const int32_t q_size    = static_cast<int32_t>(q_size64);
+    const int32_t kv_size   = static_cast<int32_t>(kv_size64);
+    const int64_t qkv_size  = q_size64 + 2 * kv_size64;
     const float attn_scale  = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const int32_t n_tokens  = static_cast<int32_t>(prefix_tokens.size()) + 1;
+
+    std::vector<float> host_prefix_embeddings;
+    const bool use_host_fast_embeddings = cuda_fast_host_embeddings_ && !prefix_tokens.empty();
+    if (use_host_fast_embeddings) {
+        if (!host_fast_embeddings_.valid() || host_fast_embeddings_.width != fast_dim ||
+            host_fast_embeddings_.rows < hparams_.codebook_size) {
+            std::fprintf(stderr, "[fast_decode] CUDA host fast-embedding table is incomplete/incompatible\n");
+            return false;
+        }
+        const uint64_t elems = static_cast<uint64_t>(fast_dim) * prefix_tokens.size();
+        if (elems > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) return false;
+        host_prefix_embeddings.resize(static_cast<size_t>(elems));
+        for (size_t i = 0; i < prefix_tokens.size(); ++i) {
+            float * dst = host_prefix_embeddings.data() + i * static_cast<size_t>(fast_dim);
+            if (!decode_host_embedding_row(host_fast_embeddings_, prefix_tokens[i], dst)) {
+                std::fprintf(stderr, "[fast_decode] failed to decode fast embedding row %d\n", prefix_tokens[i]);
+                return false;
+            }
+        }
+    }
 
     constexpr size_t fast_ctx_size = 8u * 1024u * 1024u;
     if (fast_graph_ctx_buf_.size() != fast_ctx_size) fast_graph_ctx_buf_.resize(fast_ctx_size);
     ggml_init_params p = { fast_ctx_size, fast_graph_ctx_buf_.data(), true };
     ggml_context * ctx0 = ggml_init(p);
     if (!ctx0) return false;
+    GgmlContextGuard ctx_guard(ctx0);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 16384, false);
 
@@ -1101,15 +1514,32 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     if (projected->type != GGML_TYPE_F32) {
         projected = ggml_cast(ctx0, projected, GGML_TYPE_F32);
     }
+    if (projected->ne[0] != fast_dim || projected->ne[1] != 1 ||
+        projected->ne[2] != 1 || projected->ne[3] != 1) {
+        throw std::runtime_error("fast_project_in: unexpected output shape");
+    }
 
     // Build sequence: [projected_hidden; prefix_embeddings]
     ggml_tensor * x = projected;
     ggml_tensor * prefix_ids = nullptr;
+    ggml_tensor * prefix_embedding_input = nullptr;
     if (!prefix_tokens.empty()) {
-        prefix_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)prefix_tokens.size());
-        ggml_tensor * prefix_emb = ggml_get_rows(ctx0, weights_.fast_embeddings, prefix_ids);
-        if (prefix_emb->type != GGML_TYPE_F32) {
-            prefix_emb = ggml_cast(ctx0, prefix_emb, GGML_TYPE_F32);
+        ggml_tensor * prefix_emb = nullptr;
+        if (use_host_fast_embeddings) {
+            prefix_embedding_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, fast_dim,
+                                                        static_cast<int64_t>(prefix_tokens.size()));
+            prefix_emb = prefix_embedding_input;
+        } else {
+            prefix_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)prefix_tokens.size());
+            prefix_emb = ggml_get_rows(ctx0, weights_.fast_embeddings, prefix_ids);
+            if (prefix_emb->type != GGML_TYPE_F32) {
+                prefix_emb = ggml_cast(ctx0, prefix_emb, GGML_TYPE_F32);
+            }
+        }
+        if (prefix_emb->ne[0] != fast_dim ||
+            prefix_emb->ne[1] != static_cast<int64_t>(prefix_tokens.size()) ||
+            prefix_emb->ne[2] != 1 || prefix_emb->ne[3] != 1) {
+            throw std::runtime_error("fast_embeddings: unexpected output shape");
         }
         x = ggml_concat(ctx0, x, prefix_emb, 1);
     }
@@ -1117,17 +1547,44 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     std::vector<int32_t> pos_vals(n_tokens);
     for (int32_t i = 0; i < n_tokens; ++i) pos_vals[i] = i;
+    ggml_tensor * causal_mask = nullptr;
+    std::vector<float> causal_mask_vals;
+    if (active_backend_is_metal(backend_)) {
+        const uint64_t mask_elems = static_cast<uint64_t>(n_tokens) * static_cast<uint64_t>(n_tokens);
+        if (mask_elems > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) {
+            return false;
+        }
+        causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens);
+        causal_mask_vals.resize(static_cast<size_t>(mask_elems));
+        for (int32_t q = 0; q < n_tokens; ++q) {
+            for (int32_t k = 0; k < n_tokens; ++k) {
+                causal_mask_vals[static_cast<size_t>(q) * n_tokens + k] = (k <= q) ? 0.0f : -1.0e9f;
+            }
+        }
+    }
 
     for (int32_t il = 0; il < hparams_.fast_block_count; ++il) {
         const auto & layer = weights_.fast_layers[il];
 
         ggml_tensor * attn_in = rms_norm_weighted(ctx0, x, layer.attention_norm, hparams_.fast_rms_norm_eps);
         ggml_tensor * qkv     = mul_mat_checked(ctx0, layer.wqkv, attn_in, "mul_mat:fast_wqkv");
+        if (qkv->ne[0] != qkv_size || qkv->ne[1] != n_tokens || qkv->ne[2] != 1 || qkv->ne[3] != 1) {
+            throw std::runtime_error("fast_wqkv: unexpected output shape");
+        }
         const size_t elem_size = ggml_element_size(qkv);
+        const uint64_t k_offset_elems = static_cast<uint64_t>(q_size64);
+        const uint64_t v_offset_elems = static_cast<uint64_t>(q_size64) + static_cast<uint64_t>(kv_size64);
+        if (elem_size == 0 ||
+            k_offset_elems > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / elem_size) ||
+            v_offset_elems > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / elem_size)) {
+            throw std::runtime_error("fast_wqkv: view offset overflow");
+        }
+        const size_t k_offset = static_cast<size_t>(k_offset_elems) * elem_size;
+        const size_t v_offset = static_cast<size_t>(v_offset_elems) * elem_size;
 
         ggml_tensor * q2d = ggml_view_2d(ctx0, qkv, q_size, n_tokens, qkv->nb[1], 0);
-        ggml_tensor * k2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], q_size * elem_size);
-        ggml_tensor * v2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], (q_size + kv_size) * elem_size);
+        ggml_tensor * k2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], k_offset);
+        ggml_tensor * v2d = ggml_view_2d(ctx0, qkv, kv_size, n_tokens, qkv->nb[1], v_offset);
 
         ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, q2d), head_dim, n_head, n_tokens);
         ggml_tensor * k = ggml_reshape_3d(ctx0, ggml_cont(ctx0, k2d), head_dim, n_head_kv, n_tokens);
@@ -1152,45 +1609,58 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
         ggml_tensor * K   = ggml_permute(ctx0, k_rep, 0, 2, 1, 3);
         ggml_tensor * KQ  = mul_mat_checked(ctx0, K, Q, "mul_mat:fast_kq");
         ggml_tensor * KQs = ggml_scale(ctx0, KQ, attn_scale);
-        ggml_tensor * KQm = ggml_diag_mask_inf(ctx0, KQs, 0);
+        ggml_tensor * KQm = nullptr;
+        if (causal_mask) {
+            KQm = add_same_shape_checked(
+                ctx0, KQs, repeat_checked(ctx0, causal_mask, KQs, "repeat:fast_causal_mask"),
+                "add:fast_causal_mask");
+        } else {
+            KQm = ggml_diag_mask_inf(ctx0, KQs, 0);
+        }
         ggml_tensor * KQf = ggml_soft_max(ctx0, KQm);
 
         ggml_tensor * V       = ggml_cont(ctx0, ggml_permute(ctx0, v_rep, 1, 2, 0, 3));
         ggml_tensor * KQV     = mul_mat_checked(ctx0, V, KQf, "mul_mat:fast_kqv");
         ggml_tensor * KQVm    = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-        ggml_tensor * attn_cur = ggml_cpy(ctx0, KQVm,
-                                          ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens));
+        ggml_tensor * attn_cur = cpy_same_shape_checked(
+            ctx0, KQVm, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens), "cpy:fast_attn");
         ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:fast_wo");
 
-        ggml_tensor * h     = ggml_add(ctx0, x, attn_out);
+        ggml_tensor * h     = add_same_shape_checked(ctx0, x, attn_out, "add:fast_attention_residual");
         ggml_tensor * ff_in = rms_norm_weighted(ctx0, h, layer.ffn_norm, hparams_.fast_rms_norm_eps);
         ggml_tensor * gate  = mul_mat_checked(ctx0, layer.w1, ff_in, "mul_mat:fast_w1");
         ggml_tensor * up    = mul_mat_checked(ctx0, layer.w3, ff_in, "mul_mat:fast_w3");
-        ggml_tensor * ff_h  = ggml_swiglu_split(ctx0, gate, up);
+        ggml_tensor * ff_h  = swiglu_split_checked(ctx0, gate, up, "swiglu:fast_ffn");
         ggml_tensor * ff_out = mul_mat_checked(ctx0, layer.w2, ff_h, "mul_mat:fast_w2");
 
-        x = ggml_add(ctx0, h, ff_out);
+        x = add_same_shape_checked(ctx0, h, ff_out, "add:fast_ffn_residual");
     }
 
     ggml_tensor * fast_out  = rms_norm_weighted(ctx0, x, weights_.fast_norm, hparams_.fast_rms_norm_eps);
     ggml_tensor * fast_cont = ggml_cont(ctx0, fast_out);
-    ggml_tensor * fast_last = ggml_cpy(ctx0,
-        last_token_view(ctx0, fast_cont, n_tokens),
-        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, fast_dim, 1));
+    ggml_tensor * fast_last = cpy_same_shape_checked(
+        ctx0, last_token_view(ctx0, fast_cont, n_tokens),
+        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, fast_dim, 1), "cpy:fast_last");
     ggml_tensor * logits = mul_mat_checked(ctx0, weights_.fast_output, fast_last, "mul_mat:fast_logits");
     ggml_build_forward_expand(gf, logits);
 
     if (!ggml_gallocr_alloc_graph(fast_allocr_, gf)) {
         std::fprintf(stderr, "[fast_decode] gallocr alloc failed\n");
-        ggml_free(ctx0);
         return false;
     }
 
     ggml_backend_tensor_set(hidden0,   hidden_in.data(),    0, hidden_in.size() * sizeof(float));
     ggml_backend_tensor_set(positions, pos_vals.data(),     0, pos_vals.size() * sizeof(int32_t));
-    if (prefix_ids) {
+    if (prefix_embedding_input) {
+        ggml_backend_tensor_set(prefix_embedding_input, host_prefix_embeddings.data(), 0,
+                                host_prefix_embeddings.size() * sizeof(float));
+    } else if (prefix_ids) {
         ggml_backend_tensor_set(prefix_ids, prefix_tokens.data(), 0,
                                 prefix_tokens.size() * sizeof(int32_t));
+    }
+    if (causal_mask) {
+        ggml_backend_tensor_set(causal_mask, causal_mask_vals.data(), 0,
+                                causal_mask_vals.size() * sizeof(float));
     }
 
     if (ggml_backend_is_cpu(backend_)) {
@@ -1198,7 +1668,6 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     }
     if (ggml_backend_graph_compute(backend_, gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[fast_decode] compute failed\n");
-        ggml_free(ctx0);
         return false;
     }
 
@@ -1206,7 +1675,6 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
     logits_out.resize(hparams_.codebook_size);
     ggml_backend_tensor_get(logits, logits_out.data(), 0, hparams_.codebook_size * sizeof(float));
 
-    ggml_free(ctx0);
     return true;
 }
 

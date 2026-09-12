@@ -42,6 +42,24 @@ struct PipelineParams {
     int32_t max_tokens_per_segment = 300;
     int32_t min_seg_chars          = 0;
 
+    // Fish-compatible long-form chunking. 0 keeps V7.4/V7.5 native behavior.
+    // Non-zero chunk_length is measured in visible Unicode characters.
+    int32_t chunk_length           = 0;
+    int32_t min_chunk_length       = 0;
+    bool    condition_on_previous_chunks = true;
+
+    // Fish prosody volume is a post-decode dB gain. Speed is intentionally not
+    // represented until a pitch-preserving time-stretch implementation exists.
+    float   prosody_volume_db      = 0.0f;
+
+    // Conversational VQ history. 0 preserves V7.4 for ordinary mono-speaker
+    // requests; multi-speaker requests without an external reference retain at
+    // least one prior turn to avoid applying one monovoice anchor to everyone.
+    int32_t multi_turn_history     = 0;
+
+    // Optional startup warmup; isolated from real voice/reference state.
+    bool warmup                    = false;
+
     // Trailing-silence trimming applied after synthesis
     bool trim_silence = false;
 
@@ -63,7 +81,8 @@ struct VoiceCache {
 };
 
 // Callback para synthesize_streaming().
-// Se llama una vez por segmento de audio generado.
+// Con stride activo puede llamarse varias veces por segmento de texto; con
+// stride desactivado se llama una vez por segmento.
 // Parámetros:
 //   pcm_int16  — puntero a los samples int16 del segmento
 //   n_samples  — número de samples
@@ -73,6 +92,12 @@ using StreamCallback = std::function<bool(
     const int16_t * pcm_int16,
     size_t          n_samples,
     bool            is_last)>;
+
+// Optional cancellation probe for streaming. Return false to stop generation.
+// With stride streaming this is checked for every semantic frame; with stride
+// disabled it is checked at segment boundaries because the non-streaming model
+// path does not expose frame-level cancellation.
+using CancelCallback = std::function<bool()>;
 
 class Pipeline {
 public:
@@ -85,6 +110,7 @@ public:
     Pipeline & operator=(Pipeline &&) = delete;
 
     bool init(const PipelineParams & params);
+    bool warmup(const PipelineParams & params);
 
     // HTTP clásico: todo el audio en un archivo temporal; el llamador toma ownership de la ruta.
     bool synthesize_to_file(const PipelineParams & params, std::string & out_wav_path);
@@ -95,9 +121,10 @@ public:
     // Guardar a archivo con ruta explícita (--output).
     bool synthesize(const PipelineParams & params);
 
-    // WebSocket / streaming: llama al callback una vez por segmento de oración.
+    // WebSocket / streaming: emite uno o mas chunks PCM por segmento de texto.
     bool synthesize_streaming(const PipelineParams & params, StreamCallback callback,
-                              int32_t * segments_out = nullptr);
+                              int32_t * segments_out = nullptr,
+                              CancelCallback should_continue = {});
 
     int32_t sample_rate()    const { return codec_.sample_rate(); }
     int32_t num_codebooks()  const { return model_.hparams().num_codebooks; }
@@ -119,7 +146,10 @@ private:
         const std::string          & text_segment,
         const std::vector<int32_t> & ref_codes,
         int32_t                      T_prompt,
-        std::vector<float>         & audio_out);
+        std::vector<float>         & audio_out,
+        std::vector<int32_t>       * generated_codes_out = nullptr,
+        int32_t                    * generated_frames_out = nullptr,
+        std::vector<PromptHistoryTurn> * history = nullptr);
 
     bool get_ref_codes(const PipelineParams & params,
                        std::vector<int32_t> & out_codes,

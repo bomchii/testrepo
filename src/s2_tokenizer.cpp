@@ -1,5 +1,6 @@
 // s2_tokenizer.cpp — BPE tokenizer for Qwen3/Fish Speech
 #include "../include/s2_tokenizer.h"
+#include "s2_utf8.h"
 #include "../third_party/json.hpp"
 
 #include <algorithm>
@@ -702,7 +703,7 @@ bool Tokenizer::load(const std::string & path) {
 // Encode text to token IDs
 // ---------------------------------------------------------------------------
 std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
-    if (text.empty() || !loaded_) return {};
+    if (text.empty() || !loaded_ || !utf8::is_valid(text)) return {};
 
     std::vector<int32_t> ids;
     auto encode_plain = [&](size_t begin, size_t end) {

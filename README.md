@@ -1,276 +1,892 @@
 # s2.cpp
 
-> **ALPHA — EXPERIMENTAL AND PROOF OF CONCEPT SOFTWARE**
-> This is an early-stage, community-built inference engine. Expect rough edges, missing features, and breaking changes. Not production-ready.
+Run **Fish Audio S2 Pro** locally with C++17 and GGML.
 
-**s2.cpp** — Fish Audio's S2 Pro Dual-AR text-to-speech model running locally via a pure C++/GGML inference engine with separate CPU, Vulkan, CUDA, and Metal backends. No Python runtime required after build.
+`s2.cpp` can synthesize from the command line, run an HTTP/WebSocket server, clone voices from reference audio, save reusable `.s2voice` profiles, and run on CPU, Vulkan, CUDA, or Metal.
 
-> **Built on Fish Audio S2 Pro**
-> The model weights are licensed under the Fish Audio Research License, Copyright © 39 AI, INC. All Rights Reserved.
-> See [LICENSE.md](LICENSE.md) for full terms. Commercial use requires a separate license from Fish Audio — contact [business@fish.audio](mailto:business@fish.audio).
+> [!WARNING]
+> This project is still alpha software. It has a lot of validation around malformed input and GGUF files, but it should not be treated as a security boundary. Test the backend you plan to use on the actual machine you plan to run it on.
 
----
+This fork is based on [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp). The main focus here is a practical local server, lower peak memory use, stable long-form synthesis, better Unicode handling, and keeping the four hardware backends isolated from each other.
 
-## What this is
+Fish Audio S2 Pro model weights use the **Fish Audio Research License**. See [LICENSE.md](LICENSE.md) before redistributing models or using them commercially.
 
-This repository is a fork of https://github.com/rodrigomatta/s2.cpp which is currently a command-line script.
+## Features
 
-This version of s2.cpp is an API server version, compatible with the Fish Audio API endpoint /v1/tts . On good GPUs, it can achieve real-time performance while taking advantage of quantized models. If needed, VRAM savings can be used to run multiple services simultaneously.
+- CLI synthesis to WAV
+- HTTP synthesis with `/v1/tts`, `/v1/audio/speech`, and `/synthesize`
+- WebSocket PCM streaming
+- Reference-audio voice cloning
+- Saved `.s2voice` profiles
+- Long-form synthesis with bounded context and incremental WAV writing
+- Multi-speaker text with `<|speaker:N|>` tags
+- Expression instructions such as `[whisper]` or `[professional broadcast tone]`
+- UTF-8 text across CJK, Arabic, Hebrew, Cyrillic, Indic scripts, Armenian, Greek, Tibetan, and more
+- Separate CPU, Vulkan, CUDA, and Metal builds
 
-The original project was tested primarily on NVIDIA RTX hardware with Vulkan. This fork also contains dedicated Windows CPU/CUDA/Vulkan and macOS Metal build workflows; those platform builds should be treated as experimental until their GitHub Actions jobs and target hardware tests pass.
+There is no universal CPU+Vulkan+CUDA+Metal binary. Each backend is built separately on purpose.
 
-This version of s2.cpp offers less flexibility and fewer features than the original s2.cpp version.
+## Backends
 
-The two main areas of focus are reducing VRAM usage and maintaining the inference speed of the best configurations of the original model. This must be achieved while maintaining very high voice cloning quality and accurate intonation and tag reproduction. To achieve these two goals, our choices included using GPUs for the codec as well as loading the reference audio when the server was launched.
+| Platform | Backend | Actions artifact | Executable |
+|---|---|---|---|
+| Windows x64 | CPU | `s2-windows-cpu` | `s2-cpu.exe` |
+| Windows x64 | Vulkan | `s2-windows-vulkan` | `s2.exe` |
+| Windows x64 | CUDA | `s2-windows-cuda` | `s2-cuda.exe` |
+| macOS | Metal | `s2-macos-metal` | `s2-metal` |
 
-This repository contains:
+Only one of `S2_VULKAN`, `S2_CUDA`, or `S2_METAL` should be enabled in a build directory. CPU-only builds leave all three off.
 
-- **`s2.cpp`** — a self-contained C++17 inference engine built on [ggml](https://github.com/ggml-org/ggml), handling tokenization, Dual-AR generation, audio codec encode/decode, and WAV output throw API similar with Fish Audio API
-- **`tokenizer.json`** — Qwen3 BPE tokenizer with ByteLevel pre-tokenization
-- GGUF model files are **not included** here — see [Model variants](#model-variants) below
+The GitHub Actions workflow is `.github/workflows/build-all-backends.yml` (Windows Server 2025 / VS 2026 for CPU, Vulkan and CUDA; macOS 15 for Metal). Tagged releases are published as `s2-<tag>-windows-cpu.zip`, `s2-<tag>-windows-vulkan.zip`, `s2-<tag>-windows-cuda.zip`, and `s2-<tag>-macos-metal.zip`.
 
-The engine runs the full pipeline: text via API → tokens → Slow-AR transformer (with KV cache) → Fast-AR codebook decoder → audio codec → WAV file return via API.
+Runtime requirements are simple:
 
----
+- CPU: Windows x64. OpenMP may require the current Microsoft Visual C++ v14 x64 Redistributable.
+- Vulkan: a Vulkan-capable GPU/driver, plus the same possible OpenMP runtime above. `vulkan-1.dll` comes from the driver.
+- CUDA: an NVIDIA driver. The CUDA runtime/cuBLAS payload is inside `s2-cuda.exe`; `nvcuda.dll` still comes from the driver.
+- Metal: macOS on a Metal-capable Mac.
 
-## Model variants
+### CUDA release layout
 
-To reduce VRAM usage, new GGUFs were created. The transformer-only GGUFs were created from the full GGUFs from rodrigomt in the table below. The codec-only GGUFs are adaptations of the original codec.pth file to GGUF and quantized formats.
+The Windows CUDA release is a single `s2-cuda.exe` file. It is a small native launcher that contains the real CUDA executable and the CUDA DLLs it needs.
 
-GGUF files are available at [mach9243/s2-pro-gguf](https://huggingface.co/mach9243/s2-pro-gguf) on Hugging Face.
+At runtime it extracts those files to a hash-addressed cache under:
 
-| File | Size | Notes |
-|---|---|---|
-| `s2-pro-f16-transformer-only.gguf` | 9.2 GB | Full precision — reference quality |
-| `s2-pro-f16-codec-only.gguf` | 1.4 GB | Full precision — reference quality |
-| `s2-pro-q8_0-transformer-only.gguf` | 5.4 GB | Near-lossless |
-| `s2-pro-q8_0-codec-only.gguf` | 1.0 GB | Near-lossless |
-| `s2-pro-q4_k_m-transformer-only.gguf` | 2.8 GB | Good quality/size balance |
-| `s2-pro-q4_k_m-codec-only.gguf` | 1.0 GB | Good quality/size balance |
-
-To use these models, you must use together one of the transformer models (--model) and one of the codec models (--model-codec). The VRAM used is the sum of the 2 models plus a few hundred MB.
-
-In order to compare several samples generated with these model pairs, they were submitted to the HF page
-
-
-Rodrigomt's original GGUF files remain functional if needed. Files are available at [rodrigomt/s2-pro-gguf](https://huggingface.co/rodrigomt/s2-pro-gguf) on Hugging Face.
-
-| File | Size | Notes |
-|---|---|---|
-| `s2-pro-f16.gguf` | 9.3 GB | Full precision — reference quality 19+ GB VRAM |
-| `s2-pro-q8_0.gguf` | 5.7 GB | Near-lossless — recommended for 12+ GB VRAM |
-| `s2-pro-q6_k.gguf` | 4.8 GB | Good quality/size balance — recommended for 11+ GB VRAM |
-| `s2-pro-q3_k.gguf` | 4.0 GB | Good quality/size balance — recommended for 8+ GB VRAM |
-
-
-
-All variants include both the transformer weights and the audio codec in a single file.
-
----
-
-## Requirements
-
-### Build dependencies
-
-- CMake ≥ 3.14
-- C++17 compiler (GCC ≥ 10, Clang ≥ 11, MSVC 2019+)
-- Crow
-- For Vulkan GPU support: Vulkan SDK and `glslc`
-- For CUDA GPU support: a CUDA Toolkit supported by your compiler/toolchain
-- For Metal GPU support: macOS with Xcode command-line tools
-
-```bash
-# Ubuntu / Debian
-sudo apt install cmake build-essential
+```text
+%LOCALAPPDATA%\s2.cpp\runtime\cuda-<payload-sha256>\
 ```
 
-# Vulkan (optional, recommended for GPU acceleration on AMD/Intel/Nvidia)
+The launcher verifies file sizes and hashes before starting the core executable. `nvcuda.dll` is not bundled because it comes from the NVIDIA driver.
 
-```bash
-sudo apt install vulkan-tools libvulkan-dev glslc
+Two launcher-only commands are available:
+
+```powershell
+s2-cuda.exe --runtime-info
+s2-cuda.exe --clean-runtime
 ```
 
-### Runtime
+`--runtime-info` shows information about the embedded runtime. `--clean-runtime` removes inactive cached runtimes and leaves caches that are currently in use alone.
 
-No Python or PyTorch is required. Runtime dependencies depend on the selected backend and how GGML was linked. The GitHub Actions release jobs build one backend per artifact and package the backend-specific runtime files they require.
+## Models
 
-Windows release artifacts use the MSVC runtime dynamically, so the **Microsoft Visual C++ 2015–2022 Redistributable (x64)** must be installed unless it is already present. The Vulkan build also needs the Vulkan loader supplied by a working GPU driver; the CUDA build needs a compatible NVIDIA driver (its selected CUDA runtime DLLs are packaged with the artifact).
+GGUF weights are not included in this repository.
 
----
+### Split transformer + codec files
 
-## Building
+The [mach9243/s2-pro-gguf](https://huggingface.co/mach9243/s2-pro-gguf) collection provides transformer-only and codec-only files that can be paired together.
 
-Clone including the GGML submodule:
+| Transformer | Codec | Approx. size |
+|---|---|---:|
+| `s2-pro-f16-transformer-only.gguf` | `s2-pro-f16-codec-only.gguf` | 9.1 GB + 1.4 GB |
+| `s2-pro-q8_0-transformer-only.gguf` | `s2-pro-q8_0-codec-only.gguf` | 5.3 GB + 1.0 GB |
+| `s2-pro-q4_k_m-transformer-only.gguf` | `s2-pro-q4_k_m-codec-only.gguf` | 2.8 GB + 0.95 GB |
+
+Use `--model` for the transformer and `--model-codec` for the codec.
+
+### Combined GGUFs
+
+Combined Fish Speech GGUFs such as [rodrigomt/s2-pro-gguf](https://huggingface.co/rodrigomt/s2-pro-gguf) are also supported. Pass the same file to both `--model` and `--model-codec`.
+
+The loader checks model/codec layout before synthesis. Two files loading successfully does not necessarily mean they are a compatible pair.
+
+## Quick start
+
+If you downloaded a release, unzip it first. The examples below assume the two Q4_K_M model files are in the same directory as the executable; full paths work too.
+
+You do **not** need a `--server` flag. Server mode is the default: give the executable the model files and do not pass `--output`. All four backends listen on `127.0.0.1:8080` by default.
+
+### Windows CPU
+
+```powershell
+.\s2-cpu.exe `
+  --model s2-pro-q4_k_m-transformer-only.gguf `
+  --model-codec s2-pro-q4_k_m-codec-only.gguf `
+  -v -1
+```
+
+### Windows Vulkan
+
+```powershell
+.\s2.exe `
+  --model s2-pro-q4_k_m-transformer-only.gguf `
+  --model-codec s2-pro-q4_k_m-codec-only.gguf `
+  -v 0
+```
+
+### Windows CUDA
+
+```powershell
+.\s2-cuda.exe `
+  --model s2-pro-q4_k_m-transformer-only.gguf `
+  --model-codec s2-pro-q4_k_m-codec-only.gguf `
+  -v 0
+```
+
+### macOS Metal
+
+```bash
+./s2-metal \
+  --model s2-pro-q4_k_m-transformer-only.gguf \
+  --model-codec s2-pro-q4_k_m-codec-only.gguf \
+  -v 0
+```
+
+`-v -1` means CPU. `-v 0` means GPU 0 for the backend you downloaded. The codec follows the transformer device by default, so you normally do not need another device flag.
+
+If you use a combined GGUF instead of separate transformer/codec files, pass the same file to both `--model` and `--model-codec`.
+
+Once the server says it is listening, check it:
+
+```bash
+curl http://127.0.0.1:8080/v1/health
+```
+
+On Windows PowerShell, use the real curl executable:
+
+```powershell
+curl.exe http://127.0.0.1:8080/v1/health
+```
+
+Then make a WAV:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello from s2.cpp.","format":"wav"}' \
+  -o output.wav
+```
+
+PowerShell:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8080/v1/tts `
+  -H "Content-Type: application/json" `
+  -d '{"text":"Hello from s2.cpp.","format":"wav"}' `
+  -o output.wav
+```
+
+That is enough for a basic server. The [HTTP server](#http-server) section below has long-form, PCM, saved-voice, reference-cloning and WebSocket examples.
+
+### One-shot WAV instead of a server
+
+Add `--text` and `--output`. `--output` switches the program to one-shot mode, writes a WAV, and exits.
+
+```powershell
+.\s2-cuda.exe `
+  --model s2-pro-q4_k_m-transformer-only.gguf `
+  --model-codec s2-pro-q4_k_m-codec-only.gguf `
+  -v 0 `
+  --text "Hello from s2.cpp." `
+  --output output.wav
+```
+
+If `--output` is present and `--text` is omitted, text is read from stdin.
+
+## Device selection
+
+| Option | Meaning |
+|---|---|
+| `-v -1` | Transformer on CPU. This is the default. |
+| `-v 0` or higher | Transformer on that GPU index for the compiled backend. |
+| `--codec-vulkan -2` | Codec follows the transformer device. Default. |
+| `--codec-vulkan -1` | Codec on CPU. |
+| `--codec-vulkan 0` or higher | Codec on that GPU index. |
+
+The `--vulkan` and `--codec-vulkan` names are historical. In a CUDA build they select CUDA devices. Metal maps GPU selection to its single logical Metal device.
+
+If GPU initialization fails and a CPU fallback is possible, the logs show the backend that ended up being used.
+
+## Voice cloning
+
+To keep the examples below short, `s2` means the executable for your backend: `.\s2-cpu.exe`, `.\s2.exe`, `.\s2-cuda.exe`, or `./s2-metal`. These generic examples leave the default `-v -1`, so they also work with the CPU build. Add `-v 0` when using Vulkan, CUDA, or Metal on the GPU.
+
+Reference audio needs a transcript. `--prompt-audio` without a non-empty `--prompt-text` is rejected.
+
+References are resampled to the codec rate and limited to **30 seconds** before encoding. In practice, a short clean single-speaker clip with an accurate transcript works better than feeding the model a long recording.
+
+### Clone from a WAV/MP3 file
+
+```bash
+s2 \
+  --model model.gguf --model-codec codec.gguf \
+  --prompt-audio reference.wav \
+  --prompt-text "Exact transcript of the reference audio." \
+  --text "This uses the reference voice." \
+  --output cloned.wav
+```
+
+### Save a voice and reuse it
+
+```bash
+# Save it once
+s2 \
+  --model model.gguf --model-codec codec.gguf \
+  --prompt-audio reference.wav \
+  --prompt-text "Exact transcript of the reference audio." \
+  --voice narrator --save-voice
+
+# Reuse it later
+s2 \
+  --model model.gguf --model-codec codec.gguf \
+  --voice narrator \
+  --text "A later request using the same voice." \
+  --output narrator.wav
+```
+
+Profiles are stored in `voices/` next to the executable unless `--voice-dir` is used. Voice IDs may contain ASCII letters, digits, `_`, and `-`.
+
+`.s2voice` files are validated when loaded and are written atomically.
+
+## Long text and low-memory synthesis
+
+For a book, article, or other large input, use `--chunk-length` or the HTTP `chunk_length` field.
+
+```bash
+cat book.txt | s2 \
+  --model model.gguf \
+  --model-codec codec.gguf \
+  --output book.wav \
+  --chunk-length 300 \
+  --min-chunk-length 50 \
+  --condition-on-previous-chunks
+```
+
+`chunk_length` uses visible Unicode characters, not UTF-8 bytes. The splitter avoids cutting through CJK text, Arabic/Hebrew marks, Indic viramas and conjuncts, emoji ZWJ sequences, flag pairs, balanced `[ ... ]` blocks, or valid `<|speaker:N|>` tags.
+
+The long-form path is disk-backed. Only the current chunk needs to exist as float PCM in memory. WAV data is appended directly to a staged file and the RIFF header is fixed up at the end, so a long request no longer needs a raw PCM temporary file plus a second WAV copy.
+
+`condition_on_previous_chunks` is on by default. It keeps a **bounded** amount of VQ/acoustic context between chunks so the voice does not restart from scratch, without letting history grow with the whole document. Use `--no-condition-on-previous-chunks` if you want each chunk to be independent.
+
+`prosody.volume` / `--prosody-volume` applies `-20..20` dB after final silence trimming. Fish-style `prosody.speed` is accepted only at `1.0` for now. Other values are rejected rather than faked with naive resampling that would also change pitch/timbre.
+
+Classic RIFF/WAV has a roughly 4 GiB data limit. RF64 is not implemented, so the writer rejects output that would exceed the RIFF limit.
+
+## Text, languages, speakers, and segmentation
+
+The tokenizer and public text paths require valid UTF-8.
+
+Sentence splitting handles the usual ASCII terminators plus CJK punctuation, Unicode ellipsis, Arabic `؟`, Urdu `۔`, Devanagari danda `।`/`॥`, Armenian full stop `։`, and other supported boundaries. It keeps common abbreviations, initials, and decimal numbers together.
+
+A few details matter for multilingual text:
+
+- CJK does not need ASCII spaces between sentences.
+- Combining marks do not count as visible characters for minimum-length decisions.
+- Arabic harakat, Hebrew niqqud, Indic viramas, bidi controls, ZWJ, and ZWNJ are preserved.
+- Armenian `՞` is not treated as a generic sentence terminator.
+- Greek `;`/question-mark handling is contextual rather than a global semicolon rule.
+- Balanced expression blocks such as `[whisper in small voice]` stay intact.
+- Valid `<|speaker:N|>` tags survive segmentation and are repeated where needed. Malformed speaker tags remain literal text.
+
+### Voice continuity without a reference
+
+Fish S2 can choose a random timbre when no reference is supplied. With segmented synthesis, the first successful segment becomes a request-local VQ voice anchor and later segments reuse it. The anchor is discarded after the request.
+
+If you need the same identity across different requests, use a saved `.s2voice` profile or reference audio.
+
+For multi-speaker text, conversational VQ history is used instead of forcing one mono-voice anchor across every speaker.
+
+## HTTP server
+
+Server mode is the default; there is no `--server` switch. If you do **not** pass `--output`, `--list-voices`, or a save-only `--save-voice` command, `s2` loads the model/codec and starts the HTTP/WebSocket server.
+
+The default address is:
+
+```text
+http://127.0.0.1:8080
+```
+
+CLI generation options become the server defaults. A JSON request can override the supported options for that request only. For example, starting the server with `--segment --chunk-length 300` makes those the defaults until a client sends different JSON values.
+
+### Starting the downloaded release
+
+Use the exact command for your backend from [Quick start](#quick-start). There is no `--server` option: if `--output`, `--list-voices`, and a save-only `--save-voice` are absent, the process starts the HTTP/WebSocket server.
+
+PowerShell examples use the backtick (`` ` ``) for line continuation. Bash/zsh examples use `\`.
+
+A server with long-form defaults and a different port:
+
+```powershell
+.\s2-cuda.exe `
+  --model s2-pro-q4_k_m-transformer-only.gguf `
+  --model-codec s2-pro-q4_k_m-codec-only.gguf `
+  -v 0 `
+  --segment `
+  --chunk-length 300 `
+  --min-chunk-length 50 `
+  --port 8081
+```
+
+Use `--host 0.0.0.0` only when you intentionally want LAN access. There is no built-in authentication. If the server is reachable by untrusted clients, put authentication/access control and a real HTTP body limit in a reverse proxy in front of it.
+
+### Endpoints
+
+| Method | Path | What it does |
+|---|---|---|
+| `POST` | `/v1/tts` | Fish-style synthesis endpoint |
+| `POST` | `/v1/audio/speech` | OpenAI-style alias (`input`, `response_format`) |
+| `POST` | `/synthesize` | Legacy synthesis alias |
+| `GET` | `/v1/models` | Local model entry |
+| `GET` | `/v1/voices` | List saved voices |
+| `POST` | `/v1/voices/<id>` | Create a saved voice from a server-local reference file |
+| `GET` | `/v1/voices/<id>` | Read voice metadata |
+| `DELETE` | `/v1/voices/<id>` | Delete a voice |
+| `GET` | `/health` | Plain-text health check |
+| `GET` | `/v1/health` | Fish-style JSON health check |
+| `GET` | `/` | Basic service status |
+| `WS` | `/ws/tts` | Incremental PCM streaming |
+
+The Fish/OpenAI compatibility layer only covers behavior this server implements. Fields that would change synthesis but are not supported are rejected instead of being silently ignored.
+
+Only WAV and raw PCM output are implemented over HTTP. MP3/Opus requests are rejected rather than returning WAV bytes under the wrong format name.
+
+### Check that the server is up
+
+```bash
+curl http://127.0.0.1:8080/
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/v1/health
+curl http://127.0.0.1:8080/v1/models
+```
+
+### Basic WAV request
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Hello from s2.cpp.","format":"wav"}' \
+  -o output.wav
+```
+
+### Windows PowerShell / `curl.exe`
+
+PowerShell may map `curl` to a PowerShell command, so use `curl.exe` when you want the real curl program.
+
+For simple ASCII JSON, a one-liner works:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8080/v1/tts -H "Content-Type: application/json" -d '{"text":"Hello from Windows.","format":"wav"}' -o output.wav
+```
+
+For multilingual text or a larger request, writing UTF-8 JSON first avoids shell quoting/encoding surprises:
+
+```powershell
+$bodyObj = @{
+    text = "¡Hola! 你好。 مرحباً. नमस्ते।"
+    format = "wav"
+    segment = $true
+    chunk_length = 300
+    condition_on_previous_chunks = $true
+}
+$bodyJson = ConvertTo-Json -InputObject $bodyObj -Compress
+$bodyPath = Join-Path $PWD "request.json"
+[System.IO.File]::WriteAllText($bodyPath, $bodyJson, [System.Text.UTF8Encoding]::new($false))
+
+curl.exe -X POST http://127.0.0.1:8080/v1/tts `
+  -H "Content-Type: application/json; charset=utf-8" `
+  --data-binary "@$bodyPath" `
+  -o output.wav
+
+Remove-Item $bodyPath
+```
+
+### Raw PCM
+
+```bash
+curl -D pcm-headers.txt \
+  -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Raw PCM request.","format":"pcm"}' \
+  -o output.pcm
+```
+
+Raw PCM is mono signed 16-bit little-endian. The response header `X-Sample-Rate` contains the actual codec output rate; do not assume 44.1 kHz.
+
+### OpenAI-style and legacy aliases
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"OpenAI-style request.","response_format":"wav"}' \
+  -o output.wav
+
+curl -X POST http://127.0.0.1:8080/synthesize \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Legacy endpoint.","format":"wav"}' \
+  -o output.wav
+```
+
+### Long-form HTTP request
+
+`chunk_length` is per request and uses visible Unicode characters. `max_new_tokens` is also applied per generated chunk and is still clamped to the real model context.
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"A long passage goes here...","format":"wav","segment":true,"chunk_length":300,"min_chunk_length":50,"condition_on_previous_chunks":true,"max_new_tokens":1024}' \
+  -o long.wav
+```
+
+The API still has a 1 MiB limit for `text` in a single request. Long-form mode keeps inference memory/context bounded; it does not remove the request-size limit.
+
+### Deterministic request
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Repeatable sampling request.","format":"wav","seed":123456,"temperature":0.7,"top_p":0.7,"top_k":30}' \
+  -o seeded.wav
+```
+
+`seed: 0` or Fish-style `seed: null` uses a random seed. A nonzero `uint64` seed uses the deterministic sampler path; backend floating-point differences can still affect exact cross-backend output.
+
+### Reference voice without saving a profile
+
+`reference_audio` is a path on the **server machine**, not an uploaded file. The decoded reference is limited to 30 seconds after resampling, and `prompt_text` must match that reference.
+On Windows JSON, use forward slashes (`C:/voices/ref.wav`) or escape backslashes (`C:\\voices\\ref.wav`).
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Clone this voice.","reference_audio":"/local/path/reference.wav","prompt_text":"Exact transcript."}' \
+  -o cloned.wav
+```
+
+### Saved voice API
+
+```bash
+# Save
+curl -X POST http://127.0.0.1:8080/v1/voices/narrator \
+  -H 'Content-Type: application/json' \
+  -d '{"audio_path":"/local/path/reference.wav","transcript":"Reference transcript."}'
+
+# List
+curl http://127.0.0.1:8080/v1/voices
+
+# Inspect
+curl http://127.0.0.1:8080/v1/voices/narrator
+
+# Use the native field
+curl -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Use the saved narrator voice.","voice":"narrator","format":"wav"}' \
+  -o narrator.wav
+
+# Fish-style alias for the same saved voice
+curl -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Same saved voice.","reference_id":"narrator","format":"wav"}' \
+  -o narrator-fish.wav
+
+# Delete
+curl -X DELETE http://127.0.0.1:8080/v1/voices/narrator
+```
+
+### Request fields
+
+Most synthesis fields inherit the CLI value that was used to start the server. JSON only overrides that one request.
+
+A normal request can stay small:
+
+```json
+{
+  "text": "Hello from the local API.",
+  "format": "wav",
+  "segment": true,
+  "chunk_length": 300,
+  "condition_on_previous_chunks": true,
+  "voice": "narrator"
+}
+```
+
+<details>
+<summary><strong>Complete HTTP/WebSocket synthesis field reference</strong></summary>
+
+| JSON field | Where | Meaning |
+|---|---|---|
+| `text` / `input` | HTTP + WS | Text to synthesize. At least one is required. If both are sent they must match. Max 1 MiB. |
+| `voice` / `reference_id` | HTTP + WS | Saved `.s2voice` ID, max 128 chars: ASCII letters, digits, `_`, `-`. If both are sent they must match. `reference_id: null` means no saved reference. |
+| `reference_audio` | HTTP + WS | Server-local WAV/MP3 path (max 32768 bytes) for direct cloning. Requires `prompt_text`; decoded reference max 30 s. |
+| `prompt_text` | HTTP + WS | Exact transcript for `reference_audio`, max 1 MiB. |
+| `segment` | HTTP + WS | Override sentence segmentation for this request. |
+| `temperature` | HTTP + WS | Sampling temperature, `0..10`; `0` is greedy. |
+| `top_p` | HTTP + WS | Nucleus threshold `(0,1]`. |
+| `top_k` | HTTP + WS | Top-k cutoff `0..1000000`. |
+| `seed` | HTTP + WS | `0`/`null` = random; nonzero uint64 = deterministic request seed. |
+| `repetition_penalty` | HTTP + WS | Explicit repetition penalty `1.0..10.0`; `1.0` disables it. |
+| `repetition_window` | HTTP + WS | Recent-token window `0..32768`. |
+| `multi_turn_history` | HTTP + WS | Explicit prior text→VQ turns to retain, `0..1024`. |
+| `threads` | HTTP + WS | CPU thread count `1..256`. |
+| `max_tokens` / `max_new_tokens` | HTTP + WS | Generation budget `1..32768`. If both are sent they must agree. Fish `max_new_tokens: 0` means no explicit Fish limit and is still context-clamped. |
+| `max_seg_tokens` | HTTP + WS | Per-segment generation cap `1..32768` when sentence segmentation is active. |
+| `min_end_tokens` | HTTP + WS | `0..32768`; minimum generated tokens before EOS and must remain below effective generation budget. |
+| `ras_window` | HTTP + WS | RAS recent-token window `0..32768`; `0` disables the window. |
+| `ras_temp` | HTTP + WS | RAS resample temperature `0..10`. |
+| `ras_top_p` | HTTP + WS | RAS resample top-p `(0,1]`. |
+| `min_seg_chars` | HTTP + WS | Minimum visible characters used when merging sentence pieces, `0..1000000`. |
+| `chunk_length` | HTTP + WS | Long-form chunk target: `0` off, otherwise `100..300` visible Unicode characters. |
+| `min_chunk_length` | HTTP + WS | Long-form minimum `0..100`; nonzero requires `chunk_length`. |
+| `condition_on_previous_chunks` | HTTP + WS | Keep bounded automatic VQ/acoustic context between long-form chunks. |
+| `prosody.volume` | HTTP + WS | Output gain `-20..20` dB, applied after final trim. |
+| `prosody.speed` | HTTP + WS | Only `1.0` is currently implemented. Other values are rejected. |
+| `latency` | HTTP + WS | Only `"normal"` is currently implemented; `balanced`/`low` are rejected. |
+| `codec_chunk` | HTTP + WS | Codec decode frame cap, `>=0`; `0` = automatic. |
+| `codec_overlap` | HTTP + WS | Codec history/holdback override, `>=0`; `0` = automatic. |
+| `trim_silence` | HTTP + WS | Trim only the real final trailing silence. |
+| `streaming` | HTTP + WS | Route-consistency flag: HTTP accepts omitted/`false`; WS accepts omitted/`true`. Other route combinations are rejected. |
+| `format` / `response_format` | HTTP only | `wav` or `pcm`, default `wav`. If both are sent they must agree. |
+| `stream_stride` | WS only | `-1` = segment-boundary streaming, `0` = automatic 4-frame cadence, `1..32768` = explicit frame cadence. |
+
+Fish fields that would change output but are not implemented are rejected instead of ignored. This includes non-empty `references`, `early_stop_threshold`, `normalize`, `sample_rate`, `mp3_bitrate`, `opus_bitrate`, `use_memory_cache`, `prosody.normalize_loudness`, `latency` modes `balanced`/`low`, and `prosody.speed` values other than `1.0`.
+
+WebSocket always returns framed PCM, so `format`/`response_format` are rejected there. Buffered HTTP does not use `stream_stride`, so that field is rejected on HTTP.
+
+</details>
+
+### HTTP status behavior
+
+The main synthesis routes use these status classes:
+
+- `200`: synthesis succeeded
+- `400`: malformed JSON, wrong field type/range, incompatible aliases, unsupported format/semantic field, invalid voice ID, etc.
+- `404`: a syntactically valid saved voice ID does not exist
+- `413`: JSON request body exceeds 8 MiB
+- `500`: model/codec/storage/runtime failure after request validation, including corrupt/unreadable saved voice data
+
+### Request-size note
+
+JSON bodies/messages above 8 MiB are rejected, and `text`/`prompt_text` are each limited to 1 MiB.
+
+Crow 1.3.3 has already buffered the HTTP body by the time the route-level 8 MiB check runs. If you expose the server outside localhost and need a real pre-buffer HTTP body limit, put a reverse proxy in front of it and enforce the limit there.
+
+The server enables `CROW_ENFORCE_WS_SPEC`, so normal RFC 6455 client masking rules are enforced.
+
+## WebSocket streaming
+
+Connect to:
+
+```text
+ws://127.0.0.1:8080/ws/tts
+```
+
+For example with `websocat`:
+
+```bash
+websocat ws://127.0.0.1:8080/ws/tts
+# Send one text message:
+# {"text":"Streaming request.","segment":true,"stream_stride":0}
+```
+
+Binary messages use:
+
+```text
+[2-byte little-endian flags][PCM int16 little-endian samples]
+```
+
+`flags & 1` marks the final output boundary. When synthesis finishes, a JSON text message reports `done`, `segments`, and `sample_rate`.
+
+`segments` counts text segments, not PCM packets.
+
+Streaming decode keeps left context and a small right-edge holdback so it does not decode each stride as an unrelated clip. The final holdback is flushed at the end.
+
+Useful controls:
+
+| Option / JSON field | Default | Meaning |
+|---|---:|---|
+| `--stream-decode-stride` / `stream_stride` | `0` | `0` = auto (4 frames), `-1` = no stride streaming, positive = explicit cadence |
+| `--codec-chunk` / `codec_chunk` | `0` | `0` = automatic bounded window; positive = cap codec frames per decode |
+| `--codec-overlap` / `codec_overlap` | `0` | `0` = automatic codec history/holdback; positive = manual override |
+
+Smaller codec windows can reduce peak memory, but going too small can hurt continuity at chunk boundaries.
+
+If a WebSocket disconnects, stride streaming checks the connection on every semantic frame and stops promptly. With `--stream-decode-stride -1`, cancellation happens at text-segment boundaries because that path does not expose frame callbacks.
+
+## CLI reference
+
+All backend executables use the same CLI. The backend changes what the device selectors point to, not the option names.
+
+The common modes are simple:
+
+- `s2 --help`: show help
+- `s2 --list-voices`: list saved voices without loading model/codec
+- `s2 ... --output out.wav`: one-shot synthesis
+- `s2 ... --voice ID --prompt-audio ref.wav --prompt-text "..." --save-voice`: save a voice
+- `s2 [options]`: start the HTTP/WebSocket server
+
+<details>
+<summary><strong>Complete command-line option list</strong></summary>
+
+### Models and devices
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `-m <path>`, `--model <path>` | `model.gguf` | Transformer/full GGUF |
+| `--model-codec <path>` | `codec.gguf` | Codec/full GGUF |
+| `-t <path>`, `--tokenizer <path>` | embedded in release builds when available | External tokenizer JSON |
+| `-v <N>`, `--vulkan <N>` | `-1` | Transformer device: `-1` CPU, `0+` compiled GPU backend |
+| `--codec-vulkan <N>` | `-2` | Codec: `-2` follow transformer, `-1` CPU, `0+` GPU |
+
+### Server
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `-p <N>`, `--port <N>` | `8080` | TCP port `1..65535` |
+| `--host <IP>` | `127.0.0.1` | IPv4/IPv6 address literal; hostnames are not accepted |
+
+### Input/output
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `--text <text>` | empty | One-shot text, max 1 MiB |
+| `-o <path>`, `--output <path>` | none | Write WAV and exit instead of starting the server |
+| `--trim-silence` | off | Trim trailing silence at the real end of the request |
+| `--no-trim-silence` | off | Explicitly disable trailing trim |
+
+### Voice/reference
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `-pa <path>`, `--prompt-audio <path>` | none | WAV/MP3 reference, max 30 s after resample; requires `--prompt-text` |
+| `-pt <text>`, `--prompt-text <text>` | empty | Exact reference transcript, max 1 MiB |
+| `--voice <id>` | none | Load a saved profile |
+| `--save-voice` | off | Save the current explicit reference as `--voice` |
+| `--voice-dir <path>` | `voices/` | Voice profile directory |
+| `--list-voices` | off | List profiles and exit before model initialization |
+
+### Generation and chunking
+
+| Argument | Default | Meaning |
+|---|---:|---|
+| `-threads <N>`, `--threads <N>` | `4` | CPU threads, `1..256` |
+| `--max-tokens <N>` | `1024` | Generation budget, `1..32768` |
+| `--segment` | off | Unicode-aware sentence segmentation |
+| `--max-seg-tokens <N>` | `300` | Segment budget, `1..32768` |
+| `--min-seg-chars <N>` | `0` | Merge very short segments, `0..1000000` |
+| `--chunk-length <N>` | `0` | Long-form chunks; `0` off, otherwise `100..300` visible characters |
+| `--min-chunk-length <N>` | `0` | Minimum long-form chunk, `0..100`; requires chunking |
+| `--condition-on-previous-chunks` | on | Keep bounded automatic context between chunks |
+| `--no-condition-on-previous-chunks` | off | Disable automatic chunk-to-chunk context |
+| `--prosody-volume <dB>` | `0` | Output gain, `-20..20` dB |
+
+### Sampling
+
+| Argument | Default | Meaning |
+|---|---:|---|
+| `--temperature <F>`, `--temp <F>` | `0.7` | `0..10`; `0` = greedy |
+| `--top-p <F>` | `0.7` | `(0,1]` |
+| `--top-k <N>` | `30` | `0..1000000` |
+| `--min-end-tokens <N>` | `64` | Minimum tokens before EOS, `0..32768`, less than `--max-tokens` |
+| `--seed <uint64>` | `0` | `0` random; nonzero reproducible |
+| `--repetition-penalty <F>` | `1.0` | `1.0..10.0`; `1.0` disables it |
+| `--repetition-window <N>` | `64` | Recent-token window, `0..32768` |
+
+### Conversation/startup
+
+| Argument | Default | Meaning |
+|---|---:|---|
+| `--multi-turn-history <N>` | `0` | Explicit text→VQ turns to retain, `0..1024` |
+| `--warmup` | off | Short isolated model+codec warmup at startup |
+
+### RAS
+
+| Argument | Default | Meaning |
+|---|---:|---|
+| `--ras-window <N>` | `10` | Recent-token repetition window, `0..32768`; `0` disables it |
+| `--ras-temp <F>` | `1.0` | RAS temperature, `0..10` |
+| `--ras-top-p <F>` | `0.9` | RAS top-p, `(0,1]` |
+
+### Codec/streaming
+
+| Argument | Default | Meaning |
+|---|---:|---|
+| `--codec-chunk <N>` | `0` | `0` automatic; positive values cap frames per codec decode |
+| `--codec-overlap <N>` | `0` | `0` automatic history/holdback; positive = override |
+| `--stream-decode-stride <N>` | `0` | `-1` off, `0` auto 4-frame cadence, positive = explicit cadence |
+
+### Help
+
+| Argument | Meaning |
+|---|---|
+| `-h`, `--help` | Print help and exit |
+
+A few option interactions are worth knowing:
+
+- `--prompt-audio` requires non-empty `--prompt-text`.
+- Explicit `--prompt-audio` takes priority over a saved `--voice`.
+- `--save-voice` needs `--voice`, `--prompt-audio`, and `--prompt-text`.
+- `--min-end-tokens` must be lower than `--max-tokens`.
+- `--codec-vulkan -2` follows the transformer device.
+- `--host` accepts IP address literals, not DNS names.
+- Floating-point sampling options reject NaN/Inf.
+- `--list-voices` does not load the model, codec, or GPU backend.
+- `--output` always writes WAV. Raw PCM is only exposed by HTTP/WebSocket.
+
+</details>
+
+## A few useful CLI examples
+
+Here too, `s2` is shorthand for the backend-specific executable from the Quick start.
+
+Read a long file from stdin:
+
+```bash
+cat article.txt | s2 \
+  --model model.gguf --model-codec codec.gguf \
+  --segment --max-seg-tokens 300 --min-seg-chars 60 \
+  --output article.wav
+```
+
+Transformer on GPU 0, codec on CPU:
+
+```bash
+s2 --model model.gguf --model-codec codec.gguf \
+  -v 0 --codec-vulkan -1 \
+  --text "GPU transformer, CPU codec." \
+  --output mixed.wav
+```
+
+Lower codec peak memory while keeping automatic overlap:
+
+```bash
+s2 --model model.gguf --model-codec codec.gguf \
+  -v 0 --codec-vulkan 0 \
+  --codec-chunk 32 --codec-overlap 0 \
+  --segment --max-seg-tokens 300 \
+  --text "A longer synthesis request." \
+  --output low-vram.wav
+```
+
+Run `s2 --help` for the same option reference directly from the binary.
+
+## Concurrency and network safety
+
+Crow handles network connections concurrently, but model inference is serialized around the shared model/codec/KV state. Two TTS requests can be connected at once, but they do not run inference through the same mutable pipeline at the same time.
+
+The server binds to localhost because reference/voice endpoints can read paths from the machine running `s2`. If you bind to another interface, add authentication/access control in front of it before exposing it to an untrusted network.
+
+For public or LAN-facing deployments, a reverse proxy is also the right place to enforce a true pre-buffer HTTP body limit.
+
+## Build
+
+If you are using a release artifact, you can skip this section.
+
+You need:
+
+- CMake 3.15+
+- a C++17 compiler
+- the `ggml` submodule
+- Crow and standalone Asio
+- Vulkan SDK/runtime for Vulkan builds
+- NVIDIA driver + CUDA toolkit for CUDA builds
+- Xcode command-line tools for Metal builds
+
+Clone with submodules:
 
 ```bash
 git clone --recurse-submodules https://github.com/mach92432/s2.cpp.git
 cd s2.cpp
 ```
 
-If the repository was already cloned without submodules:
+If you already cloned it without submodules:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-### CPU only
+### CPU
 
 ```bash
-cmake -B build-cpu -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release \
   -DS2_VULKAN=OFF -DS2_CUDA=OFF -DS2_METAL=OFF
 cmake --build build-cpu --parallel
 ```
 
-### With Vulkan GPU support
+### Vulkan
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DS2_VULKAN=ON
-cmake --build build --parallel $(nproc)
+cmake -S . -B build-vulkan -DCMAKE_BUILD_TYPE=Release \
+  -DS2_VULKAN=ON -DS2_CUDA=OFF -DS2_METAL=OFF
+cmake --build build-vulkan --parallel
 ```
 
-The binary is produced at `build/s2`.
-
-### With CUDA GPU support
+### CUDA
 
 ```bash
-cmake -B build-cuda -DCMAKE_BUILD_TYPE=Release -DS2_CUDA=ON
+cmake -S . -B build-cuda -DCMAKE_BUILD_TYPE=Release \
+  -DS2_CUDA=ON -DS2_VULKAN=OFF -DS2_METAL=OFF
 cmake --build build-cuda --parallel
 ```
 
-### With Metal GPU support (macOS only)
+Do not force one CUDA architecture unless you have a specific deployment reason. GGML manages the supported architecture list.
+
+### Metal
 
 ```bash
-cmake -B build-metal -DCMAKE_BUILD_TYPE=Release -DS2_METAL=ON \
+cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release \
+  -DS2_METAL=ON -DS2_VULKAN=OFF -DS2_CUDA=OFF \
   -DGGML_METAL_EMBED_LIBRARY=ON
 cmake --build build-metal --parallel
 ```
 
-Only one GPU backend should be enabled in a build directory. Prefer separate build directories (`build-cpu`, `build-vulkan`, `build-cuda`, `build-metal`) so cached CMake options cannot leak between artifacts.
+Local CMake builds create `s2` (`s2.exe` on Windows). Release jobs rename/package it for each backend.
 
----
+Windows release builds use `/MT` for the normal MSVC CRT. OpenMP is separate: GGML may still require `VCOMP140.DLL`, so a current Microsoft Visual C++ v14 x64 Redistributable can still be needed. CI checks imports with `dumpbin` instead of assuming `/MT` makes every runtime static.
 
-## Usage
+## Backend notes
 
-### Basic server launch for GPU Vulkan (ex: Nvidia)
+A few implementation details are useful when debugging backend-specific problems:
 
-Put model.gguf (or link) in s2.cpp directory
+- CUDA K-quant embedding fallback dequantizes only the rows actually used instead of expanding a full embedding table.
+- Codec K-quant conversion is limited to operations that need it. Supported linear/attention tensors stay quantized.
+- Metal uses an explicit finite F32 causal mask when the active backend is Metal, avoiding the unsupported `DIAG_MASK_INF` path.
+- Codec/model fallback logs report the backend that initialized.
+- Streaming and offline chunked decode keep left context, right-edge holdback, exact frame-to-sample geometry, and a final flush.
+- `--codec-overlap 0` means automatic codec-derived history, not “no overlap”.
 
-Put codec.gguf (or link) in s2.cpp directory
+## Validation
 
-Only for cloning put reference.wav and reference.txt in s2.cpp directory
+The source tree used for the V7.5 package was checked locally with:
 
-```bash
-build/s2 -v 0 --codec-vulkan 0 --model-codec codec.gguf --port 8081
+- strict C++17 warning/syntax passes for CPU, Vulkan, CUDA, and Metal variants
+- Clang Static Analyzer on model/codec/pipeline code
+- ASan + UBSan regression tests for sampler, Unicode splitting, JSON surrogate handling, WAV I/O, prompt history, and tokenizer behavior
+- tokenizer differential tests across multilingual/emoji/RTL cases
+- root CMake plus both Windows-generated CMake files
+- strict YAML parsing and CI invariant checks
+- CUDA launcher/bundler manifest tests
+- README/`--help` CLI/API/route/cURL synchronization checks
+- clean ZIP re-extraction and byte/hash comparison
+
+These checks are useful, but they are not the same thing as running every native compiler/driver combination. GitHub Actions and real Windows/macOS hardware are still the final check for MSVC, CUDA, Vulkan, Metal, driver behavior, and numerical output.
+
+## Known limitations
+
+- Still alpha software.
+- Fish Audio/OpenAI API compatibility is partial, not drop-in.
+- No batch inference.
+- One shared inference pipeline means TTS requests are serialized.
+- HTTP WAV/PCM is returned after synthesis finishes. Use WebSocket for incremental playback.
+- Voice quality depends heavily on reference quality and transcript accuracy.
+- Very aggressive quantization, tiny codec history, or tiny codec chunks can save memory at the cost of quality.
+- Classic RIFF limits incremental WAV output to about 4 GiB of audio data. RF64 is not implemented.
+- Backends and drivers can behave differently across machines. Test the hardware you intend to deploy.
+
+## Project layout
+
+```text
+include/                         Public C++ headers
+src/                             Tokenizer, model, codec, generation, pipeline, server/CLI
+third_party/                     Header-only/support dependencies
+ggml/                            GGML submodule
+.github/workflows/               Multi-backend CI
+patch-cmake.ps1                  Windows CPU/Vulkan CI CMake preparation
+patch-cmake-cuda.ps1             Windows CUDA CI CMake preparation
+CMakeLists.txt                   Root CMake project
 ```
-
-`--model model.gguf` to specify the path to a GGUF model (default model.gguf)
-`--model-codec codec.gguf` to specify the path to a GGUF model for 'codec' processing only. By default, it's the model specified by '--model' or 'model.gguf'.
-`-v 0` selects the first device of the GPU backend compiled into that executable (Vulkan/CUDA; Metal exposes device 0).
-`--codec-vulkan 0` selects the first GPU device for the audio codec. The name is kept for compatibility, but it also works in CUDA builds; Metal maps any GPU selection to device 0. Omit it to inherit the transformer device, or pass `--codec-vulkan -1` to force the codec to CPU.
-`--host 127.0.0.1` is the default bind address. Use `--host 0.0.0.0` only when LAN access is intentional.
-`--port 8081` selects the listening port.
-`--help` shows the complete option list.
-
-### GPU inference via Vulkan with curl
-
-```bash
-curl -X POST http://localhost:8081/v1/tts \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer dummy" \
-  -d "{\"text\":\"[emphasis] Bonjour Bob ! [pause] Je suis bien là, mais il semble y avoir une petite confusion : je ne suis pas Samantha. Je suis **Anna** (ou **Anaïs**, selon l'humeur du jour !). [laughing] Je suis parfaitement réveillée et prête à t'aider. Que souhaites-tu faire ?\",\"format\":\"wav\"}" \
-  -o output.wav
-```
-
-The server binds to `127.0.0.1` by default. This matters because reference/voice-management endpoints can be given local audio paths. If you opt in to `--host 0.0.0.0`, place the service behind an access-control layer before using it on an untrusted LAN or the public Internet.
-
-### Common options
-
-| Flag | Default | Description |
-|---|---:|---|
-| `-v`, `--vulkan <N>` | `-1` | Transformer backend device. `-1` = CPU; `0+` = compiled GPU backend device. |
-| `--codec-vulkan <N>` | `-2` (inherit) | Codec device. `-2` inherits transformer device, `-1` forces CPU, `0+` selects the compiled GPU backend device (Metal normalizes to 0). |
-| `--host <IP>` | `127.0.0.1` | Server bind address. Use `0.0.0.0` only for intentional LAN exposure. |
-| `--port <N>` | `8080` | HTTP/WebSocket listening port. |
-| `--segment` | off | Split long text before generation. |
-| `--codec-chunk <N>` | `0` (auto) | Codec frames per decode call. |
-| `--codec-overlap <N>` | `0` | Context overlap used for codec chunk/stream boundaries. |
-| `--stream-decode-stride <N>` | `0` (auto = 4) | Streaming decode stride; negative disables stride mode. |
-| `--voice <id>` | — | Reuse a saved `.s2voice` profile. |
-| `--save-voice` | off | Encode/save `--prompt-audio` + `--prompt-text` as `--voice` and exit unless `--output` is also supplied. |
-| `--output <path>` | — | One-shot CLI synthesis to WAV; no server is started. |
-
-Run `s2 --help` for the complete set of sampling, segmentation, RAS, reference-audio and generation-limit options.
-
----
-
-
-## Benchmark
-
-For speed, we don't recommend using the CPU for the codec. Using the CPU for the codec doubles the total processing time.
-
-I suggest choosing transformer and codec quantized version that can fit in the allocated VRAM. Only a few hundred MB will be used extra during inference. It's possible to use two GPUs.
-
-The audio generation speed is approximately 0.8x on an RTX3090 (RTF 1.3).
-
-The speed is roughly the same regardless of the model.
-
-The sound quality remains acceptable for the smallest model .
-
-Voice cloning works correctly.
-
-Tags may be less respected with high levels of quantization.
-
-Generating short texts often results in artifacts at the end. Whenever possible, long texts should be split into segments of at least 90 characters.
-
----
-
-## Architecture notes
-
-S2 Pro uses a **Dual-AR** architecture:
-
-- **Slow-AR** — a 36-layer Qwen3-based transformer (4.13B params) that processes the full token sequence with GQA (32 heads, 8 KV heads), RoPE at 1M base, QK norm, and a persistent KV cache
-- **Fast-AR** — a 4-layer transformer (0.42B params) that autoregressively generates 10 acoustic codebook tokens from the Slow-AR hidden state for each semantic step
-- **Audio codec** — a convolutional encoder/decoder with residual vector quantization (RVQ, 10 codebooks × 4096 entries) that converts between audio waveforms and discrete codes
-
-Total: ~4.56B parameters.
-
----
-
-## Implementation notes
-
-The C++ engine (`src/`) is built entirely on [ggml](https://github.com/ggml-org/ggml) include in this code. Key design decisions:
-
-- **Reference audio caching** — the optional global `reference.wav`/`reference.txt` pair is prepared at startup; per-request reference files are encoded on demand and cached by path plus file fingerprint.
-- **Separate persistent `gallocr` allocators** for Slow-AR and Fast-AR — each path keeps its own compute buffer, avoiding memory re-planning per token
-- **Temporary prefill allocator** — freed immediately after prefill, so the large compute buffer does not persist into the generation loop
-- **Independent model/codec placement** — transformer and codec may use different devices. The codec defaults to inheriting the transformer device (`-2` internally); `--codec-vulkan -1` explicitly forces CPU.
-- **posix_fadvise(DONTNEED)** after weight loading on supported POSIX systems — advises the kernel that model-file pages are no longer needed once weights have been copied to their backend buffers
-- **Correct ByteLevel tokenization** — the GPT-2 byte-to-unicode table is applied before BPE, producing token IDs identical to the HuggingFace reference tokenizer
-
----
-
-## Known limitations (alpha)
-
-- HTTP WAV/PCM responses are returned after the requested synthesis finishes; low-latency incremental PCM is available separately through WebSocket `/ws/tts`.
-- Inference is serialized through one shared pipeline/model instance, so concurrent HTTP/WebSocket requests queue rather than execute model inference in parallel.
-- No batch inference
-- Voice cloning quality depends heavily on reference audio length and SNR
-- Windows CPU/Vulkan/CUDA and macOS Metal builds have CI jobs, but target-hardware behavior still needs validation on the GPUs/OS versions you intend to support.
-- Only Nvidia GPUs were tested with Vulkan. Other Vulkan-compatible GPUs were not tested.
-
----
 
 ## License
 
-The model weights and associated materials are licensed under the **Fish Audio Research License**. Key points:
+Fish Audio S2 Pro model weights and related Fish Audio materials use the **Fish Audio Research License**. See [LICENSE.md](LICENSE.md) for the terms and attribution requirements.
 
-- **Research and non-commercial use:** free, under the terms of this Agreement
-- **Commercial use:** requires a separate written license from Fish Audio
-- When distributing, you must include a copy of the license and the attribution notice
-- Attribution: *"This model is licensed under the Fish Audio Research License, Copyright © 39 AI, INC. All Rights Reserved."*
+Commercial licensing information is available from [Fish Audio](https://fish.audio/).
 
-Full license: [LICENSE.md](LICENSE.md)
-
-Commercial licensing: [https://fish.audio](https://fish.audio) · [business@fish.audio](mailto:business@fish.audio)
-
-The inference engine source code (`src/`) is a Derivative Work of the Fish Audio Materials as defined in the Agreement and is distributed under the same Fish Audio Research License terms.
+This repository is derived from the Fish Audio/S2 ecosystem and [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp). Check the upstream and model licenses before redistribution or commercial deployment.

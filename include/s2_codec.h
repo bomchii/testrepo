@@ -43,8 +43,9 @@ public:
     bool decode(const int32_t * codes, int32_t n_frames, int32_t n_threads,
                 std::vector<float> & audio_out);
 
-    // Igual que decode() pero en chunks para evitar OOM en GPUs con VRAM limitada.
-    // chunk_frames=0 → tamaño automático (~120 frames).
+    // Igual que decode() pero en ventanas acotadas para evitar OOM en GPUs con
+    // VRAM limitada. Solo compromete el centro estable de cada ventana.
+    // chunk_frames=0 -> tamaño automático; overlap_frames=0 -> historial del codec.
     bool decode_chunked(const int32_t * codes, int32_t n_frames, int32_t n_threads,
                         std::vector<float> & audio_out, int32_t chunk_frames = 0,
                         int32_t overlap_frames = 0);
@@ -55,6 +56,11 @@ public:
     int32_t semantic_codebook_size()   const { return semantic_codebook_size_; }
     int32_t residual_codebook_size()   const { return residual_codebook_size_; }
     int32_t max_decode_frames()        const { return max_decode_frames_; }
+    // Exact temporal mapping used by streaming/chunked decode. One public VQ
+    // code frame expands by hop_length * quantizer_downsample_factor samples.
+    int32_t samples_per_code_frame()     const { return samples_per_code_frame_; }
+    // Left context / right holdback recommended for stable decoder boundaries.
+    int32_t streaming_history_frames()   const { return streaming_history_frames_; }
     std::string backend_name() const;
 
     // Model state (opaque, holds all codec tensors)
@@ -69,6 +75,8 @@ private:
     int32_t semantic_codebook_size_   = 4096;
     int32_t residual_codebook_size_   = 4096;
     int32_t max_decode_frames_        = 0;
+    int32_t samples_per_code_frame_   = 2048;
+    int32_t streaming_history_frames_ = 160;
 };
 
 } // namespace s2

@@ -28,6 +28,7 @@ public:
 
     void set_storage_dir(const std::string & dir);
     bool save(const std::string & voice_id, const VoiceProfile & profile);
+    bool exists(const std::string & voice_id) const;
     VoiceProfile load(const std::string & voice_id);
     bool remove(const std::string & voice_id);
     std::vector<std::string> list() const;

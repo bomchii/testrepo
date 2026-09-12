@@ -1,6 +1,28 @@
 # patch-cmake.ps1
 # Parchea los CMake files para compilar s2.cpp en Windows con MSVC.
-# OpenSSL se instala en un step previo del workflow via Chocolatey.
+# Crow se compila sin CROW_ENABLE_SSL; este build no depende de OpenSSL.
+
+$ErrorActionPreference = "Stop"
+
+function Invoke-DownloadWithRetry {
+    param([Parameter(Mandatory=$true)][string]$Uri,
+          [Parameter(Mandatory=$true)][string]$OutFile,
+          [int]$Attempts = 3)
+    for ($attempt = 1; $attempt -le $Attempts; ++$attempt) {
+        try {
+            if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
+            Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+            if (-Not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -le 0) {
+                throw "download produced an empty file: $OutFile"
+            }
+            return
+        } catch {
+            if ($attempt -eq $Attempts) { throw }
+            Write-Warning "Download failed (attempt $attempt/$Attempts): $($_.Exception.Message)"
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
+}
 
 Write-Host "=== Parcheando CMake files para Windows ==="
 
@@ -22,18 +44,24 @@ if (-Not (Test-Path $crowFile) -or -Not $crowVersionOk) {
     if (Test-Path $crowDir) { Remove-Item $crowDir -Recurse -Force }
     Write-Host "Descargando Crow v$($crowVersion) source tarball..."
     $crowTar = "$depsDir\crow.tar.gz"
-    Invoke-WebRequest `
+    Invoke-DownloadWithRetry `
         -Uri "https://github.com/CrowCpp/Crow/archive/refs/tags/v$crowVersion.tar.gz" `
-        -OutFile $crowTar -UseBasicParsing
-    # Extraer con tar (disponible en Windows 10+ y en todos los runners de GitHub)
-    New-Item -ItemType Directory -Force -Path "$depsDir\crow-extracted" | Out-Null
-    tar -xzf $crowTar -C "$depsDir\crow-extracted"
+        -OutFile $crowTar
+    # Extraer con tar (disponible en Windows 10+ y en los runners hospedados).
+    $crowExtracted = "$depsDir\crow-extracted"
+    if (Test-Path $crowExtracted) { Remove-Item $crowExtracted -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $crowExtracted | Out-Null
+    tar -xzf $crowTar -C $crowExtracted
+    if ($LASTEXITCODE -ne 0) { throw "tar failed while extracting Crow (exit $LASTEXITCODE)" }
     # El tarball extrae como Crow-1.3.3/include/crow/
     $crowSrc = "$depsDir\crow-extracted\Crow-$crowVersion\include"
     if (-Not (Test-Path $crowSrc)) {
         # Fallback: buscar include/ en cualquier subdirectorio
-        $crowSrc = Get-ChildItem "$depsDir\crow-extracted" -Recurse -Filter "crow.h" |
+        $crowSrc = Get-ChildItem "$depsDir\crow-extracted" -Recurse -Filter "crow.h" -ErrorAction SilentlyContinue |
                    Select-Object -First 1 -ExpandProperty DirectoryName
+    }
+    if (-Not $crowSrc -or -Not (Test-Path (Join-Path $crowSrc "crow.h"))) {
+        throw "Crow archive layout is invalid: include/crow.h was not found"
     }
     New-Item -ItemType Directory -Force -Path $crowDir | Out-Null
     Copy-Item "$crowSrc\*" $crowDir -Recurse -Force
@@ -55,18 +83,23 @@ if (-Not (Test-Path $asioFile) -or -Not $asioVersionOk) {
     if (Test-Path $asioDir) { Remove-Item $asioDir -Recurse -Force }
     Write-Host "Descargando Asio $asioVersion..."
     $asioZip = "$depsDir\asio.zip"
-    Invoke-WebRequest `
+    Invoke-DownloadWithRetry `
         -Uri "https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.zip" `
-        -OutFile $asioZip -UseBasicParsing
-    Expand-Archive -Path $asioZip -DestinationPath "$depsDir\asio-extracted" -Force
-    $asioSrc = "$depsDir\asio-extracted\asio-asio-1-30-2\asio\include"
+        -OutFile $asioZip
+    $asioExtracted = "$depsDir\asio-extracted"
+    if (Test-Path $asioExtracted) { Remove-Item $asioExtracted -Recurse -Force }
+    Expand-Archive -Path $asioZip -DestinationPath $asioExtracted -Force
+    $asioSrc = "$asioExtracted\asio-asio-1-30-2\asio\include"
+    if (-Not (Test-Path (Join-Path $asioSrc "asio.hpp"))) {
+        throw "Asio archive layout is invalid: asio/include/asio.hpp was not found"
+    }
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
     Remove-Item $asioZip -Force
     Set-Content -Path $asioMarker -Value $asioVersion -Encoding ASCII
     # Reemplazar asio/ssl.hpp y asio/ssl/ con stubs vacíos.
-    # Crow puede incluir asio/ssl.hpp aunque CROW_ENABLE_SSL=0 esté definido,
-    # porque algunos headers de Crow lo incluyen antes de que la macro sea visible.
+    # Crow puede alcanzar asio/ssl.hpp por el orden de inclusion de algunos headers;
+    # los stubs garantizan un build HTTP/WebSocket sin OpenSSL.
     # Un stub vacío con include guard evita el error C1083 sin romper nada.
     $sslStubDir = "$asioDir\asio\ssl"
     New-Item -ItemType Directory -Force -Path $sslStubDir | Out-Null
@@ -150,7 +183,11 @@ endfunction()
 $opensslLinkBlock = ""
 
 $newCmake = @"
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.15)
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded" CACHE STRING "MSVC runtime library" FORCE)
 project(s2cpp LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -186,7 +223,7 @@ add_subdirectory(ggml)
 # ---------------------------------------------------------------------------
 # Crow: headers originales del source tarball (NO crow_all.h).
 # Los headers originales tienen #ifdef CROW_ENABLE_SSL, por lo que
-# definir CROW_ENABLE_SSL=0 evita completamente asio::ssl y OpenSSL.
+# NO definir CROW_ENABLE_SSL evita completamente asio::ssl y OpenSSL.
 # include_directories apunta a crow-include/ para que #include <crow/crow.h>
 # funcione, y tambien a crow-include/crow/ para que #include <crow.h> funcione.
 # ---------------------------------------------------------------------------
@@ -206,6 +243,8 @@ target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE)
 # ---------------------------------------------------------------------------
 set(S2_SOURCES
     src/s2_audio.cpp
+    src/s2_json.cpp
+    src/s2_text.cpp
     src/s2_tokenizer.cpp
     src/s2_sampler.cpp
     src/s2_model.cpp

@@ -64,6 +64,9 @@ struct GenerateParams {
     int32_t ras_window_size         = 10;
     float   ras_high_temp           = 1.0f;
     float   ras_high_top_p          = 0.9f;
+    uint64_t seed                    = 0;
+    float   repetition_penalty      = 1.0f;
+    int32_t repetition_window       = 64;
 };
 
 struct PipelineParams {
@@ -85,6 +88,12 @@ struct PipelineParams {
     int32_t codec_overlap_frames   = 0;
     int32_t max_tokens_per_segment = 300;
     int32_t min_seg_chars          = 0;
+    int32_t chunk_length           = 0;
+    int32_t min_chunk_length       = 0;
+    bool    condition_on_previous_chunks = true;
+    float   prosody_volume_db      = 0.0f;
+    int32_t multi_turn_history     = 0;
+    bool warmup                    = false;
     bool trim_silence = false;
     std::string voice_id;
     bool        save_voice        = false;
@@ -99,6 +108,16 @@ static int parse_int_arg(const char * raw) {
     const int parsed = std::stoi(value, &pos, 10);
     if (pos != value.size()) throw std::invalid_argument("trailing characters in integer: " + value);
     return parsed;
+}
+
+static uint64_t parse_u64_arg(const char * raw) {
+    if (!raw) throw std::invalid_argument("missing unsigned integer value");
+    const std::string value(raw);
+    if (value.empty() || value[0] == '-') throw std::invalid_argument("expected uint64: " + value);
+    size_t pos = 0;
+    const unsigned long long parsed = std::stoull(value, &pos, 10);
+    if (pos != value.size()) throw std::invalid_argument("trailing characters in uint64: " + value);
+    return static_cast<uint64_t>(parsed);
 }
 
 static float parse_float_arg(const char * raw) {
@@ -139,6 +158,16 @@ int parse_args(int argc, char** argv,
             params.codec_overlap_frames = parse_int_arg(argv[++i]);
         } else if (arg == "--min-seg-chars" && i + 1 < argc) {
             params.min_seg_chars = parse_int_arg(argv[++i]);
+        } else if (arg == "--chunk-length" && i + 1 < argc) {
+            params.chunk_length = parse_int_arg(argv[++i]);
+        } else if (arg == "--min-chunk-length" && i + 1 < argc) {
+            params.min_chunk_length = parse_int_arg(argv[++i]);
+        } else if (arg == "--condition-on-previous-chunks") {
+            params.condition_on_previous_chunks = true;
+        } else if (arg == "--no-condition-on-previous-chunks") {
+            params.condition_on_previous_chunks = false;
+        } else if (arg == "--prosody-volume" && i + 1 < argc) {
+            params.prosody_volume_db = parse_float_arg(argv[++i]);
         } else if ((arg == "--temperature" || arg == "--temp") && i + 1 < argc) {
             params.gen.temperature = parse_float_arg(argv[++i]);
         } else if (arg == "--top-p" && i + 1 < argc) {
@@ -147,6 +176,16 @@ int parse_args(int argc, char** argv,
             params.gen.top_k = parse_int_arg(argv[++i]);
         } else if (arg == "--min-end-tokens" && i + 1 < argc) {
             params.gen.min_tokens_before_end = parse_int_arg(argv[++i]);
+        } else if (arg == "--seed" && i + 1 < argc) {
+            params.gen.seed = parse_u64_arg(argv[++i]);
+        } else if (arg == "--repetition-penalty" && i + 1 < argc) {
+            params.gen.repetition_penalty = parse_float_arg(argv[++i]);
+        } else if (arg == "--repetition-window" && i + 1 < argc) {
+            params.gen.repetition_window = parse_int_arg(argv[++i]);
+        } else if (arg == "--multi-turn-history" && i + 1 < argc) {
+            params.multi_turn_history = parse_int_arg(argv[++i]);
+        } else if (arg == "--warmup") {
+            params.warmup = true;
         } else if (arg == "--ras-window" && i + 1 < argc) {
             params.gen.ras_window_size = parse_int_arg(argv[++i]);
         } else if (arg == "--ras-temp" && i + 1 < argc) {
@@ -298,6 +337,10 @@ int main() {
     { RunResult r = run({"--top-p","0.8"});              ok(r.rc==0 && feq(r.params.gen.top_p,0.8f), "--top-p sets gen.top_p"); }
     { RunResult r = run({"--top-k","40"});               ok(r.rc==0 && r.params.gen.top_k==40, "--top-k sets gen.top_k"); }
     { RunResult r = run({"--min-end-tokens","64"});      ok(r.rc==0 && r.params.gen.min_tokens_before_end==64, "--min-end-tokens sets gen.min_tokens_before_end"); }
+    { RunResult r = run({"--seed","18446744073709551615"}); ok(r.rc==0 && r.params.gen.seed==UINT64_MAX, "--seed accepts UINT64_MAX exactly"); }
+    { RunResult r = run({"--repetition-penalty","1.2"}); ok(r.rc==0 && feq(r.params.gen.repetition_penalty,1.2f), "--repetition-penalty sets gen.repetition_penalty"); }
+    { RunResult r = run({"--repetition-window","128"});  ok(r.rc==0 && r.params.gen.repetition_window==128, "--repetition-window sets gen.repetition_window"); }
+    { RunResult r = run({"--multi-turn-history","8"});  ok(r.rc==0 && r.params.multi_turn_history==8, "--multi-turn-history sets multi_turn_history"); }
     { RunResult r = run({"--ras-window","10"});          ok(r.rc==0 && r.params.gen.ras_window_size==10, "--ras-window sets gen.ras_window_size"); }
     { RunResult r = run({"--ras-temp","1.2"});           ok(r.rc==0 && feq(r.params.gen.ras_high_temp,1.2f), "--ras-temp sets gen.ras_high_temp"); }
     { RunResult r = run({"--ras-top-p","0.9"});          ok(r.rc==0 && feq(r.params.gen.ras_high_top_p,0.9f), "--ras-top-p sets gen.ras_high_top_p"); }
@@ -324,6 +367,7 @@ int main() {
     // ----------------------------------------------------------------------
     std::cout << "[group] boolean flags\n";
     { RunResult r = run({"--segment"});                  ok(r.rc==0 && r.params.segment_sentences==true, "--segment sets segment_sentences"); }
+    { RunResult r = run({"--warmup"});                   ok(r.rc==0 && r.params.warmup==true, "--warmup sets warmup"); }
     { RunResult r = run({"--save-voice"});               ok(r.rc==0 && r.params.save_voice==true, "--save-voice sets save_voice"); }
     { RunResult r = run({"--list-voices"});              ok(r.rc==0 && r.list_voices==true, "--list-voices sets list_voices"); }
     { RunResult r = run({"--trim-silence"});             ok(r.rc==0 && r.params.trim_silence==true, "--trim-silence sets trim_silence=true"); }
@@ -338,15 +382,16 @@ int main() {
     std::cout << "[group] invalid numeric values -> clean exit 1 (core fix)\n";
     const char* int_flags[] = {
         "-v","--vulkan","--codec-vulkan","--codec-chunk","--codec-overlap",
-        "--min-seg-chars","--top-k","--min-end-tokens","--ras-window",
-        "--max-seg-tokens","-p","--port","--threads","-threads","--max-tokens",
+        "--min-seg-chars","--top-k","--min-end-tokens","--repetition-window",
+        "--multi-turn-history","--ras-window","--max-seg-tokens","-p","--port",
+        "--threads","-threads","--max-tokens",
         "--stream-decode-stride"
     };
     for (const char* f : int_flags)
         expect_rc({f, "abc"}, 1, std::string("int flag ") + f + " rejects non-numeric");
 
     const char* float_flags[] = {
-        "--temperature","--temp","--top-p","--ras-temp","--ras-top-p"
+        "--temperature","--temp","--top-p","--repetition-penalty","--ras-temp","--ras-top-p"
     };
     for (const char* f : float_flags)
         expect_rc({f, "xyz"}, 1, std::string("float flag ") + f + " rejects non-numeric");
@@ -357,6 +402,10 @@ int main() {
     std::cout << "[group] out-of-range numbers -> clean exit 1\n";
     expect_rc({"--port","99999999999999999999"}, 1, "--port out-of-range rejected");
     expect_rc({"--max-tokens","99999999999999999999"}, 1, "--max-tokens out-of-range rejected");
+    expect_rc({"--seed","18446744073709551616"}, 1, "--seed UINT64_MAX+1 rejected");
+    expect_rc({"--seed","-1"}, 1, "--seed negative rejected");
+    expect_rc({"--seed","1.5"}, 1, "--seed decimal rejected");
+    expect_rc({"--seed","123junk"}, 1, "--seed trailing junk rejected");
 
     // ----------------------------------------------------------------------
     // 5. Value flag whose "value" is actually the next flag (non-numeric) ->
@@ -426,8 +475,9 @@ int main() {
             "--model-codec","s2-pro-q4_k_m-codec-only.gguf",
             "-v","1","--codec-vulkan","1","--segment","--codec-chunk","32",
             "--max-seg-tokens","300","--min-seg-chars","60",
-            "--temperature","0.8","--top-p","0.8","--top-k","40","--port","8080",
-            "--host","127.0.0.1"
+            "--temperature","0.8","--top-p","0.8","--top-k","40",
+            "--seed","123456789","--repetition-penalty","1.1","--repetition-window","96",
+            "--multi-turn-history","4","--warmup","--port","8080","--host","127.0.0.1"
         });
         ok(r.rc==0
            && r.params.model_path=="s2-pro-q4_k_m-transformer-only.gguf"
@@ -441,6 +491,11 @@ int main() {
            && feq(r.params.gen.temperature,0.8f)
            && feq(r.params.gen.top_p,0.8f)
            && r.params.gen.top_k==40
+           && r.params.gen.seed==123456789ULL
+           && feq(r.params.gen.repetition_penalty,1.1f)
+           && r.params.gen.repetition_window==96
+           && r.params.multi_turn_history==4
+           && r.params.warmup==true
            && r.port==8080
            && r.bind_host=="127.0.0.1",
            "full optimal Vulkan command line parses with all fields correct");

@@ -13,19 +13,38 @@ permissions:
 
 jobs:
   build:
-    name: Windows Server 2022 - MSVC - Vulkan
-    # Pinned to windows-2022 (VS 2022 / MSVC 19.4x) to match the last verified-green
-    # toolchain. windows-2025 moved to VS 2026 (MSVC 19.51, C++20 default, stricter
-    # diagnostics) on 2026-06-08; pinning keeps both jobs on one consistent compiler
-    # and avoids surprise breakage in the Crow/Asio/ggml compile. Revisit when ready
-    # to validate against VS 2026 (test via the windows-2025-vs2026 label on a branch).
-    runs-on: windows-2022
+    name: Windows Server 2025 - VS 2026 - Vulkan
+    # Pin the current Windows image explicitly instead of relying on a moving
+    # windows-latest alias. The image provides Windows Server 2025 + VS 2026/v145.
+    runs-on: windows-2025-vs2026
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Verificar toolchain VS 2026
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw "cmake --version failed with exit $LASTEXITCODE" }
+          $cmakeHelp = cmake --help | Out-String
+          if ($LASTEXITCODE -ne 0 -or $cmakeHelp -notmatch [regex]::Escape("Visual Studio 18 2026")) {
+              throw 'Installed CMake does not expose generator "Visual Studio 18 2026" (requires CMake >= 4.2).'
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-Not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
+          $vsRoot = & $vswhere -latest -products * -version '[18.0,19.0)' -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -Not $vsRoot) { throw "Visual Studio 2026 not found" }
+          $cl = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction Stop |
+                Sort-Object FullName -Descending | Select-Object -First 1
+          if (-Not $cl) { throw "VS 2026 x64 cl.exe not found" }
+          Write-Host "VS2026=$vsRoot"
+          Write-Host "cl.exe=$($cl.FullName)"
+          Write-Host "cl version=$($cl.VersionInfo.FileVersion)"
 
       - name: Instalar Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
@@ -81,65 +100,19 @@ jobs:
         shell: pwsh
         run: pwsh -File patch-cmake.ps1
 
-      - name: Generar tokenizer_data embebido en el exe
+      - name: Generate byte-exact embedded tokenizer
         shell: pwsh
         run: |
-          $json = "tokenizer.json"
-          if (-Not (Test-Path $json)) { Write-Error "tokenizer.json no encontrado"; exit 1 }
-
-          $bytes  = [System.IO.File]::ReadAllBytes((Resolve-Path $json).Path)
-          $nBytes = $bytes.Length
-          Write-Host "tokenizer.json: $nBytes bytes ($([math]::Round($nBytes/1MB,2)) MB)"
-
-          # tokenizer_data.h — solo declaraciones extern
-          # Escribir linea a linea para evitar conflictos YAML/heredoc con comillas
-          $hLines = [System.Collections.Generic.List[string]]::new()
-          $hLines.Add("// tokenizer_data.h -- generado por el workflow. NO editar.")
-          $hLines.Add("#pragma once")
-          $hLines.Add("#include <stddef.h>")
-          $hLines.Add("extern const unsigned char tokenizer_json_data[];")
-          $hLines.Add("extern const size_t tokenizer_json_size;")
-          [System.IO.File]::WriteAllLines(
-              (Join-Path (Get-Location) "src/tokenizer_data.h"),
-              $hLines,
-              [System.Text.UTF8Encoding]::new($false))
-          Write-Host "OK: src/tokenizer_data.h"
-
-          # tokenizer_data.cpp — definicion del array (unsigned char, pragma warnings)
-          $sb = [System.Text.StringBuilder]::new($nBytes * 6)
-          $sb.AppendLine("// tokenizer_data.cpp -- generado por el workflow. NO editar.") | Out-Null
-          $sb.AppendLine("#ifdef _MSC_VER")                                               | Out-Null
-          $sb.AppendLine("#  pragma warning(push)")                                        | Out-Null
-          $sb.AppendLine("#  pragma warning(disable: 4838 4309 4365 4267)")                | Out-Null
-          $sb.AppendLine("#endif")                                                         | Out-Null
-          $sb.AppendLine("#include <stddef.h>")                                            | Out-Null
-          $sb.AppendLine("extern const size_t tokenizer_json_size = static_cast<size_t>(${nBytes}ULL);")   | Out-Null
-          $sb.AppendLine("extern const unsigned char tokenizer_json_data[] = {")                  | Out-Null
-
-          $COLS = 32
-          for ($i = 0; $i -lt $nBytes; $i += $COLS) {
-              $end   = [Math]::Min($i + $COLS, $nBytes)
-              $chunk = $bytes[$i..($end - 1)]
-              $hexes = ($chunk | ForEach-Object { "0x{0:x2}u" -f $_ }) -join ","
-              $sb.AppendLine("    $hexes,") | Out-Null
-          }
-
-          $sb.AppendLine("    0x00u")   | Out-Null
-          $sb.AppendLine("};")          | Out-Null
-          $sb.AppendLine("#ifdef _MSC_VER")   | Out-Null
-          $sb.AppendLine("#  pragma warning(pop)") | Out-Null
-          $sb.AppendLine("#endif")      | Out-Null
-
-          [System.IO.File]::WriteAllText(
-              (Join-Path (Get-Location) "src/tokenizer_data.cpp"),
-              $sb.ToString(),
-              [System.Text.UTF8Encoding]::new($false))
-          Write-Host "OK: src/tokenizer_data.cpp ($([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1KB,1)) KB)"
-
+          $ErrorActionPreference = "Stop"
+          python --version
+          if ($LASTEXITCODE -ne 0) { throw "Python not available" }
+          python tools/embed_tokenizer.py tokenizer.json src/tokenizer_data.cpp src/tokenizer_data.h
+          if ($LASTEXITCODE -ne 0) { throw "tokenizer embedding failed" }
+          Write-Host "Embedded tokenizer source size: $([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1MB,2)) MB"
       - name: CMake Configure
         shell: pwsh
         run: |
-          cmake -B build -S . `
+          cmake -G "Visual Studio 18 2026" -A x64 -B build -S . `
             -DCMAKE_BUILD_TYPE=Release `
             -DS2_VULKAN=ON `
             -DGGML_VULKAN=ON `
@@ -189,22 +162,24 @@ jobs:
           $deps | ForEach-Object { Write-Host "    $_" }
           Write-Host "-------------------------`n"
 
-          # Classify each dependency. A dependency is safe if it is the Vulkan
-          # loader, a UCRT api-set, or any DLL actually present in System32 (i.e.
-          # OS-provided / VC++ redistributable. The VC++ runtime is intentionally
-          # not bundled; end users must have the Microsoft VC++ 2015-2022 x64
-          # Redistributable installed. Only a DLL that is NONE of these would
-          # indicate an unexpected backend/build dependency,
-          # so flag just those. (Using live System32 presence instead of a fixed
-          # name list avoids false failures on benign system DLLs like bcrypt.dll.)
+          # /MT makes the normal MSVC CRT static, but MSVC OpenMP is special:
+          # VCOMP.LIB is an import library for VCOMP140.DLL. Keep OpenMP enabled
+          # for performance and allow only that VC runtime dependency. The one-file
+          # artifact therefore requires the Microsoft VC++ v14 Redistributable
+          # for OpenMP, plus vulkan-1.dll from the GPU driver. CUDA imports are
+          # explicitly forbidden even if a CUDA driver DLL happens to be in System32.
           $sys32 = Join-Path $env:WINDIR "System32"
           $hasVulkan  = $false
           $unexpected = @()
           foreach ($d in $deps) {
               $name = $d.ToLower()
               if ($name -eq 'vulkan-1.dll') { $hasVulkan = $true; continue }
-              if ($name -like 'api-ms-win-*') { continue }
-              if ($name -match '^(msvcp140|vcruntime140|vcomp140|concrt140)') { continue }  # VC++ redist
+              if ($name -eq 'nvcuda.dll' -or $name -like 'cublas*.dll' -or $name -like 'cudart*.dll' -or $name -like 'nvrtc*.dll') {
+                  $unexpected += $d; continue
+              }
+              if ($name -match '^(msvcp|vcruntime|concrt)') { $unexpected += $d; continue }
+              if ($name -like 'vcomp*.dll') { continue } # MSVC OpenMP runtime; external VC++ v14 redist
+              if ($name -like 'api-ms-win-*' -or $name -like 'ext-ms-win-*') { continue }
               if (Test-Path (Join-Path $sys32 $name)) { continue }   # OS-provided
               $unexpected += $d
           }
@@ -216,7 +191,7 @@ jobs:
               Write-Error ("Dependencias no resolubles en una maquina Windows estandar (revisar link/empaquetado): " + ($unexpected -join ', '))
               exit 1
           }
-          Write-Host "OK: s2.exe solo importa vulkan-1.dll + DLLs del sistema / runtime VC++."
+          Write-Host "OK: s2.exe importa Vulkan + DLLs del sistema; solo VCOMP puede quedar dinamico por OpenMP."
 
           # ---- Opportunistic execution (only if the loader is available) ---------
           # s2.exe imports the Vulkan loader (vulkan-1.dll). On a headless runner
@@ -270,13 +245,10 @@ jobs:
       - name: Empaquetar release
         shell: pwsh
         run: |
-          # Con BUILD_SHARED_LIBS=OFF y CROW_ENABLE_SSL=0, el exe no necesita
-          # DLLs de ggml ni de OpenSSL. El runtime de MSVC se enlaza dinamicamente
-          # y NO se empaqueta: el usuario debe tener instalado Microsoft Visual C++
-          # 2015-2022 Redistributable (x64). vulkan-1.dll lo proporciona el driver
-          # Vulkan de la GPU (NVIDIA/AMD/Intel).
-          #
-          # Resultado: no se distribuyen DLLs de ggml/OpenSSL junto al ejecutable.
+          # GGML/Crow/tokenizer y el CRT normal van dentro del exe (/MT). MSVC OpenMP
+          # usa VCOMP140.DLL dinamico, por lo que el artefacto sigue siendo un solo
+          # s2.exe pero requiere el Microsoft VC++ v14 x64 Redistributable.
+          # vulkan-1.dll lo proporciona el driver Vulkan (NVIDIA/AMD/Intel).
 
           New-Item -ItemType Directory -Force -Path release | Out-Null
 
@@ -304,37 +276,53 @@ jobs:
           retention-days: 30
 
   build-cuda:
-    name: Windows Server 2022 - MSVC - CUDA 12
-    # Pinned to windows-2022 (Visual Studio 2022 / MSVC 19.4x). The windows-2025
-    # label migrated to Visual Studio 2026 (MSVC 19.51) starting 2026-06-08, and
-    # CUDA 12.6 does not support VS 2026: CMake's enable_language(CUDA) fails with
-    # "No CUDA toolset found" (the CUDA MSBuild integration has no v180 customization),
-    # and nvcc's host_config.h #error rejects the newer MSVC. GitHub's documented
-    # fallback for VS 2022 is the windows-2022 image.
-    runs-on: windows-2022
+    name: Windows Server 2025 - VS 2026 - CUDA 13.2
+    # CUDA 13.2 officially supports MSVC 195x / Visual Studio 2026 and
+    # Windows Server 2025, so use the current v145 toolchain directly.
+    runs-on: windows-2025-vs2026
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - name: Instalar CUDA Toolkit 12.6
-        uses: Jimver/cuda-toolkit@v0.2.23
+      - name: Instalar CUDA Toolkit 13.2
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: '12.6.3'
+          cuda: '13.2.0'
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
 
-      - name: Verificar CUDA
+      - name: Verificar CUDA y toolchain
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw "cmake --version failed with exit $LASTEXITCODE" }
+          $cmakeHelp = cmake --help | Out-String
+          if ($LASTEXITCODE -ne 0 -or $cmakeHelp -notmatch [regex]::Escape("Visual Studio 18 2026")) {
+              throw 'Installed CMake does not expose generator "Visual Studio 18 2026" (requires CMake >= 4.2).'
+          }
           nvcc --version
+          if ($LASTEXITCODE -ne 0) { throw "nvcc --version failed with exit $LASTEXITCODE" }
+
           $cudaPath = $env:CUDA_PATH
-          if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
           if (-Not $cudaPath) { Write-Error "CUDA_PATH no encontrado"; exit 1 }
           Write-Host "CUDA_PATH = $cudaPath"
           "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-Not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
+          $vsRoot = & $vswhere -latest -products * -version '[18.0,19.0)' -property installationPath
+          if (-Not $vsRoot) { Write-Error "Visual Studio 2026 no encontrado"; exit 1 }
+          $cl = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending | Select-Object -First 1
+          if (-Not $cl) { Write-Error "cl.exe v145 no encontrado"; exit 1 }
+          Write-Host "VS2026 = $vsRoot"
+          Write-Host "cl.exe  = $($cl.FullName)"
+          Write-Host "cl file version = $($cl.VersionInfo.FileVersion)"
 
       - name: Cache Crow/Asio headers
         uses: actions/cache@v6
@@ -348,69 +336,25 @@ jobs:
         shell: pwsh
         run: pwsh -File patch-cmake-cuda.ps1
 
-      - name: Generar tokenizer_data embebido en el exe
+      - name: Generate byte-exact embedded tokenizer
         shell: pwsh
         run: |
-          $json = "tokenizer.json"
-          if (-Not (Test-Path $json)) { Write-Error "tokenizer.json no encontrado"; exit 1 }
-
-          $bytes  = [System.IO.File]::ReadAllBytes((Resolve-Path $json).Path)
-          $nBytes = $bytes.Length
-          Write-Host "tokenizer.json: $nBytes bytes ($([math]::Round($nBytes/1MB,2)) MB)"
-
-          $hLines = [System.Collections.Generic.List[string]]::new()
-          $hLines.Add("// tokenizer_data.h -- generado por el workflow. NO editar.")
-          $hLines.Add("#pragma once")
-          $hLines.Add("#include <stddef.h>")
-          $hLines.Add("extern const unsigned char tokenizer_json_data[];")
-          $hLines.Add("extern const size_t tokenizer_json_size;")
-          [System.IO.File]::WriteAllLines(
-              (Join-Path (Get-Location) "src/tokenizer_data.h"),
-              $hLines,
-              [System.Text.UTF8Encoding]::new($false))
-          Write-Host "OK: src/tokenizer_data.h"
-
-          $sb = [System.Text.StringBuilder]::new($nBytes * 6)
-          $sb.AppendLine("// tokenizer_data.cpp -- generado por el workflow. NO editar.") | Out-Null
-          $sb.AppendLine("#ifdef _MSC_VER")                                               | Out-Null
-          $sb.AppendLine("#  pragma warning(push)")                                        | Out-Null
-          $sb.AppendLine("#  pragma warning(disable: 4838 4309 4365 4267)")                | Out-Null
-          $sb.AppendLine("#endif")                                                         | Out-Null
-          $sb.AppendLine("#include <stddef.h>")                                            | Out-Null
-          $sb.AppendLine("extern const size_t tokenizer_json_size = static_cast<size_t>(${nBytes}ULL);")   | Out-Null
-          $sb.AppendLine("extern const unsigned char tokenizer_json_data[] = {")                  | Out-Null
-
-          $COLS = 32
-          for ($i = 0; $i -lt $nBytes; $i += $COLS) {
-              $end   = [Math]::Min($i + $COLS, $nBytes)
-              $chunk = $bytes[$i..($end - 1)]
-              $hexes = ($chunk | ForEach-Object { "0x{0:x2}u" -f $_ }) -join ","
-              $sb.AppendLine("    $hexes,") | Out-Null
-          }
-
-          $sb.AppendLine("    0x00u")   | Out-Null
-          $sb.AppendLine("};")          | Out-Null
-          $sb.AppendLine("#ifdef _MSC_VER")   | Out-Null
-          $sb.AppendLine("#  pragma warning(pop)") | Out-Null
-          $sb.AppendLine("#endif")      | Out-Null
-
-          [System.IO.File]::WriteAllText(
-              (Join-Path (Get-Location) "src/tokenizer_data.cpp"),
-              $sb.ToString(),
-              [System.Text.UTF8Encoding]::new($false))
-          Write-Host "OK: src/tokenizer_data.cpp ($([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1KB,1)) KB)"
-
+          $ErrorActionPreference = "Stop"
+          python --version
+          if ($LASTEXITCODE -ne 0) { throw "Python not available" }
+          python tools/embed_tokenizer.py tokenizer.json src/tokenizer_data.cpp src/tokenizer_data.h
+          if ($LASTEXITCODE -ne 0) { throw "tokenizer embedding failed" }
+          Write-Host "Embedded tokenizer source size: $([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1MB,2)) MB"
       - name: CMake Configure (CUDA)
         shell: pwsh
         run: |
-          cmake -B build -S . `
+          cmake -G "Visual Studio 18 2026" -A x64 -B build -S . `
             -DCMAKE_BUILD_TYPE=Release `
             -DS2_CUDA=ON `
             -DGGML_CUDA=ON `
             -DS2_VULKAN=OFF `
             -DS2_METAL=OFF `
             -DBUILD_SHARED_LIBS=OFF `
-            -DGGML_CUDA_ARCHITECTURES=86 `
             -DGGML_AVX2=ON `
             -DGGML_STATIC=ON `
             -DCMAKE_CUDA_RUNTIME_LIBRARY=Static `
@@ -421,113 +365,117 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release --parallel
 
-      - name: Verificar ejecutable CUDA
+      - name: Verify CUDA core and native launcher
         shell: pwsh
         run: |
-          $exe = "build\Release\s2-cuda.exe"
-          if (-Not (Test-Path $exe)) {
-            Write-Error "s2-cuda.exe no fue generado."
-            exit 1
-          }
-          $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
-          Write-Host "OK: s2-cuda.exe generado ($sizeMB MB)"
+          $ErrorActionPreference = "Stop"
+          $core = "build\Release\s2-cuda-core.exe"
+          $launcher = "build\Release\s2-cuda-launcher.exe"
+          if (-Not (Test-Path $core)) { throw "s2-cuda-core.exe was not generated" }
+          if (-Not (Test-Path $launcher)) { throw "s2-cuda-launcher.exe was not generated" }
 
-          # DO NOT run s2-cuda.exe on this runner. A CUDA-enabled binary has a
-          # LOAD-TIME import on nvcuda.dll -- the CUDA *Driver* API, which the
-          # NVIDIA *display driver* installs into System32. It is NOT part of the
-          # CUDA toolkit and is NOT redistributable. GitHub-hosted windows-2022
-          # runners have no NVIDIA GPU and no driver, so nvcuda.dll is absent and
-          # ANY launch (even `--help`) fails at process load with 0xC0000135
-          # (STATUS_DLL_NOT_FOUND / -1073741515) before main() runs. That is
-          # expected on a GPU-less box and is NOT a build defect -- so instead of
-          # executing the exe we verify its import table is exactly what we expect.
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          if (-Not (Test-Path $vswhere)) { Write-Error "vswhere no encontrado"; exit 1 }
-          $vsRoot  = & $vswhere -latest -products * -property installationPath
-          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
-                     Select-Object -First 1
-          if (-Not $dumpbin) { Write-Error "dumpbin no encontrado -- no se pueden verificar dependencias"; exit 1 }
-
-          $deps = & $dumpbin.FullName /dependents $exe |
-                  Select-String -Pattern '^\s+\S+\.dll\s*$' |
-                  ForEach-Object { $_.ToString().Trim() }
-          Write-Host "`n--- s2-cuda.exe dependents ---"
-          $deps | ForEach-Object { Write-Host "    $_" }
-          Write-Host "------------------------------`n"
-
-          # Buckets of acceptable dependencies:
-          #  - Windows system DLLs + UCRT api-sets + VC/OpenMP runtime: present on
-          #    Windows and on end-user machines via the VC++ Redistributable.
-          #  - nvcuda.dll: the NVIDIA driver provides this on the user's GPU box.
-          #  - cublas/cublasLt/cudart: shipped next to the exe in the release step.
-          # Anything else is an unexpected new dependency that would break users, so
-          # fail here -- this catches packaging regressions WITHOUT needing a GPU.
-          $allowDriver  = @('nvcuda.dll')
-          $allowShipped = @('cublas64_12.dll','cublaslt64_12.dll','cudart64_12.dll')
-          $sys32 = Join-Path $env:WINDIR "System32"
-
-          $hasNvcuda  = $false
-          $unexpected = @()
-          foreach ($d in $deps) {
-              $name = $d.ToLower()
-              if ($name -eq 'nvcuda.dll') { $hasNvcuda = $true }
-              if ($name -like 'api-ms-win-*') { continue }
-              if ($allowDriver  -contains $name) { continue }
-              if ($allowShipped -contains $name) { continue }
-              if ($name -match '^(msvcp140|vcruntime140|vcomp140|concrt140)') { continue }
-              if (Test-Path (Join-Path $sys32 $name)) { continue }
-              $unexpected += $d
+          $vsRoot = & $vswhere -latest -products * -version '[18.0,19.0)' -property installationPath
+          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop |
+                     Sort-Object FullName -Descending | Select-Object -First 1
+          function Get-Deps([string]$file) {
+            @(& $dumpbin.FullName /dependents $file | Select-String -Pattern '^\s+\S+\.dll\s*$' | ForEach-Object { $_.ToString().Trim().ToLowerInvariant() })
           }
-
-          if (-Not $hasNvcuda) {
-              Write-Error "nvcuda.dll no figura como dependencia -- el artefacto no es un build CUDA valido."
-              exit 1
+          $coreDeps = Get-Deps $core
+          $launcherDeps = Get-Deps $launcher
+          Write-Host "--- CUDA core imports ---"; $coreDeps | ForEach-Object { Write-Host "  $_" }
+          Write-Host "--- launcher imports ---"; $launcherDeps | ForEach-Object { Write-Host "  $_" }
+          if ($coreDeps -contains 'vulkan-1.dll') { throw "CUDA core unexpectedly imports vulkan-1.dll" }
+          if ($coreDeps | Where-Object { $_ -match '^(vcruntime|msvcp|concrt)' }) {
+            throw "CUDA core unexpectedly depends on a dynamic MSVC CRT: $($coreDeps -join ', ')"
           }
-          if ($unexpected.Count -gt 0) {
-              Write-Error ("Dependencias inesperadas (revisar empaquetado): " + ($unexpected -join ', '))
-              exit 1
+          if ($coreDeps | Where-Object { $_ -like 'vcomp*.dll' }) {
+            Write-Host "INFO: CUDA core uses MSVC OpenMP; VCOMP will be embedded in the outer single-file payload."
           }
-
-          Write-Host "OK: s2-cuda.exe solo depende de (sistema + VC runtime) + nvcuda (driver) + cublas (incluida en el release)."
-          Write-Host "NOTA: la ejecucion real (incl. --help) requiere una GPU NVIDIA con driver; validar en hardware o en un runner self-hosted con GPU."
-
-      - name: Empaquetar release CUDA
+          if (-Not ($coreDeps | Where-Object { $_ -eq 'nvcuda.dll' -or $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' })) {
+            throw "CUDA core has no CUDA import evidence"
+          }
+          if ($launcherDeps | Where-Object { $_ -eq 'nvcuda.dll' -or $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' -or $_ -like 'nvrtc*.dll' }) {
+            throw "Outer launcher must not import CUDA libraries: $($launcherDeps -join ', ')"
+          }
+          if ($launcherDeps | Where-Object { $_ -match '^(vcruntime|msvcp|vcomp)' }) {
+            throw "Outer launcher is not CRT-single-file: $($launcherDeps -join ', ')"
+          }
+      - name: Build single-file CUDA container
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release-cuda | Out-Null
-          Copy-Item build\Release\s2-cuda.exe release-cuda\
+          $ErrorActionPreference = "Stop"
+          $core = (Resolve-Path "build\Release\s2-cuda-core.exe").Path
+          $launcher = (Resolve-Path "build\Release\s2-cuda-launcher.exe").Path
+          $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+          if (-Not (Test-Path $cudaBin)) { throw "CUDA bin does not exist: $cudaBin" }
 
-          # Runtime DLLs that ship next to s2-cuda.exe. The exe's actual imports
-          # (verified via dumpbin in the previous step) are cublas64_12.dll plus
-          # nvcuda.dll; cudart64_12.dll is NOT imported (the static CUDA runtime
-          # linked correctly). We ship:
-          #   - cublas64_12.dll   : directly imported by the exe (no static build on Windows).
-          #   - cublasLt64_12.dll : loaded by cuBLAS at runtime; ship alongside it.
-          #   - cudart64_12.dll   : shipped defensively (cuBLAS may pull it); ~harmless if unused.
-          # nvcuda.dll is intentionally NOT shipped: it is the NVIDIA *driver* API,
-          # provided by the user's installed GPU driver in System32, and is not
-          # redistributable. End users also need the VC++ Redistributable
-          # (MSVCP140/VCRUNTIME140*/VCOMP140), standard on most Windows machines.
-          $cudaPath = $env:CUDA_PATH
-          if (-Not $cudaPath) { $cudaPath = $env:CUDA_PATH_V12_6 }
-          if (-Not $cudaPath) { Write-Error "CUDA_PATH no definido"; exit 1 }
-
-          foreach ($dll in @("cublas64_12.dll", "cublasLt64_12.dll", "cudart64_12.dll")) {
-              $src = Join-Path $cudaPath "bin\$dll"
-              if (Test-Path $src) {
-                  Copy-Item $src release-cuda\
-                  Write-Host "OK: $dll incluida"
-              } else {
-                  Write-Error "$dll no encontrada en $cudaPath\bin -- el release quedaria incompleto"
-                  exit 1
-              }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -version '[18.0,19.0)' -property installationPath
+          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop |
+                     Sort-Object FullName -Descending | Select-Object -First 1
+          function Get-PeDependencies([string]$file) {
+            @(& $dumpbin.FullName /dependents $file | Select-String -Pattern '^\s+\S+\.dll\s*$' | ForEach-Object { $_.ToString().Trim() })
           }
 
-          $sizeMB = [math]::Round((Get-Item release-cuda\s2-cuda.exe).Length / 1MB, 1)
-          Write-Host "`nContenido del release CUDA:"
-          Get-ChildItem release-cuda\ | Format-Table Name, Length -AutoSize
-          Write-Host "Tamanio de s2-cuda.exe: $sizeMB MB (cudart embebido, cublas dinamica)"
+          Remove-Item cuda-payload, release-cuda -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force cuda-payload, release-cuda | Out-Null
+          Copy-Item $core cuda-payload\s2-cuda-core.exe
+          $sys32 = Join-Path $env:WINDIR 'System32'
+          $queue = [System.Collections.Generic.Queue[string]]::new(); $queue.Enqueue($core)
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $copied = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $missing = [System.Collections.Generic.List[string]]::new()
 
+          # cuBLAS may load cuBLASLt dynamically; seed the transitive closure.
+          Get-ChildItem $cudaBin -Filter 'cublasLt64_*.dll' -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($copied.Add($_.Name)) { Copy-Item $_.FullName (Join-Path cuda-payload $_.Name); $queue.Enqueue($_.FullName) }
+          }
+          while ($queue.Count -gt 0) {
+            $current = $queue.Dequeue(); if (-Not $seen.Add($current)) { continue }
+            foreach ($dep in (Get-PeDependencies $current)) {
+              $low = $dep.ToLowerInvariant()
+              if ($low -eq 'nvcuda.dll') { continue } # driver-owned; never redistribute
+              if ($low -like 'api-ms-win-*' -or $low -like 'ext-ms-win-*') { continue }
+              if ($low -like 'vcomp*.dll') {
+                # /MT does not make MSVC OpenMP static. Microsoft documents VCOMP
+                # as redistributable from VC\Redist; embed it beside the extracted core.
+                $vcDll = Get-ChildItem (Join-Path $vsRoot 'VC\Redist\MSVC') -Recurse -File -Filter $dep -ErrorAction SilentlyContinue |
+                         Where-Object { $_.FullName -match '\\x64\\' -and $_.FullName -notmatch 'debug_nonredist|onecore' } |
+                         Sort-Object FullName -Descending | Select-Object -First 1
+                if ($vcDll) {
+                  if ($copied.Add($dep)) { Copy-Item $vcDll.FullName (Join-Path cuda-payload $dep); $queue.Enqueue($vcDll.FullName) }
+                  continue
+                }
+                $missing.Add("$dep (MSVC OpenMP runtime required by $([IO.Path]::GetFileName($current)))")
+                continue
+              }
+              # Prefer Toolkit redistributables over anything coincidentally present
+              # in this runner's System32. Otherwise a polluted CI image could make
+              # the bundle omit cuBLAS/nvrtc/etc. and produce an artifact that only
+              # works on the runner that built it. nvcuda.dll was excluded above.
+              $cudaDll = Join-Path $cudaBin $dep
+              if (Test-Path $cudaDll) {
+                if ($copied.Add($dep)) { Copy-Item $cudaDll (Join-Path cuda-payload $dep); $queue.Enqueue($cudaDll) }
+                continue
+              }
+              if (Test-Path (Join-Path $sys32 $dep)) { continue }
+              $missing.Add("$dep (required by $([IO.Path]::GetFileName($current)))")
+            }
+          }
+          if ($missing.Count) { throw "Unresolved non-system dependencies: $((($missing | Sort-Object -Unique) -join ', '))" }
+          if (Test-Path cuda-payload\nvcuda.dll) { throw "nvcuda.dll must never be bundled" }
+
+          python tools/cuda_bundle.py --launcher $launcher --payload-dir cuda-payload --output release-cuda\s2-cuda.exe
+          if ($LASTEXITCODE -ne 0) { throw "CUDA bundler failed" }
+          $outer = (Resolve-Path release-cuda\s2-cuda.exe).Path
+          $outerDeps = Get-PeDependencies $outer | ForEach-Object { $_.ToLowerInvariant() }
+          if ($outerDeps | Where-Object { $_ -eq 'nvcuda.dll' -or $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' -or $_ -like 'nvrtc*.dll' }) {
+            throw "Final outer s2-cuda.exe imports CUDA: $($outerDeps -join ', ')"
+          }
+          $files = @(Get-ChildItem release-cuda -File)
+          if ($files.Count -ne 1 -or $files[0].Name -ne 's2-cuda.exe') { throw "CUDA artifact must contain exactly one s2-cuda.exe" }
+          Write-Host "OK: single-file CUDA artifact built; nvcuda.dll is supplied by the NVIDIA driver."
       - name: Subir artifact CUDA
         uses: actions/upload-artifact@v7
         with:
@@ -536,14 +484,36 @@ jobs:
           retention-days: 30
 
   build-cpu:
-    name: Windows Server 2022 - MSVC - CPU only
-    runs-on: windows-2022
+    name: Windows Server 2025 - VS 2026 - CPU only
+    runs-on: windows-2025-vs2026
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Verificar toolchain VS 2026
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw "cmake --version failed with exit $LASTEXITCODE" }
+          $cmakeHelp = cmake --help | Out-String
+          if ($LASTEXITCODE -ne 0 -or $cmakeHelp -notmatch [regex]::Escape("Visual Studio 18 2026")) {
+              throw 'Installed CMake does not expose generator "Visual Studio 18 2026" (requires CMake >= 4.2).'
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-Not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
+          $vsRoot = & $vswhere -latest -products * -version '[18.0,19.0)' -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -Not $vsRoot) { throw "Visual Studio 2026 not found" }
+          $cl = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction Stop |
+                Sort-Object FullName -Descending | Select-Object -First 1
+          if (-Not $cl) { throw "VS 2026 x64 cl.exe not found" }
+          Write-Host "VS2026=$vsRoot"
+          Write-Host "cl.exe=$($cl.FullName)"
+          Write-Host "cl version=$($cl.VersionInfo.FileVersion)"
 
       - name: Cache Crow/Asio headers
         uses: actions/cache@v6
@@ -557,10 +527,20 @@ jobs:
         shell: pwsh
         run: pwsh -File patch-cmake.ps1
 
+      - name: Generate byte-exact embedded tokenizer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python --version
+          if ($LASTEXITCODE -ne 0) { throw "Python not available" }
+          python tools/embed_tokenizer.py tokenizer.json src/tokenizer_data.cpp src/tokenizer_data.h
+          if ($LASTEXITCODE -ne 0) { throw "tokenizer embedding failed" }
+          Write-Host "Embedded tokenizer source size: $([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1MB,2)) MB"
+
       - name: CMake Configure (CPU only)
         shell: pwsh
         run: |
-          cmake -B build-cpu -S . `
+          cmake -G "Visual Studio 18 2026" -A x64 -B build-cpu -S . `
             -DCMAKE_BUILD_TYPE=Release `
             -DS2_VULKAN=OFF `
             -DS2_CUDA=OFF `
@@ -590,23 +570,29 @@ jobs:
                   Select-String -Pattern '^\s+\S+\.dll\s*$' |
                   ForEach-Object { $_.ToString().Trim().ToLower() }
           if ($deps -contains 'vulkan-1.dll' -or $deps -contains 'nvcuda.dll' -or
-              ($deps | Where-Object { $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' })) {
+              ($deps | Where-Object { $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' -or $_ -like 'nvrtc*.dll' })) {
               Write-Error "CPU artifact unexpectedly links a GPU runtime: $($deps -join ', ')"
               exit 1
+          }
+          if ($deps | Where-Object { $_ -match '^(vcruntime|msvcp|concrt)' }) {
+              Write-Error "CPU artifact unexpectedly uses the dynamic MSVC CRT despite /MT: $($deps -join ', ')"
+              exit 1
+          }
+          if ($deps | Where-Object { $_ -like 'vcomp*.dll' }) {
+              Write-Host "INFO: CPU artifact keeps OpenMP performance and therefore requires the VC++ v14 x64 Redistributable (VCOMP)."
           }
 
           & $exe --help 2>&1 | Out-Null
           if ($LASTEXITCODE -ne 0) { Write-Error "CPU executable failed --help"; exit 1 }
-          Write-Host "OK: CPU-only executable has no Vulkan/CUDA imports and starts successfully."
+          Write-Host "OK: CPU-only executable has no GPU imports, no dynamic normal CRT, and starts successfully."
 
       - name: Package CPU release
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release-cpu | Out-Null
           Copy-Item build-cpu\Release\s2.exe release-cpu\s2-cpu.exe
-          # CPU build intentionally does not embed the large tokenizer blob.
-          # Keep it beside the executable so get_exe_dir() resolves it automatically.
-          Copy-Item tokenizer.json release-cpu\tokenizer.json
+          if (Test-Path release-cpu\tokenizer.json) { Remove-Item release-cpu\tokenizer.json -Force }
+          Write-Host "OK: tokenizer is embedded; CPU artifact contains only s2-cpu.exe"
 
       - name: Upload CPU artifact
         uses: actions/upload-artifact@v7
@@ -617,13 +603,24 @@ jobs:
 
   build-metal:
     name: macOS - Clang - Metal
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Verificar toolchain Metal
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ImageOS=${ImageOS:-unknown} ImageVersion=${ImageVersion:-unknown}"
+          sw_vers
+          uname -m
+          cmake --version
+          xcodebuild -version
+          clang++ --version
 
       - name: Fetch header-only Crow and Asio
         shell: bash
@@ -642,6 +639,14 @@ jobs:
 
           test -f build-deps/Crow-1.3.3/include/crow.h
           test -f build-deps/asio-asio-1-30-2/asio/include/asio.hpp
+
+      - name: Generate byte-exact embedded tokenizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 tools/embed_tokenizer.py tokenizer.json src/tokenizer_data.cpp src/tokenizer_data.h
+          ls -lh src/tokenizer_data.cpp src/tokenizer_data.h
 
       - name: CMake Configure (Metal only)
         shell: bash
@@ -691,10 +696,18 @@ jobs:
           set -euo pipefail
           mkdir -p release-metal
           cp build-metal/s2 release-metal/s2-metal
-          cp tokenizer.json release-metal/tokenizer.json
           chmod +x release-metal/s2-metal
-          # Package on macOS so the executable bit is preserved inside the ZIP.
-          ditto -c -k --sequesterRsrc --keepParent release-metal s2-macos-metal.zip
+          test "$(find release-metal -maxdepth 1 -type f | wc -l | tr -d ' ')" = "1"
+          # Package the executable itself (not the release-metal directory) so the
+          # published ZIP extracts directly to ./s2-metal, matching README/--help.
+          # ditto preserves the executable mode in the ZIP.
+          ditto -c -k --keepParent release-metal/s2-metal s2-macos-metal.zip
+          rm -rf verify-metal-zip
+          mkdir verify-metal-zip
+          ditto -x -k s2-macos-metal.zip verify-metal-zip
+          test -f verify-metal-zip/s2-metal
+          test -x verify-metal-zip/s2-metal
+          test "$(find verify-metal-zip -maxdepth 1 -type f | wc -l | tr -d ' ')" = "1"
 
       - name: Upload Metal artifact
         uses: actions/upload-artifact@v7
@@ -707,7 +720,7 @@ jobs:
     name: Publish all backend release assets
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build, build-cuda, build-cpu, build-metal]
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     permissions:
       contents: write
 
@@ -748,7 +761,7 @@ jobs:
           Copy-Item $metalZip.FullName "s2-$tag-macos-metal.zip"
 
       - name: Publish GitHub Release assets
-        uses: softprops/action-gh-release@v3.0.1
+        uses: softprops/action-gh-release@v3.0.3
         with:
           files: |
             s2-*-windows-vulkan.zip

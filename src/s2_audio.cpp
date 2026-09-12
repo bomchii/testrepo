@@ -9,7 +9,12 @@
 #include <limits>
 #include <new>
 #ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
 #  include <windows.h>
 #endif
 
@@ -27,6 +32,30 @@ constexpr size_t AUDIO_DECODE_CHUNK_FRAMES = 4096;
 constexpr size_t MAX_DECODED_MONO_FRAMES = 64u * 1024u * 1024u; // 256 MiB float32 mono
 constexpr unsigned int MAX_AUDIO_CHANNELS = 32;
 constexpr size_t MAX_AUDIO_MEMORY_INPUT = 512u * 1024u * 1024u;
+
+struct WavFileWriter {
+    FILE * fp = nullptr;
+    bool io_error = false;
+};
+
+static size_t wav_file_write_cb(void * user, const void * data, size_t bytes) {
+    auto * w = static_cast<WavFileWriter *>(user);
+    if (!w || !w->fp || (!data && bytes != 0)) return 0;
+    const size_t n = std::fwrite(data, 1, bytes, w->fp);
+    if (n != bytes || std::ferror(w->fp)) w->io_error = true;
+    return n;
+}
+
+static drwav_bool32 wav_file_seek_cb(void * user, int offset, drwav_seek_origin origin) {
+    auto * w = static_cast<WavFileWriter *>(user);
+    if (!w || !w->fp) return DRWAV_FALSE;
+    const int whence = origin == DRWAV_SEEK_SET ? SEEK_SET : SEEK_CUR;
+    if (std::fseek(w->fp, offset, whence) != 0) {
+        w->io_error = true;
+        return DRWAV_FALSE;
+    }
+    return DRWAV_TRUE;
+}
 
 #ifdef _WIN32
 static bool utf8_to_wide(const std::string & s, std::wstring & out) {
@@ -316,9 +345,8 @@ bool audio_read_from_memory(const void * in_data, size_t in_data_size, AudioData
 }
 
 bool audio_write_wav(const std::string & path, const float * data, size_t n_samples, int32_t sample_rate) {
-    if (path.empty() || sample_rate <= 0 || (n_samples > 0 && data == nullptr)) return false;
-    // Classic RIFF stores chunk sizes in uint32. Refuse an oversized file
-    // rather than letting the header wrap. Also do not persist NaN/Inf PCM.
+    if (path.empty() || sample_rate < 1000 || sample_rate > 768000 ||
+        (n_samples > 0 && data == nullptr)) return false;
     constexpr uint64_t MAX_RIFF_DATA = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - 36u;
     if (n_samples > MAX_RIFF_DATA / sizeof(float)) {
         std::fprintf(stderr, "[s2_audio] WAV exceeds classic RIFF 4 GiB limit\n");
@@ -330,33 +358,47 @@ bool audio_write_wav(const std::string & path, const float * data, size_t n_samp
             return false;
         }
     }
-    drwav wav;
-    drwav_data_format format = {};
-    format.container     = drwav_container_riff;
-    format.format        = DR_WAVE_FORMAT_IEEE_FLOAT;
-    format.channels      = 1;
-    format.sampleRate    = static_cast<drwav_uint32>(sample_rate);
-    format.bitsPerSample = 32;
 
-    bool write_open = false;
+    FILE * fp = nullptr;
 #ifdef _WIN32
     std::wstring wpath;
     if (!utf8_to_wide(path, wpath)) return false;
-    write_open = drwav_init_file_write_w(&wav, wpath.c_str(), &format, nullptr) != 0;
+    fp = _wfopen(wpath.c_str(), L"wb");
 #else
-    write_open = drwav_init_file_write(&wav, path.c_str(), &format, nullptr) != 0;
+    fp = std::fopen(path.c_str(), "wb");
 #endif
-    if (!write_open) {
+    if (!fp) {
         std::fprintf(stderr, "[s2_audio] failed to open WAV for writing: %s\n", path.c_str());
         return false;
     }
 
-    drwav_uint64 written = drwav_write_pcm_frames(&wav, n_samples, data);
-    drwav_uninit(&wav);
+    WavFileWriter writer{fp, false};
+    drwav wav{};
+    drwav_data_format format{};
+    format.container = drwav_container_riff;
+    format.format = DR_WAVE_FORMAT_IEEE_FLOAT;
+    format.channels = 1;
+    format.sampleRate = static_cast<drwav_uint32>(sample_rate);
+    format.bitsPerSample = 32;
 
-    if (written != static_cast<drwav_uint64>(n_samples)) {
-        std::fprintf(stderr, "[s2_audio] WAV write incomplete: %llu / %zu frames\n",
-                     (unsigned long long)written, n_samples);
+    bool ok = drwav_init_write(&wav, &format, wav_file_write_cb, wav_file_seek_cb,
+                               &writer, nullptr) != 0;
+    drwav_uint64 written = 0;
+    drwav_result finalize_result = DRWAV_SUCCESS;
+    if (ok) {
+        written = drwav_write_pcm_frames(&wav, static_cast<drwav_uint64>(n_samples), data);
+        finalize_result = drwav_uninit(&wav);
+        if (written != static_cast<drwav_uint64>(n_samples) || finalize_result != DRWAV_SUCCESS)
+            ok = false;
+    }
+    if (writer.io_error || std::ferror(fp)) ok = false;
+    // stdio may buffer a successful fwrite even when the device is full. Both
+    // flush and close are part of the write transaction and must be observed.
+    if (std::fflush(fp) != 0 || std::ferror(fp)) ok = false;
+    if (std::fclose(fp) != 0) ok = false;
+
+    if (!ok) {
+        std::fprintf(stderr, "[s2_audio] WAV write/finalize/flush/close failed: %s\n", path.c_str());
         return false;
     }
     return true;
@@ -421,16 +463,24 @@ std::vector<float> audio_trim_trailing_silence(const float * data, size_t n_samp
         }
     }
 
+    const size_t min_audio_samples = static_cast<size_t>(0.1L * sample_rate);
     if (last_audio_idx == n_samples) {
         bool has_audio = false;
         for (size_t i = 0; i < n_samples; ++i) {
             if (std::isfinite(data[i]) && std::fabs(data[i]) > threshold) { has_audio = true; break; }
         }
-        if (!has_audio) return std::vector<float>();
+        if (!has_audio) {
+            // An all-silent clip is still a valid clip. Returning {} used to be
+            // ambiguous with invalid input, and both callers consequently kept
+            // the *entire* silent input when trimming was requested. Keep a
+            // short non-empty tail instead so WAV output remains valid while
+            // --trim-silence actually does what it says.
+            const size_t keep = std::min(min_audio_samples, n_samples);
+            return std::vector<float>(data, data + keep);
+        }
         return std::vector<float>(data, data + n_samples);
     }
 
-    const size_t min_audio_samples = static_cast<size_t>(0.1f * sample_rate);
     if (last_audio_idx < min_audio_samples) {
         last_audio_idx = std::min(min_audio_samples, n_samples);
     }
@@ -439,7 +489,7 @@ std::vector<float> audio_trim_trailing_silence(const float * data, size_t n_samp
 }
 
 bool load_audio(const std::string & path, AudioData & out, int32_t target_sample_rate) {
-    if (target_sample_rate < 0 || target_sample_rate > 768000) return false;
+    if (target_sample_rate != 0 && (target_sample_rate < 1000 || target_sample_rate > 768000)) return false;
     if (!audio_read(path, out) || out.sample_rate <= 0 || out.samples.empty()) return false;
     if (target_sample_rate > 0 && out.sample_rate != target_sample_rate) {
         auto resampled = audio_resample(out.samples.data(), out.samples.size(), out.sample_rate, target_sample_rate);
@@ -451,7 +501,7 @@ bool load_audio(const std::string & path, AudioData & out, int32_t target_sample
 }
 
 bool load_audio_from_memory(const void * data, size_t bytes, AudioData & out, int32_t target_sample_rate) {
-    if (target_sample_rate < 0 || target_sample_rate > 768000) return false;
+    if (target_sample_rate != 0 && (target_sample_rate < 1000 || target_sample_rate > 768000)) return false;
     if (!audio_read_from_memory(data, bytes, out) || out.sample_rate <= 0 || out.samples.empty()) return false;
     if (target_sample_rate > 0 && out.sample_rate != target_sample_rate) {
         auto resampled = audio_resample(out.samples.data(), out.samples.size(), out.sample_rate, target_sample_rate);
@@ -464,7 +514,7 @@ bool load_audio_from_memory(const void * data, size_t bytes, AudioData & out, in
 
 bool save_audio(const std::string & path, const std::vector<float> & data, int32_t sample_rate,
                 bool trim_silence, bool normalize_peak) {
-    if (path.empty() || sample_rate <= 0) return false;
+    if (path.empty() || sample_rate < 1000 || sample_rate > 768000) return false;
     std::vector<float> output_data = data;
 
     if (trim_silence && !output_data.empty()) {

@@ -30,6 +30,8 @@ GenerateResult generate(
         params.top_k < 0 || params.top_k > 1000000 ||
         params.min_tokens_before_end < 0 ||
         params.ras_window_size < 0 || params.ras_window_size > 32768 ||
+        !std::isfinite(params.repetition_penalty) || params.repetition_penalty < 1.0f || params.repetition_penalty > 10.0f ||
+        params.repetition_window < 0 || params.repetition_window > 32768 ||
         !std::isfinite(params.ras_high_temp) || params.ras_high_temp < 0.0f || params.ras_high_temp > 10.0f ||
         !std::isfinite(params.ras_high_top_p) || params.ras_high_top_p <= 0.0f || params.ras_high_top_p > 1.0f ||
         vocab_size <= 0 || codebook_size <= 0 ||
@@ -39,6 +41,17 @@ GenerateResult generate(
         prompt.data.size() != static_cast<size_t>(prompt.rows) * static_cast<size_t>(prompt.cols)) {
         std::cerr << "[Generate] Invalid generation parameters/model/prompt dimensions.\n";
         return out;
+    }
+
+    // EOS must become eligible before the generation budget is exhausted.
+    // Segment/context clamping can reduce max_new_tokens after request-level
+    // validation, so clamp again here against the effective budget.
+    const int32_t min_tokens_before_end =
+        std::min(params.min_tokens_before_end, std::max(0, params.max_new_tokens - 1));
+    if (params.verbose && min_tokens_before_end != params.min_tokens_before_end) {
+        std::cout << "[Generate] min_end_tokens clamped from " << params.min_tokens_before_end
+                  << " to " << min_tokens_before_end << " for max_new_tokens="
+                  << params.max_new_tokens << ".\n";
     }
 
     // Build semantic mask: -inf everywhere except [sem_begin, sem_end] and im_end
@@ -73,28 +86,44 @@ GenerateResult generate(
         return out;
     }
 
-    // Apply semantic mask to initial logits
-    auto apply_mask_and_sample = [&](const std::vector<float> & logits,
-                                     bool block_im_end) -> int32_t {
-        std::vector<float> biased(vocab_size);
+    SamplerRng rng(params.seed);
+    int32_t step = 0;
+    std::vector<int32_t> repetition_last_seen(static_cast<size_t>(vocab_size), -1);
+
+    auto build_biased = [&](const std::vector<float> & logits, bool block_im_end) {
+        std::vector<float> biased(static_cast<size_t>(vocab_size));
         for (int32_t i = 0; i < vocab_size; ++i) {
-            biased[i] = logits[i] + sem_mask[i];
+            float value = logits[static_cast<size_t>(i)];
+            if (params.repetition_penalty != 1.0f && params.repetition_window > 0 &&
+                repetition_last_seen[static_cast<size_t>(i)] >= 0 &&
+                step - repetition_last_seen[static_cast<size_t>(i)] <= params.repetition_window &&
+                std::isfinite(value)) {
+                if (value > 0.0f) value /= params.repetition_penalty;
+                else if (value < 0.0f) value *= params.repetition_penalty;
+            }
+            biased[static_cast<size_t>(i)] = value + sem_mask[static_cast<size_t>(i)];
         }
         if (block_im_end && im_end_id >= 0 && im_end_id < vocab_size) {
-            biased[im_end_id] = -std::numeric_limits<float>::infinity();
+            biased[static_cast<size_t>(im_end_id)] = -std::numeric_limits<float>::infinity();
         }
+        return biased;
+    };
+
+    // Apply semantic mask/repetition penalty and sample from the request-local RNG.
+    auto apply_mask_and_sample = [&](const std::vector<float> & logits,
+                                     bool block_im_end) -> int32_t {
+        std::vector<float> biased = build_biased(logits, block_im_end);
         SamplerParams sparams;
         sparams.temperature = params.temperature;
         sparams.top_p       = params.top_p;
         sparams.top_k       = params.top_k;
-        // Pass im_end_id so it is always eligible for sampling when not blocked,
-        // regardless of GPU numerical precision (fixes NVIDIA/NV_coopmat2 EOS dropout).
         const int32_t force_id = block_im_end ? -1 : im_end_id;
-        return sample_token(biased.data(), vocab_size, sparams, force_id);
+        return sample_token(biased.data(), vocab_size, sparams, force_id, &rng);
     };
 
-    // Sample first main_token
-    bool block_end = (params.min_tokens_before_end > 0);
+    // Sample first main_token. Warmup may force one semantic frame even when
+    // the effective budget is exactly one token.
+    bool block_end = params.force_first_token || (min_tokens_before_end > 0);
     int32_t main_token = apply_mask_and_sample(state.logits, block_end);
     if (main_token < 0) {
         std::cerr << "[Generate] Sampling failed (non-finite logits).\n";
@@ -122,27 +151,21 @@ GenerateResult generate(
         std::cout << "[Generate] Generating (max " << params.max_new_tokens << " tokens)..." << std::endl;
     }
 
-    int32_t step = 0;
     while (main_token != im_end_id && step < params.max_new_tokens) {
         // RAS check
         if (!ras_window.empty() &&
             std::find(ras_window.begin(), ras_window.end(), main_token) != ras_window.end() &&
             main_token >= sem_begin && main_token <= sem_end)
         {
-            // Resample with high temperature
-            std::vector<float> biased(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                biased[i] = state.logits[i] + sem_mask[i];
-            }
-            if (step < params.min_tokens_before_end && im_end_id >= 0 && im_end_id < vocab_size) {
-                biased[im_end_id] = -std::numeric_limits<float>::infinity();
-            }
+            const bool ras_block_end = (params.force_first_token && step == 0) ||
+                                       (step < min_tokens_before_end);
+            std::vector<float> biased = build_biased(state.logits, ras_block_end);
             SamplerParams ras_sparams;
             ras_sparams.temperature = ras_high_temp;
             ras_sparams.top_p       = ras_high_top_p;
             ras_sparams.top_k       = params.top_k;
-            const int32_t ras_force_id = (step < params.min_tokens_before_end) ? -1 : im_end_id;
-            main_token = sample_token(biased.data(), vocab_size, ras_sparams, ras_force_id);
+            const int32_t ras_force_id = ras_block_end ? -1 : im_end_id;
+            main_token = sample_token(biased.data(), vocab_size, ras_sparams, ras_force_id, &rng);
             if (main_token < 0) {
                 std::cerr << "[Generate] RAS sampling failed.\n";
                 out.codes.clear();
@@ -162,6 +185,9 @@ GenerateResult generate(
             out.n_frames = 0;
             return out;
         }
+
+        // Record semantic history for the explicit repetition penalty.
+        repetition_last_seen[static_cast<size_t>(main_token)] = step;
 
         // Update RAS window only with semantic tokens.
         if (ras_window_size > 0) {
@@ -199,7 +225,7 @@ GenerateResult generate(
                 out.n_frames = 0;
                 return out;
             }
-            int32_t cb_token = sample_token(fast_logits.data(), codebook_size, sparams);
+            int32_t cb_token = sample_token(fast_logits.data(), codebook_size, sparams, -1, &rng);
             if (cb_token < 0 || cb_token >= codebook_size) {
                 std::cerr << "[Generate] Fast-decoder sampling failed/out of range at cb " << cb_idx << std::endl;
                 out.codes.clear();
@@ -214,6 +240,16 @@ GenerateResult generate(
             out.codes[static_cast<size_t>(cb) * params.max_new_tokens + step] = codebooks_cb[cb];
         }
         out.n_frames++;
+        step++;
+
+        if (params.verbose && step % 50 == 0) {
+            std::cout << "\r[Generate] " << step << " / " << params.max_new_tokens << " tokens..." << std::flush;
+        }
+
+        // The final permitted frame is already complete. Do not execute an
+        // extra model step/sampling pass that can only fail spuriously because
+        // there will be no next iteration to consume it.
+        if (step >= params.max_new_tokens) break;
 
         // Build step_input: [main_token (vocab space), codebooks_cb[0..num_cb-1] (codebook space)]
         std::vector<int32_t> step_input(num_cb + 1);
@@ -230,13 +266,8 @@ GenerateResult generate(
             return out;
         }
 
-        step++;
-        if (params.verbose && step % 50 == 0) {
-            std::cout << "\r[Generate] " << step << " / " << params.max_new_tokens << " tokens..." << std::flush;
-        }
-
         // Apply semantic mask and sample next main token
-        bool block_next_end = (step < params.min_tokens_before_end);
+        bool block_next_end = (step < min_tokens_before_end);
         main_token = apply_mask_and_sample(state.logits, block_next_end);
         if (main_token < 0) {
             std::cerr << "[Generate] Sampling failed at step " << step << ".\n";
@@ -300,6 +331,8 @@ GenerateResult generate_streaming(
         params.top_k < 0 || params.top_k > 1000000 ||
         params.min_tokens_before_end < 0 ||
         params.ras_window_size < 0 || params.ras_window_size > 32768 ||
+        !std::isfinite(params.repetition_penalty) || params.repetition_penalty < 1.0f || params.repetition_penalty > 10.0f ||
+        params.repetition_window < 0 || params.repetition_window > 32768 ||
         !std::isfinite(params.ras_high_temp) || params.ras_high_temp < 0.0f || params.ras_high_temp > 10.0f ||
         !std::isfinite(params.ras_high_top_p) || params.ras_high_top_p <= 0.0f || params.ras_high_top_p > 1.0f ||
         vocab_size <= 0 || codebook_size <= 0 ||
@@ -309,6 +342,14 @@ GenerateResult generate_streaming(
         prompt.data.size() != static_cast<size_t>(prompt.rows) * static_cast<size_t>(prompt.cols)) {
         std::cerr << "[GenerateStream] Invalid generation parameters/model/prompt dimensions.\n";
         return out;
+    }
+
+    const int32_t min_tokens_before_end =
+        std::min(params.min_tokens_before_end, std::max(0, params.max_new_tokens - 1));
+    if (params.verbose && min_tokens_before_end != params.min_tokens_before_end) {
+        std::cout << "[GenerateStream] min_end_tokens clamped from " << params.min_tokens_before_end
+                  << " to " << min_tokens_before_end << " for max_new_tokens="
+                  << params.max_new_tokens << ".\n";
     }
 
     std::vector<float> sem_mask(vocab_size, -std::numeric_limits<float>::infinity());
@@ -331,18 +372,37 @@ GenerateResult generate_streaming(
         return out;
     }
 
-    auto apply_mask_and_sample = [&](const std::vector<float> & logits, bool block_im_end) -> int32_t {
-        std::vector<float> biased(vocab_size);
-        for (int32_t i = 0; i < vocab_size; ++i) biased[i] = logits[i] + sem_mask[i];
+    SamplerRng rng(params.seed);
+    int32_t step = 0;
+    std::vector<int32_t> repetition_last_seen(static_cast<size_t>(vocab_size), -1);
+
+    auto build_biased = [&](const std::vector<float> & logits, bool block_im_end) {
+        std::vector<float> biased(static_cast<size_t>(vocab_size));
+        for (int32_t i = 0; i < vocab_size; ++i) {
+            float value = logits[static_cast<size_t>(i)];
+            if (params.repetition_penalty != 1.0f && params.repetition_window > 0 &&
+                repetition_last_seen[static_cast<size_t>(i)] >= 0 &&
+                step - repetition_last_seen[static_cast<size_t>(i)] <= params.repetition_window &&
+                std::isfinite(value)) {
+                if (value > 0.0f) value /= params.repetition_penalty;
+                else if (value < 0.0f) value *= params.repetition_penalty;
+            }
+            biased[static_cast<size_t>(i)] = value + sem_mask[static_cast<size_t>(i)];
+        }
         if (block_im_end && im_end_id >= 0 && im_end_id < vocab_size)
-            biased[im_end_id] = -std::numeric_limits<float>::infinity();
+            biased[static_cast<size_t>(im_end_id)] = -std::numeric_limits<float>::infinity();
+        return biased;
+    };
+
+    auto apply_mask_and_sample = [&](const std::vector<float> & logits, bool block_im_end) -> int32_t {
+        std::vector<float> biased = build_biased(logits, block_im_end);
         SamplerParams sp;
         sp.temperature = params.temperature; sp.top_p = params.top_p; sp.top_k = params.top_k;
         const int32_t force_id = block_im_end ? -1 : im_end_id;
-        return sample_token(biased.data(), vocab_size, sp, force_id);
+        return sample_token(biased.data(), vocab_size, sp, force_id, &rng);
     };
 
-    bool block_end = (params.min_tokens_before_end > 0);
+    bool block_end = params.force_first_token || (min_tokens_before_end > 0);
     int32_t main_token = apply_mask_and_sample(state.logits, block_end);
     if (main_token < 0) {
         std::cerr << "[GenerateStream] Sampling failed (non-finite logits).\n";
@@ -366,21 +426,19 @@ GenerateResult generate_streaming(
     if (params.verbose) std::cout << "[GenerateStream] Generating...\n";
 
     bool internal_ok = true;
-    int32_t step = 0;
     while (main_token != im_end_id && step < params.max_new_tokens) {
         // RAS check
         if (!ras_window.empty() &&
             std::find(ras_window.begin(), ras_window.end(), main_token) != ras_window.end() &&
             main_token >= sem_begin && main_token <= sem_end)
         {
-            std::vector<float> biased(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) biased[i] = state.logits[i] + sem_mask[i];
-            if (step < params.min_tokens_before_end && im_end_id >= 0 && im_end_id < vocab_size)
-                biased[im_end_id] = -std::numeric_limits<float>::infinity();
+            const bool ras_block_end = (params.force_first_token && step == 0) ||
+                                       (step < min_tokens_before_end);
+            std::vector<float> biased = build_biased(state.logits, ras_block_end);
             SamplerParams ras_sp;
             ras_sp.temperature = ras_high_temp; ras_sp.top_p = ras_high_top_p; ras_sp.top_k = params.top_k;
             main_token = sample_token(biased.data(), vocab_size, ras_sp,
-                                      (step < params.min_tokens_before_end) ? -1 : im_end_id);
+                                      ras_block_end ? -1 : im_end_id, &rng);
             if (main_token < 0) {
                 std::cerr << "[GenerateStream] RAS sampling failed.\n";
                 internal_ok = false;
@@ -396,6 +454,9 @@ GenerateResult generate_streaming(
             internal_ok = false;
             break;
         }
+
+        // Record semantic history for the explicit repetition penalty.
+        repetition_last_seen[static_cast<size_t>(main_token)] = step;
 
         if (ras_window_size > 0) {
             ras_window.push_back(main_token);
@@ -422,7 +483,7 @@ GenerateResult generate_streaming(
                 internal_ok = false;
                 break;
             }
-            const int32_t cb_token = sample_token(fast_logits.data(), codebook_size, sparams);
+            const int32_t cb_token = sample_token(fast_logits.data(), codebook_size, sparams, -1, &rng);
             if (cb_token < 0 || cb_token >= codebook_size) {
                 std::cerr << "[GenerateStream] Fast-decoder sampling failed/out of range at cb " << cb_idx << "\n";
                 internal_ok = false;
@@ -437,6 +498,12 @@ GenerateResult generate_streaming(
         for (int32_t cb = 0; cb < num_cb; ++cb) frame_codes[cb] = codebooks_cb[cb];
         if (!frame_cb(frame_codes.data(), num_cb)) break;   // caller requested stop
         out.n_frames++;
+        step++;
+
+        if (params.verbose && step % 50 == 0)
+            std::cout << "\r[GenerateStream] " << step << " tokens..." << std::flush;
+
+        if (step >= params.max_new_tokens) break;
 
         std::vector<int32_t> step_input(num_cb + 1);
         step_input[0] = main_token;
@@ -449,11 +516,7 @@ GenerateResult generate_streaming(
             break;
         }
 
-        step++;
-        if (params.verbose && step % 50 == 0)
-            std::cout << "\r[GenerateStream] " << step << " tokens..." << std::flush;
-
-        bool block_next_end = (step < params.min_tokens_before_end);
+        bool block_next_end = (step < min_tokens_before_end);
         main_token = apply_mask_and_sample(state.logits, block_next_end);
         if (main_token < 0) {
             std::cerr << "[GenerateStream] Sampling failed at step " << step << ".\n";

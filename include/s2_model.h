@@ -132,12 +132,36 @@ public:
     }
 
 private:
+    struct HostEmbeddingTable {
+        enum ggml_type type = GGML_TYPE_COUNT;
+        int64_t width = 0;
+        int64_t rows = 0;
+        size_t row_bytes = 0;
+        std::vector<uint8_t> data;
+
+        bool valid() const {
+            return type != GGML_TYPE_COUNT && width > 0 && rows > 0 && row_bytes > 0 && !data.empty();
+        }
+        void clear() {
+            type = GGML_TYPE_COUNT;
+            width = 0;
+            rows = 0;
+            row_bytes = 0;
+            std::vector<uint8_t>().swap(data);
+        }
+    };
+
     ModelHParams   hparams_;
     ModelWeights   weights_;
     ggml_backend_t backend_      = nullptr;
     ggml_backend_t backend_cpu_  = nullptr;
-    ggml_backend_buffer_t emb_buf_cpu_ = nullptr;
     bool           cuda_mode_    = false;
+    bool           cuda_host_embeddings_ = false;
+    bool           cuda_host_codebook_embeddings_ = false;
+    bool           cuda_fast_host_embeddings_ = false;
+    HostEmbeddingTable host_embeddings_;
+    HostEmbeddingTable host_codebook_embeddings_;
+    HostEmbeddingTable host_fast_embeddings_;
     ggml_gallocr_t allocr_       = nullptr;
     ggml_gallocr_t fast_allocr_  = nullptr;
     ggml_context * ctx_kv_      = nullptr;
@@ -156,6 +180,9 @@ private:
     bool eval_cached(const std::vector<int32_t> & flat_tokens,
                      int32_t n_tokens, int32_t n_threads,
                      StepResult & result);
+
+    bool decode_host_embedding_row(const HostEmbeddingTable & table,
+                                   int64_t row, float * out) const;
 };
 
 } // namespace s2

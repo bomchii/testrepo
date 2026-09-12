@@ -1,6 +1,11 @@
 #include "s2_pipeline.h"
+#include "s2_json.h"
+#include "s2_utf8.h"
 #if defined(GGML_USE_CUDA)
 #  include <cuda_runtime.h>
+#endif
+#ifndef CROW_ENFORCE_WS_SPEC
+#define CROW_ENFORCE_WS_SPEC
 #endif
 #include <crow.h>
 #include <fstream>
@@ -96,6 +101,16 @@ static int parse_int_arg(const char * raw) {
     return parsed;
 }
 
+static uint64_t parse_u64_arg(const char * raw) {
+    if (!raw) throw std::invalid_argument("missing unsigned integer value");
+    const std::string value(raw);
+    if (value.empty() || value[0] == '-') throw std::invalid_argument("expected uint64: " + value);
+    size_t pos = 0;
+    const unsigned long long parsed = std::stoull(value, &pos, 10);
+    if (pos != value.size()) throw std::invalid_argument("trailing characters in uint64: " + value);
+    return static_cast<uint64_t>(parsed);
+}
+
 #ifdef _WIN32
 static bool utf8_to_wide_path(const std::string & value, std::wstring & out) {
     out.clear();
@@ -133,16 +148,107 @@ static float parse_float_arg(const char * raw) {
     return parsed;
 }
 
+static bool json_is_integer(const crow::json::rvalue & value) {
+    if (value.t() != crow::json::type::Number) return false;
+    const auto nt = value.nt();
+    return nt == crow::json::num_type::Signed_integer ||
+           nt == crow::json::num_type::Unsigned_integer;
+}
+
 static int32_t checked_json_i32(const crow::json::rvalue & value) {
-    // Crow exposes JSON integers as int64_t. Narrowing first and validating the
-    // int32_t afterwards lets values such as 4294967297 wrap to 1 and bypass
-    // request limits. Range-check before the cast instead.
+    if (!json_is_integer(value)) throw std::invalid_argument("JSON field must be an integer number");
+    if (value.nt() == crow::json::num_type::Unsigned_integer) {
+        const uint64_t v = value.u();
+        if (v > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()))
+            throw std::out_of_range("JSON integer is outside int32 range");
+        return static_cast<int32_t>(v);
+    }
     const int64_t v = value.i();
     if (v < static_cast<int64_t>(std::numeric_limits<int32_t>::min()) ||
-        v > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        v > static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
         throw std::out_of_range("JSON integer is outside int32 range");
-    }
     return static_cast<int32_t>(v);
+}
+
+static uint64_t checked_json_u64(const crow::json::rvalue & value) {
+    if (!json_is_integer(value)) throw std::invalid_argument("JSON field must be an integer number");
+    if (value.nt() == crow::json::num_type::Unsigned_integer) return value.u();
+    const int64_t v = value.i();
+    if (v < 0) throw std::out_of_range("JSON uint64 must be non-negative");
+    return static_cast<uint64_t>(v);
+}
+
+static uint64_t checked_json_fish_seed(const crow::json::rvalue & value) {
+    // Fish Speech serializes an unspecified seed as null; s2.cpp uses 0 for random.
+    if (value.t() == crow::json::type::Null) return 0;
+    return checked_json_u64(value);
+}
+
+static int32_t checked_json_fish_max_new_tokens(const crow::json::rvalue & value) {
+    const int32_t v = checked_json_i32(value);
+    // Fish Speech/WebUI defines 0 as no explicit limit. Keep a finite defensive
+    // ceiling here; Pipeline clamps this again to the model context before decode.
+    return v == 0 ? 32768 : v;
+}
+
+static void validate_fish_json_subset(const crow::json::rvalue & json, bool http_buffered) {
+    // Known Fish fields that materially change generation/output but do not yet
+    // have an equivalent implementation here must fail explicitly. Silently
+    // accepting them is worse than a clear subset error because the client may
+    // believe it requested different prosody/chunk continuity/normalization.
+    static constexpr const char * unsupported_semantic_fields[] = {
+        "early_stop_threshold",
+        "normalize",
+        "sample_rate",
+        "mp3_bitrate",
+        "opus_bitrate",
+        "use_memory_cache",
+    };
+    for (const char * field : unsupported_semantic_fields) {
+        if (json.has(field)) {
+            throw std::invalid_argument(
+                std::string("Fish field '") + field +
+                "' is not supported by this API subset and must not be ignored");
+        }
+    }
+
+    if (json.has("references")) {
+        const auto & refs = json["references"];
+        if (refs.t() != crow::json::type::List)
+            throw std::invalid_argument("Fish field 'references' must be an array");
+        if (refs.size() != 0)
+            throw std::invalid_argument(
+                "inline Fish 'references' are not supported by this JSON API; "
+                "use reference_audio+prompt_text or reference_id/voice");
+    }
+    if (json.has("streaming")) {
+        const auto & streaming = json["streaming"];
+        if (streaming.t() != crow::json::type::True &&
+            streaming.t() != crow::json::type::False)
+            throw std::invalid_argument("Fish field 'streaming' must be a boolean");
+        if (http_buffered && streaming.b())
+            throw std::invalid_argument(
+                "HTTP streaming=true is not supported; use /ws/tts for streaming audio");
+        if (!http_buffered && !streaming.b())
+            throw std::invalid_argument(
+                "streaming=false is incompatible with /ws/tts; use an HTTP synthesis endpoint");
+    }
+
+    // Route-specific fields must not be accepted as silent no-ops. HTTP returns
+    // one buffered WAV/PCM response; WebSocket always streams framed PCM.
+    if (http_buffered && json.has("stream_stride"))
+        throw std::invalid_argument(
+            "stream_stride is WebSocket-only; use /ws/tts or --stream-decode-stride as its server default");
+    if (!http_buffered && (json.has("format") || json.has("response_format")))
+        throw std::invalid_argument(
+            "format/response_format are HTTP-only; /ws/tts always streams PCM");
+}
+
+static crow::json::rvalue load_json_strict(const std::string & raw) {
+    std::string normalized, error;
+    if (!s2::json::normalize_surrogate_pairs(raw, normalized, &error))
+        throw std::invalid_argument(error);
+    return crow::json::load(normalized);
 }
 
 constexpr size_t MAX_JSON_REQUEST_BYTES = 8u * 1024u * 1024u;
@@ -152,8 +258,14 @@ struct ScopedTempPath {
     ~ScopedTempPath() {
         if (path.empty()) return;
 #ifdef _WIN32
-        std::wstring wpath;
-        if (utf8_to_wide_path(path, wpath)) DeleteFileW(wpath.c_str());
+        // Destructors are implicitly noexcept. UTF-8 -> UTF-16 conversion may
+        // allocate, so cleanup must absorb allocation/conversion failures
+        // instead of terminating the server while unwinding another error.
+        try {
+            std::wstring wpath;
+            if (utf8_to_wide_path(path, wpath)) DeleteFileW(wpath.c_str());
+        } catch (...) {
+        }
 #else
         std::remove(path.c_str());
 #endif
@@ -238,11 +350,10 @@ static bool validate_pipeline_params(const s2::PipelineParams & p,
                                      std::string & error,
                                      bool require_text = false) {
     auto fail = [&](const std::string & msg) { error = msg; return false; };
-    auto has_non_ws = [](const std::string & value) {
-        return std::any_of(value.begin(), value.end(), [](unsigned char c) { return !std::isspace(c); });
-    };
-    if (require_text && !has_non_ws(p.text)) return fail("text must not be empty or whitespace-only");
-    if (!p.prompt_audio_path.empty() && !has_non_ws(p.prompt_text))
+    if (!s2::utf8::is_valid(p.text)) return fail("text must be valid UTF-8");
+    if (!s2::utf8::is_valid(p.prompt_text)) return fail("prompt_text must be valid UTF-8");
+    if (require_text && !s2::utf8::has_non_whitespace(p.text)) return fail("text must not be empty or whitespace-only");
+    if (!p.prompt_audio_path.empty() && !s2::utf8::has_non_whitespace(p.prompt_text))
         return fail("reference_audio/--prompt-audio requires a non-empty prompt_text/--prompt-text");
     if (p.text.size() > 1024u * 1024u) return fail("text exceeds 1 MiB request limit");
     if (p.prompt_text.size() > 1024u * 1024u) return fail("prompt_text exceeds 1 MiB request limit");
@@ -267,6 +378,14 @@ static bool validate_pipeline_params(const s2::PipelineParams & p,
     if (p.gen.top_k < 0 || p.gen.top_k > 1000000) return fail("top_k must be between 0 and 1000000");
     if (p.gen.min_tokens_before_end < 0 || p.gen.min_tokens_before_end > 32768)
         return fail("min_end_tokens must be between 0 and 32768");
+    if (p.gen.min_tokens_before_end >= p.gen.max_new_tokens)
+        return fail("min_end_tokens must be smaller than max_tokens");
+    if (p.gen.repetition_penalty < 1.0f || !std::isfinite(p.gen.repetition_penalty) || p.gen.repetition_penalty > 10.0f)
+        return fail("repetition_penalty must be finite and between 1.0 and 10.0");
+    if (p.gen.repetition_window < 0 || p.gen.repetition_window > 32768)
+        return fail("repetition_window must be between 0 and 32768");
+    if (p.multi_turn_history < 0 || p.multi_turn_history > 1024)
+        return fail("multi_turn_history must be between 0 and 1024");
     if (p.gen.ras_window_size < 0 || p.gen.ras_window_size > 32768)
         return fail("ras_window must be between 0 and 32768");
     if (!std::isfinite(p.gen.ras_high_temp) || p.gen.ras_high_temp < 0.0f || p.gen.ras_high_temp > 10.0f)
@@ -276,6 +395,14 @@ static bool validate_pipeline_params(const s2::PipelineParams & p,
     if (p.codec_chunk_frames < 0) return fail("codec_chunk must be >= 0");
     if (p.codec_overlap_frames < 0) return fail("codec_overlap must be >= 0");
     if (p.min_seg_chars < 0 || p.min_seg_chars > 1000000) return fail("min_seg_chars must be between 0 and 1000000");
+    if (p.chunk_length != 0 && (p.chunk_length < 100 || p.chunk_length > 300))
+        return fail("chunk_length must be 0 (off) or between 100 and 300");
+    if (p.min_chunk_length < 0 || p.min_chunk_length > 100)
+        return fail("min_chunk_length must be between 0 and 100");
+    if (p.chunk_length == 0 && p.min_chunk_length != 0)
+        return fail("min_chunk_length requires chunk_length");
+    if (!std::isfinite(p.prosody_volume_db) || p.prosody_volume_db < -20.0f || p.prosody_volume_db > 20.0f)
+        return fail("prosody volume must be finite and between -20 and 20 dB");
     if (p.stream_decode_stride_frames < -1 || p.stream_decode_stride_frames > 32768)
         return fail("stream_stride must be -1 (disabled), 0 (auto), or 1..32768");
     if (p.vulkan_device < -1) return fail("model device must be -1 (CPU) or >= 0");
@@ -303,8 +430,12 @@ int main(int argc, char** argv) {
     params.gen.top_k            = 30;
     params.segment_sentences    = false; // OFF por defecto -- el usuario activa con --segment
     params.codec_chunk_frames   = 0;     // 0 = automatico (se calcula en runtime)
-    params.codec_overlap_frames  = 0;     // 0 = sin overlap (recomendado con VRAM ajustada)
+    params.codec_overlap_frames  = 0;     // 0 = historial automatico del codec
     params.min_seg_chars         = 0;     // 0 = sin filtro de longitud minima
+    params.chunk_length          = 0;     // 0 = long-form Fish chunking OFF
+    params.min_chunk_length      = 0;
+    params.condition_on_previous_chunks = true;
+    params.prosody_volume_db     = 0.0f;
     // GenerateParams defaults (tambien en s2_generate.h)
     params.gen.temperature       = 0.7f;
     params.gen.top_p             = 0.7f;
@@ -313,6 +444,11 @@ int main(int argc, char** argv) {
     params.gen.ras_window_size   = 10;
     params.gen.ras_high_temp     = 1.0f;
     params.gen.ras_high_top_p    = 0.9f;
+    params.gen.seed              = 0;
+    params.gen.repetition_penalty = 1.0f;
+    params.gen.repetition_window = 64;
+    params.multi_turn_history     = 0;
+    params.warmup                 = false;
     params.base_dir             = exe_dir;
     params.output_path          = "";     // vacio = usar archivo temporal Crow
     params.trim_silence         = false;
@@ -352,6 +488,16 @@ int main(int argc, char** argv) {
             params.codec_overlap_frames = parse_int_arg(argv[++i]);
         } else if (arg == "--min-seg-chars" && i + 1 < argc) {
             params.min_seg_chars = parse_int_arg(argv[++i]);
+        } else if (arg == "--chunk-length" && i + 1 < argc) {
+            params.chunk_length = parse_int_arg(argv[++i]);
+        } else if (arg == "--min-chunk-length" && i + 1 < argc) {
+            params.min_chunk_length = parse_int_arg(argv[++i]);
+        } else if (arg == "--condition-on-previous-chunks") {
+            params.condition_on_previous_chunks = true;
+        } else if (arg == "--no-condition-on-previous-chunks") {
+            params.condition_on_previous_chunks = false;
+        } else if (arg == "--prosody-volume" && i + 1 < argc) {
+            params.prosody_volume_db = parse_float_arg(argv[++i]);
         } else if ((arg == "--temperature" || arg == "--temp") && i + 1 < argc) {
             params.gen.temperature = parse_float_arg(argv[++i]);
         } else if (arg == "--top-p" && i + 1 < argc) {
@@ -360,6 +506,16 @@ int main(int argc, char** argv) {
             params.gen.top_k = parse_int_arg(argv[++i]);
         } else if (arg == "--min-end-tokens" && i + 1 < argc) {
             params.gen.min_tokens_before_end = parse_int_arg(argv[++i]);
+        } else if (arg == "--seed" && i + 1 < argc) {
+            params.gen.seed = parse_u64_arg(argv[++i]);
+        } else if (arg == "--repetition-penalty" && i + 1 < argc) {
+            params.gen.repetition_penalty = parse_float_arg(argv[++i]);
+        } else if (arg == "--repetition-window" && i + 1 < argc) {
+            params.gen.repetition_window = parse_int_arg(argv[++i]);
+        } else if (arg == "--multi-turn-history" && i + 1 < argc) {
+            params.multi_turn_history = parse_int_arg(argv[++i]);
+        } else if (arg == "--warmup") {
+            params.warmup = true;
         } else if (arg == "--ras-window" && i + 1 < argc) {
             params.gen.ras_window_size = parse_int_arg(argv[++i]);
         } else if (arg == "--ras-temp" && i + 1 < argc) {
@@ -400,231 +556,319 @@ int main(int argc, char** argv) {
             params.stream_decode_stride_frames = parse_int_arg(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout <<
-R"(s2 -- Fish Speech TTS server + CLI  (CPU / Vulkan / CUDA / Metal)
-HTTP+WebSocket server and CLI tool for local voice cloning with Fish Speech models.
+R"S2HELP(s2 -- Fish Speech TTS server + CLI (CPU / Vulkan / CUDA / Metal)
+Local Fish Speech synthesis, voice cloning, saved .s2voice profiles, HTTP API,
+and WebSocket PCM streaming. The same CLI is used by every backend-specific build.
 
-QUICK START:
-  Server -- CPU (works everywhere):
-    s2.exe --model s2-pro-q4_k_m-transformer-only.gguf \
-           --model-codec s2-pro-q4_k_m-codec-only.gguf
+USAGE:
+  s2 [options]                         Start the HTTP/WebSocket server.
+  s2 [options] --output out.wav        Synthesize once to WAV and exit.
+  s2 [options] --save-voice ...        Encode/save a .s2voice profile.
+  s2 [options] --list-voices           List saved profiles and exit.
+  s2 --help                            Show this help and exit.
 
-  Server -- RTX 3050 laptop (4 GB VRAM, iGPU on index 0):
-    s2.exe --model s2-pro-q4_k_m-transformer-only.gguf \
-           --model-codec s2-pro-q4_k_m-codec-only.gguf \
-           -v 1 --codec-vulkan 1 --segment --codec-chunk 32 \
-           --max-seg-tokens 300 --min-seg-chars 60 \
-           --temperature 0.8 --top-p 0.8 --top-k 40
+  Release filenames: Windows CPU = s2-cpu.exe, Vulkan = s2.exe,
+  CUDA = s2-cuda.exe, macOS Metal = s2-metal. The examples below use `s2`
+  as a placeholder for whichever backend-specific executable you downloaded.
 
-  CLI -- synthesize once to a file (no server):
-    s2.exe --model ... --model-codec ... -v 1 --codec-vulkan 1 \
-           --prompt-audio ref.wav --prompt-text "Reference transcript." \
-           --text "Hello, this is a cloned voice." \
-           --trim-silence --output hello.wav
+QUICK START - DOWNLOADED RELEASE:
+  There is no --server flag. Server mode is the default when --output is absent.
+  Replace the model filenames below with the files you downloaded.
 
-  Save a voice profile, then reuse it by name:
-    s2.exe --model ... --model-codec ... -v 1 --codec-vulkan 1 \
-           --prompt-audio ref.wav --prompt-text "Reference transcript." \
-           --voice my_voice --save-voice
-    s2.exe --model ... --model-codec ... -v 1 --codec-vulkan 1 \
-           --voice my_voice --text "Hello from saved voice." --output out.wav
+  Windows CPU:
+    s2-cpu.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1
+  Windows Vulkan, GPU 0:
+    s2.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0
+  Windows CUDA, GPU 0:
+    s2-cuda.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0
+  macOS Metal:
+    ./s2-metal --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0
 
-  List saved voice profiles:
-    s2.exe --list-voices
+  All four listen on http://127.0.0.1:8080 by default. Check the server with:
+    curl http://127.0.0.1:8080/v1/health
+  On Windows PowerShell, use curl.exe instead of curl if curl is an alias.
+  If one combined GGUF contains both parts, pass that same file to --model and
+  --model-codec. The codec follows the transformer device by default.
 
-OPTIONS:
+  CUDA packaged launcher only:
+    s2-cuda.exe --runtime-info        Show embedded CUDA runtime/cache details.
+    s2-cuda.exe --clean-runtime       Remove inactive extracted runtime caches.
 
-  Models:
-    -m,  --model <path>          Path to the transformer GGUF model file.
-                                 Default: model.gguf next to the executable.
-         --model-codec <path>    Path to the codec GGUF model file.
-                                 Default: codec.gguf next to the executable.
-    -t,  --tokenizer <path>      Path to tokenizer.json.
-                                 Default: tokenizer embedded inside the exe.
+COMMAND MODES / FUNCTIONS:
+  Server mode (default)
+    Mode precedence is: --help exits immediately; --list-voices exits before
+    model loading; --save-voice saves and exits unless --output is also present;
+    --output synthesizes once and exits. Otherwise s2 starts Crow HTTP/WebSocket.
+    Generation, voice, segmentation, sampling and codec options become server
+    defaults and supported request JSON fields can override them per request.
 
-  GPU / device selection:
-    -v,  --vulkan <N>            GPU device index for the transformer model.
-                                 In Vulkan builds this selects the Vulkan device.
-                                 In CUDA builds this selects the CUDA device.
-                                 In Metal builds, 0 enables the Metal device.
-                                   -1  CPU (default -- works on any machine)
-                                    0  first GPU
-                                    1  second GPU (use on laptops where
-                                       index 0 is the Intel/AMD iGPU)
-         --codec-vulkan <N>      Codec device index (legacy option name).
-                                  -2  inherit transformer device (default)
-                                  -1  force codec to CPU
-                                  >=0 select that Vulkan/CUDA GPU; Metal uses device 0
-                                 Note: q4_k_m codec only works on GPU; CPU
-                                 fallback requires f16 or f32 codec weights.
+  One-shot synthesis
+    --output <path> writes one WAV file and exits without starting the server.
+    Input comes from --text; if --text is omitted, UTF-8 text is read from stdin.
 
-  NOTE FOR CUDA BUILDS (s2-cuda.exe):
-    -v and --codec-vulkan select transformer and codec devices independently.
-    Example: model+codec on the first NVIDIA GPU:
-      s2-cuda.exe --model ... --model-codec ... -v 0 --segment --codec-chunk 32
-    Example: transformer on CUDA, codec forced to CPU:
-      s2-cuda.exe --model ... --model-codec ... -v 0 --codec-vulkan -1
+  Save a voice profile
+    --save-voice requires --voice <id>, --prompt-audio <path> and
+    --prompt-text <text>. It encodes the reference and saves <id>.s2voice.
+    With no --output it exits after saving. With --output it saves first, then
+    performs the requested one-shot synthesis.
+
+  List voice profiles
+    --list-voices lists IDs under --voice-dir and exits without loading models.
+
+MORE EXAMPLES:
+  Server on a different port (still localhost-only):
+    s2 --model model.gguf --model-codec codec.gguf --port 8081
+
+  One-shot synthesis:
+    s2 --model model.gguf --model-codec codec.gguf \
+       --text "Hello world." --output hello.wav
+
+  One-shot synthesis from stdin:
+    echo "Hello from stdin." | s2 --model model.gguf --model-codec codec.gguf \
+       --output hello.wav
+
+  Clone directly from reference audio:
+    s2 --model model.gguf --model-codec codec.gguf \
+       --prompt-audio ref.wav --prompt-text "Exact reference transcript." \
+       --text "Hello in the reference voice." --output cloned.wav
+
+  Save and reuse a voice profile:
+    s2 --model model.gguf --model-codec codec.gguf \
+       --prompt-audio ref.wav --prompt-text "Exact reference transcript." \
+       --voice narrator --save-voice
+    s2 --model model.gguf --model-codec codec.gguf \
+       --voice narrator --text "Hello again." --output reused.wav
+
+ALL COMMAND-LINE OPTIONS:
+
+  Models / tokenizer:
+    -m, --model <path>            Transformer/full GGUF path.
+                                  Default: model.gguf next to executable.
+        --model-codec <path>      Codec/full GGUF path.
+                                  Default: codec.gguf next to executable.
+    -t, --tokenizer <path>        tokenizer.json path for non-embedded builds.
+                                  Release builds normally embed the tokenizer;
+                                  otherwise default is tokenizer.json next to exe.
+
+  Backend / device selection:
+    -v, --vulkan <N>              Transformer device selector (legacy name).
+                                  -1 = CPU (default), 0+ = compiled GPU device.
+                                  Vulkan: Vulkan index; CUDA: CUDA index;
+                                  Metal: any 0+ request is normalized to device 0.
+                                  CPU-only builds ignore GPU requests with warning.
+        --codec-vulkan <N>        Codec device selector (legacy name).
+                                  -2 = inherit transformer device (default)
+                                  -1 = force CPU
+                                   0+ = compiled GPU device (Metal -> device 0)
 
   Server:
-    -p,  --port <N>              HTTP port to listen on. Default: 8080.
-         --host <IP>             Bind IP address. Default: 127.0.0.1 (local only).
-                                 Use 0.0.0.0 only if you intentionally want LAN access.
+    -p, --port <N>                Listen port. Default: 8080. Range: 1..65535.
+        --host <IP>               Bind IPv4/IPv6 address literal only.
+                                  Default: 127.0.0.1. Max text length: 64 chars.
+                                  Use 0.0.0.0 only for intentional LAN exposure.
 
-  Reference audio (voice cloning):
-    -pa, --prompt-audio <path>   Path to reference WAV/MP3 for voice cloning.
-    -pt, --prompt-text <text>    Transcript of the reference audio.
-                                 Required when using --save-voice.
-                                 Helps the model align prosody to the reference.
+  One-shot input/output:
+        --text <text>             Input for --output mode. Max: 1 MiB.
+                                  If omitted with --output, text is read from stdin.
+    -o, --output <path>           Write one WAV file and exit; no server is started.
+        --trim-silence            Trim only final trailing silence.
+        --no-trim-silence         Disable trailing-silence trim (default; also
+                                  overrides an earlier --trim-silence).
 
-  Voice profiles (save and reuse encoded reference voices):
-         --voice <id>            Load a saved voice profile by name.
-                                 Skips re-encoding the reference audio.
-                                 Ignored if --prompt-audio is also given.
-         --save-voice            Encode --prompt-audio and save it as a profile.
-                                 Requires --voice <id>, --prompt-audio,
-                                 and --prompt-text.
-         --voice-dir <path>      Directory for .s2voice profile files.
-                                 Default: voices/ next to the executable.
-         --list-voices           List saved voice profiles and exit.
+  Reference audio / voice cloning:
+    -pa, --prompt-audio <path>    Reference WAV or MP3 path. Max path: 32768 bytes.
+                                  Requires a non-empty --prompt-text. Decoded
+                                  reference duration is limited to 30 seconds.
+    -pt, --prompt-text <text>     Exact transcript of reference audio. Max: 1 MiB.
+        --voice <id>              Load saved .s2voice ID. Max: 128 chars; only
+                                  ASCII letters, digits, '_' and '-' are allowed.
+                                  Explicit --prompt-audio takes precedence.
+        --save-voice              Save encoded reference as --voice <id>.
+                                  Requires --voice, --prompt-audio, --prompt-text.
+        --voice-dir <path>        .s2voice storage directory.
+                                  Default: voices/ next to executable.
+        --list-voices             List saved profile IDs and exit before model load.
 
-  CLI output (no HTTP server):
-    -o,  --output <path>         Synthesize once, write WAV to <path>, exit.
-                                 Combine with --text for the input text, or
-                                 pipe text to stdin if --text is omitted.
-         --text <text>           Input text for CLI mode (--output).
-         --trim-silence          Trim trailing silence from the output WAV.
-         --no-trim-silence       Keep trailing silence in the output (default).
-
-  Generation limits:
-         --threads <N>           CPU threads for CPU-bound ops. Default: 4.
-         --max-tokens <N>        Max tokens per request (no --segment).
-                                 Default: 1024. One token ~= ~11 ms of audio.
-         --max-seg-tokens <N>    Max tokens per sentence with --segment.
-                                 Controls KV-cache size; lower = less VRAM.
-                                 Default: 300 (~3.3 s per sentence).
-
-  Segmentation (recommended for long texts or limited VRAM):
-         --segment               Split text into sentences before generating.
-                                 Each sentence uses its own KV cache, capping
-                                 VRAM to the longest sentence, not the full text.
-                                 Enable per-request: { "segment": true }
-         --min-seg-chars <N>     Merge segments shorter than N characters with
-                                 the next one. Prevents unnatural short clips.
-                                 Default: 0 (no minimum). Recommended: 60-90.
-
-  Codec chunking (advanced -- tune for your VRAM budget):
-         --codec-chunk <N>       Codec frames decoded per GPU call. Smaller =
-                                 less peak VRAM, slightly more overhead.
-                                 Default: 0 (auto, ~120 frames).
-                                 RTX 3050 4 GB with transformer loaded: use 32.
-         --codec-overlap <N>     Overlap frames between codec chunks.
-                                 Smooths chunk boundaries but costs more VRAM
-                                 (graph scales with chunk+overlap). Keep at 0
-                                 on 4 GB GPUs with transformer in VRAM.
-                                 Default: 0.
+  Generation / segmentation:
+    -threads, --threads <N>       CPU threads. Default: 4. Range: 1..256.
+        --max-tokens <N>          Generation budget. Default: 1024.
+                                  Range: 1..32768. In segmented mode it also caps
+                                  each segment's effective budget.
+        --segment                 Enable Unicode-aware sentence segmentation.
+                                  Without a reference/saved voice, the first generated
+                                  segment becomes a request-local voice anchor so later
+                                  segments keep the same random timbre.
+        --max-seg-tokens <N>      Per-segment budget. Default: 300.
+                                  Range: 1..32768; effective segment budget is
+                                  min(--max-tokens, --max-seg-tokens, context).
+        --min-seg-chars <N>       Merge very short sentence pieces. Default: 0.
+                                  Range: 0..1000000; 0 disables minimum length.
+        --chunk-length <N>        Fish-style long-form chunk target in visible
+                                  Unicode characters. Default: 0 = disabled.
+                                  Range when enabled: 100..300. Peak PCM RAM stays
+                                  bounded; the staged WAV grows with final audio but
+                                  no second raw-PCM copy is created.
+        --min-chunk-length <N>    Minimum visible chars for long-form chunks.
+                                  Default: 0. Range: 0..100; requires chunking.
+        --condition-on-previous-chunks
+                                  Keep bounded VQ/acoustic context between chunks
+                                  (default).
+        --no-condition-on-previous-chunks
+                                  Disable automatic inter-chunk VQ conditioning.
+        --prosody-volume <dB>     Output gain after final trim. Default: 0 dB.
+                                  Range: -20..20 dB.
 
   Sampling:
-         --temperature <F>       Sampling temperature. Higher = more expressive,
-                                 less stable. 0 = greedy. Default: 0.7. Range: 0-10.
-         --top-p <F>             Nucleus sampling threshold.
-                                 Default: 0.7. Range: 0.1-1.0.
-         --top-k <N>             Top-k candidates before applying top-p.
-                                 Default: 30.
-         --min-end-tokens <N>    Min tokens before EOS is allowed. Prevents
-                                 empty output on short texts. Default: 64.
+        --temperature <F>         Sampling temperature. Alias: --temp.
+        --temp <F>                Default: 0.7. Range: finite 0..10; 0 = greedy.
+        --top-p <F>               Nucleus threshold. Default: 0.7. Range: (0, 1].
+        --top-k <N>               Top-k cutoff. Default: 30. Range: 0..1000000.
+        --min-end-tokens <N>      Minimum generated tokens before EOS is allowed.
+                                  Default: 64. Range: 0..32768 and must be
+                                  strictly smaller than --max-tokens. It is also
+                                  clamped to the effective generation budget.
+        --seed <uint64>           Request seed. Default: 0 = random source.
+                                  1..UINT64_MAX are deterministic; segmented
+                                  requests derive a stable sub-seed per segment.
+        --repetition-penalty <F>  Explicit recent-token penalty. Default: 1.0
+                                  (disabled). Range: finite 1.0..10.0.
+        --repetition-window <N>   Tokens considered by repetition penalty.
+                                  Default: 64. Range: 0..32768; 0 disables it.
 
-  RAS -- Repetition Aware Sampling (anti-repetition):
-    Detects when the model loops on a token and resamples it at higher
-    temperature. Use if the output stutters or repeats syllables.
-         --ras-window <N>        Recent-token window to watch. Default: 10.
-         --ras-temp <F>          Temperature for the resample. Default: 1.0.
-         --ras-top-p <F>         Top-p for the resample. Default: 0.9.
+  Conversation / startup:
+        --multi-turn-history <N>  Maximum prior text->VQ turns to retain.
+                                  Default: 0 = V7.4 behavior for normal text;
+                                  multi-speaker input still keeps conversational
+                                  VQ context while it fits the model context.
+                                  Explicit range: 0..1024 turns.
+        --warmup                  Run one isolated deterministic model+codec
+                                  warmup before serving/synthesis. Default: OFF.
+                                  It never reuses the real voice/reference state.
 
-  Streaming (WebSocket /ws/tts):
-         --stream-decode-stride <N>
-                                 Codec decode cadence in frames. Lower values
-                                 reduce first-chunk latency at the cost of more
-                                 decode calls. 0 = auto (4 frames), -1 disables
-                                 stride decoding. Default: 0.
+  RAS (Repetition Aware Sampling):
+        --ras-window <N>          Recent-token repetition window. Default: 10.
+                                  Range: 0..32768; 0 disables the window.
+        --ras-temp <F>            Resample temperature. Default: 1.0.
+                                  Range: finite 0..10.
+        --ras-top-p <F>           Resample nucleus threshold. Default: 0.9.
+                                  Range: (0, 1].
+
+  Codec memory / streaming:
+        --codec-chunk <N>         Maximum codec frames per decode window.
+                                  Default: 0 = automatic. Range: >= 0.
+                                  Positive values can reduce peak memory/VRAM.
+        --codec-overlap <N>       Decoder boundary history/holdback frames.
+                                  Default: 0 = codec-derived automatic history.
+                                  Range: >= 0. Positive values explicitly override
+                                  history and can trade continuity for lower memory.
+        --stream-decode-stride <N>
+                                  WebSocket codec decode cadence in frames.
+                                  -1 = disable stride streaming (emit per text segment)
+                                   0 = automatic 4-frame cadence (default)
+                                  1..32768 = explicit cadence.
 
   Other:
-    -h,  --help                  Show this help and exit.
+    -h, --help                    Show this help and exit successfully.
 
-HTTP ENDPOINTS:
-  POST /v1/tts                   Fish Audio-compatible TTS endpoint.
-  POST /v1/audio/speech          OpenAI-compatible TTS endpoint.
-  POST /synthesize               Legacy endpoint.
-  GET  /v1/models                List available models.
-  GET  /health                   Health check.
+OPTION INTERACTIONS:
+  * --prompt-audio requires --prompt-text and takes precedence over --voice.
+  * --codec-vulkan -2 inherits the transformer device after parsing.
+  * --min-end-tokens must be lower than --max-tokens; runtime additionally
+    clamps it below a smaller effective context/segment budget when necessary.
+  * text/prompt_text must be valid UTF-8. --segment handles no-space CJK text,
+    repeated CJK punctuation and Unicode sentence boundaries without inserting
+    artificial ASCII spaces. Keep --min-seg-chars=0 when tiny CJK utterances
+    should remain independent. Without a reference voice, the first generated
+    segment anchors the random timbre for the rest of that request. Internal
+    stride/segment boundaries are not trimmed.
+  * Numeric parsing is strict: trailing junk, NaN/Inf where not allowed, and
+    out-of-range values fail with exit code 1 instead of being silently accepted.
 
-  Request body (JSON) -- all fields optional except "text":
-    {
-      "text":           "Text to synthesize.",
-      "format":         "wav",
-      "segment":        true,
-      "prompt_text":    "Transcript of the reference audio.",
-      "voice":          "my_voice",
-      "temperature":    0.7,
-      "top_p":          0.7,
-      "top_k":          30,
-      "min_end_tokens": 64,
-      "ras_window":     10,
-      "ras_temp":       1.0,
-      "ras_top_p":      0.9,
-      "codec_chunk":    32,
-      "codec_overlap":  0,
-      "min_seg_chars":  60,
-      "trim_silence":   false,
-      "stream_stride":  0
-    }
+SERVER ENDPOINTS (default mode):
+  GET  /                         Service info.
+  GET  /health                   Historical plain-text health check.
+  GET  /v1/health                Fish Speech-compatible JSON health check.
+  GET  /v1/models                Local model service entry.
+  POST /v1/tts                   Fish-Audio-style synthesis.
+  POST /v1/audio/speech          OpenAI-style synthesis subset.
+  POST /synthesize               Legacy synthesis alias.
+  GET  /v1/voices                List saved voices.
+  POST /v1/voices/<id>           Save voice from server-local audio_path+transcript.
+  GET  /v1/voices/<id>           Read saved voice metadata.
+  DELETE /v1/voices/<id>         Delete a saved voice.
+  WS   /ws/tts                   Incremental mono PCM int16 streaming.
 
-WEBSOCKET ENDPOINT -- /ws/tts  (streaming, minimum latency):
-  Send JSON, receive binary PCM frames as each sentence finishes.
-  Binary message format: [2-byte flags LE][PCM int16 LE, mono, 44100 Hz]
-    flags bit 0 = is_last (1 on the final segment)
-  Final message (text): {"done": true, "segments": N, "sample_rate": 44100}
+SERVER REQUEST EXAMPLES (default http://127.0.0.1:8080):
+  Status/model info:
+    curl http://127.0.0.1:8080/
+    curl http://127.0.0.1:8080/health
+    curl http://127.0.0.1:8080/v1/health
+    curl http://127.0.0.1:8080/v1/models
 
-  Python example:
-    import asyncio, json, websockets
+  Native WAV TTS:
+    curl -X POST http://127.0.0.1:8080/v1/tts -H "Content-Type: application/json" -d '{"text":"Hello from s2.","format":"wav"}' -o output.wav
 
-    async def tts():
-        async with websockets.connect("ws://localhost:8080/ws/tts") as ws:
-            await ws.send(json.dumps({
-                "text": "Hello world. How are you today?",
-                "segment": True,
-                "voice": "my_voice"
-            }))
-            while True:
-                msg = await ws.recv()
-                if isinstance(msg, str):
-                    print(json.loads(msg))   # {"done": true, "segments": 2, ...}
-                    break
-                pcm = msg[2:]               # strip 2-byte flags header
-                # feed pcm (int16, mono, 44100 Hz) to your audio output
+  Long-form WAV with bounded inter-chunk voice context:
+    curl -X POST http://127.0.0.1:8080/v1/tts -H "Content-Type: application/json" -d '{"text":"A long passage...","format":"wav","chunk_length":300,"min_chunk_length":50,"condition_on_previous_chunks":true}' -o long.wav
 
-HTTP EXAMPLES:
-  Basic synthesis:
-    curl -X POST http://localhost:8080/v1/tts \
-         -H "Content-Type: application/json" \
-         -d '{"text":"Hello world.","segment":true}' \
-         --output audio.wav
+  Raw PCM (sample rate is returned in X-Sample-Rate):
+    curl -D pcm-headers.txt -X POST http://127.0.0.1:8080/v1/tts -H "Content-Type: application/json" -d '{"text":"PCM request.","format":"pcm"}' -o output.pcm
 
-  With a saved voice:
-    curl -X POST http://localhost:8080/v1/tts \
-         -H "Content-Type: application/json" \
-         -d '{"text":"Hello.","voice":"my_voice","trim_silence":true}' \
-         --output audio.wav
+  OpenAI-style WAV:
+    curl -X POST http://127.0.0.1:8080/v1/audio/speech -H "Content-Type: application/json" -d '{"input":"Hello.","response_format":"wav"}' -o output.wav
 
-  Save a voice via HTTP:
-    curl -X POST http://localhost:8080/v1/voices/my_voice \
-         -H "Content-Type: application/json" \
-         -d '{"audio_path":"C:/refs/speaker.wav","transcript":"Reference text."}'
+  Legacy alias:
+    curl -X POST http://127.0.0.1:8080/synthesize -H "Content-Type: application/json" -d '{"text":"Hello.","format":"wav"}' -o output.wav
 
-  List saved voices:
-    curl http://localhost:8080/v1/voices
+  Direct reference clone (reference_audio is a server-local path):
+    curl -X POST http://127.0.0.1:8080/v1/tts -H "Content-Type: application/json" -d '{"text":"Clone me.","reference_audio":"/path/reference.wav","prompt_text":"Exact transcript."}' -o cloned.wav
 
-  Delete a voice:
-    curl -X DELETE http://localhost:8080/v1/voices/my_voice
-)";
+  Saved voices:
+    curl -X POST http://127.0.0.1:8080/v1/voices/narrator -H "Content-Type: application/json" -d '{"audio_path":"/path/reference.wav","transcript":"Reference transcript."}'
+    curl http://127.0.0.1:8080/v1/voices
+    curl http://127.0.0.1:8080/v1/voices/narrator
+    curl -X POST http://127.0.0.1:8080/v1/tts -H "Content-Type: application/json" -d '{"text":"Use narrator.","voice":"narrator","format":"wav"}' -o narrator.wav
+    curl -X DELETE http://127.0.0.1:8080/v1/voices/narrator
+
+  WebSocket streaming (websocat/wscat are separate tools):
+    websocat ws://127.0.0.1:8080/ws/tts
+    # send: {"text":"Streaming request.","segment":true,"stream_stride":0}
+    wscat -c ws://127.0.0.1:8080/ws/tts
+    # then enter the same JSON text message.
+    Binary replies are [2-byte flags][PCM int16 LE]; strip the flags per frame.
+
+  Windows PowerShell: use curl.exe if curl is mapped to a PowerShell alias.
+
+HTTP/WS SYNTHESIS FIELDS:
+  Common: text/input, segment, reference_audio, prompt_text, voice/reference_id,
+  temperature, top_p, top_k, seed, repetition_penalty, repetition_window,
+  multi_turn_history, threads, max_tokens/max_new_tokens, max_seg_tokens,
+  min_end_tokens, ras_window, ras_temp, ras_top_p, codec_chunk, codec_overlap,
+  min_seg_chars, chunk_length, min_chunk_length, condition_on_previous_chunks,
+  prosody (volume; speed currently only 1.0), latency (normal only),
+  trim_silence, and Fish streaming route-consistency flag.
+  HTTP only: format/response_format = wav|pcm. stream_stride is rejected.
+  WebSocket only: stream_stride. format/response_format are rejected because
+  /ws/tts always emits framed mono PCM int16.
+  Rejected Fish fields/modes: non-empty references[], early_stop_threshold,
+  normalize, sample_rate, mp3_bitrate, opus_bitrate, use_memory_cache,
+  prosody.normalize_loudness, latency balanced/low, and prosody.speed != 1.0.
+  These fail explicitly instead of being silently ignored.
+  Application request/message limit: 8 MiB; text and prompt_text: 1 MiB each.
+  Crow 1.3.3 buffers HTTP bodies before route handlers; for a pre-buffer HTTP
+  limit on non-loopback deployments, enforce a body limit in the reverse proxy.
+  There is no built-in authentication. Put authentication/access control in a
+  reverse proxy before exposing a non-loopback bind to untrusted clients.
+  WebSocket clients must follow RFC 6455 masking; non-conforming clients close.
+
+WEBSOCKET /ws/tts OUTPUT:
+  Binary: [2-byte little-endian flags][mono PCM int16 little-endian samples]
+          flags bit 0 = final output boundary.
+  Final text JSON: {"done":true,"segments":N,"sample_rate":RATE}
+  With stride decoding, multiple PCM chunks may be emitted inside one text segment.
+
+Run the README's complete CLI/API reference for examples and detailed backend notes.
+)S2HELP";
             return 0;
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
@@ -765,7 +1009,11 @@ HTTP EXAMPLES:
               << "  Min seg chars: " << (params.min_seg_chars == 0 ? "off" : std::to_string(params.min_seg_chars) + " chars") << "\n"
               << "  Temperature:   " << params.gen.temperature << "\n"
               << "  Top-p:        " << params.gen.top_p << "\n"
-              << "  Top-k:        " << params.gen.top_k << "\n"
+              << "  Top-k:         " << params.gen.top_k << "\n"
+              << "  Seed:          " << params.gen.seed << (params.gen.seed == 0 ? " (random)" : " (deterministic)") << "\n"
+              << "  Repetition:    " << params.gen.repetition_penalty << " / window " << params.gen.repetition_window << "\n"
+              << "  Multi-turn:    " << params.multi_turn_history << " turns\n"
+              << "  Warmup:        " << (params.warmup ? "ON" : "OFF") << "\n"
               << "  RAS window:    " << params.gen.ras_window_size << " tokens\n"
               << "  RAS temp:      " << params.gen.ras_high_temp << "\n";
 
@@ -789,6 +1037,14 @@ HTTP EXAMPLES:
     if (!pipeline.init(params)) {
         std::cerr << "Pipeline initialization failed." << std::endl;
         return 1;
+    }
+    if (params.warmup) {
+        std::cout << "[Warmup] Running isolated deterministic model+codec warmup...\n";
+        if (!pipeline.warmup(params)) {
+            std::cerr << "Warmup failed.\n";
+            return 1;
+        }
+        std::cout << "[Warmup] OK\n";
     }
 
     // --save-voice is a one-shot CLI operation, not persistent server state.
@@ -891,8 +1147,9 @@ HTTP EXAMPLES:
     // Respuestas > 1MB se streamean automaticamente (sin timeout).
     // Los WAV de audio suelen ser varios MB -- sin esto pueden cortar.
     app.stream_threshold(1024 * 1024); // 1 MB
-    // Enforce the WebSocket JSON cap before Crow buffers an oversized message.
-    // The per-message size check in onmessage remains as defense in depth.
+    // Crow applies this limit to WebSocket payload frames. Fragmented messages can
+    // still be reassembled by the protocol stack, so onmessage keeps a second
+    // check against the complete JSON message as defense in depth.
     app.websocket_max_payload(MAX_JSON_REQUEST_BYTES);
 
     // Per-connection cancellation state lets a disconnect stop an expensive
@@ -912,11 +1169,19 @@ HTTP EXAMPLES:
     // Helper : traitement commun de synthese
     // ================================================================
     auto do_synthesize = [&](const crow::json::rvalue& json) -> crow::response {
+        bool request_validated = false;
         try {
             s2::PipelineParams synth_params = params;
+            validate_fish_json_subset(json, true);
 
             // Fish Audio uses "text"; OpenAI-compatible clients usually use "input".
-            if (json.has("text")) {
+            // Treat aliases as one logical field and reject contradictory requests.
+            if (json.has("text") && json.has("input")) {
+                const std::string a = json["text"].s();
+                const std::string b = json["input"].s();
+                if (a != b) throw std::invalid_argument("conflicting text and input");
+                synth_params.text = a;
+            } else if (json.has("text")) {
                 synth_params.text = json["text"].s();
             } else if (json.has("input")) {
                 synth_params.text = json["input"].s();
@@ -927,20 +1192,84 @@ HTTP EXAMPLES:
             if (json.has("temperature"))   synth_params.gen.temperature = static_cast<float>(json["temperature"].d());
             if (json.has("top_p"))         synth_params.gen.top_p = static_cast<float>(json["top_p"].d());
             if (json.has("top_k"))         synth_params.gen.top_k = checked_json_i32(json["top_k"]);
+            if (json.has("seed"))          synth_params.gen.seed = checked_json_fish_seed(json["seed"]);
+            if (json.has("repetition_penalty")) synth_params.gen.repetition_penalty = static_cast<float>(json["repetition_penalty"].d());
+            if (json.has("repetition_window")) synth_params.gen.repetition_window = checked_json_i32(json["repetition_window"]);
+            if (json.has("multi_turn_history")) synth_params.multi_turn_history = checked_json_i32(json["multi_turn_history"]);
             if (json.has("threads"))       synth_params.gen.n_threads = checked_json_i32(json["threads"]);
-            if (json.has("max_tokens"))    synth_params.gen.max_new_tokens = checked_json_i32(json["max_tokens"]);
+            // Native s2.cpp uses max_tokens; Fish Speech/Fish Audio uses max_new_tokens.
+            // Accept both, but never silently choose one when a client sends conflicting values.
+            if (json.has("max_tokens") && json.has("max_new_tokens")) {
+                const int32_t a = checked_json_i32(json["max_tokens"]);
+                const int32_t b = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
+                if (a != b) throw std::invalid_argument("conflicting max_tokens and max_new_tokens");
+                synth_params.gen.max_new_tokens = a;
+            } else if (json.has("max_tokens")) {
+                synth_params.gen.max_new_tokens = checked_json_i32(json["max_tokens"]);
+            } else if (json.has("max_new_tokens")) {
+                synth_params.gen.max_new_tokens = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
+            }
             if (json.has("max_seg_tokens")) synth_params.max_tokens_per_segment = checked_json_i32(json["max_seg_tokens"]);
             if (json.has("segment"))       synth_params.segment_sentences = json["segment"].b();
             if (json.has("codec_chunk"))   synth_params.codec_chunk_frames = checked_json_i32(json["codec_chunk"]);
             if (json.has("codec_overlap")) synth_params.codec_overlap_frames = checked_json_i32(json["codec_overlap"]);
             if (json.has("min_seg_chars")) synth_params.min_seg_chars = checked_json_i32(json["min_seg_chars"]);
+            if (json.has("chunk_length")) synth_params.chunk_length = checked_json_i32(json["chunk_length"]);
+            if (json.has("min_chunk_length")) synth_params.min_chunk_length = checked_json_i32(json["min_chunk_length"]);
+            if (json.has("condition_on_previous_chunks")) {
+                const auto & v = json["condition_on_previous_chunks"];
+                if (v.t() != crow::json::type::True && v.t() != crow::json::type::False)
+                    throw std::invalid_argument("condition_on_previous_chunks must be a boolean");
+                synth_params.condition_on_previous_chunks = v.b();
+            }
+            if (json.has("latency")) {
+                const std::string latency = json["latency"].s();
+                if (latency != "normal")
+                    throw std::invalid_argument("latency modes balanced/low are not implemented; use normal");
+            }
+            if (json.has("prosody")) {
+                const auto & pr = json["prosody"];
+                if (pr.t() != crow::json::type::Object)
+                    throw std::invalid_argument("prosody must be an object");
+                if (pr.has("speed")) {
+                    if (pr["speed"].t() != crow::json::type::Number)
+                        throw std::invalid_argument("prosody.speed must be a number");
+                    const double speed = pr["speed"].d();
+                    if (!std::isfinite(speed) || speed < 0.5 || speed > 2.0)
+                        throw std::invalid_argument("prosody.speed must be between 0.5 and 2.0");
+                    if (std::abs(speed - 1.0) > 1e-12)
+                        throw std::invalid_argument("prosody.speed other than 1.0 is not implemented without pitch-preserving time stretch");
+                }
+                if (pr.has("volume")) {
+                    if (pr["volume"].t() != crow::json::type::Number)
+                        throw std::invalid_argument("prosody.volume must be a number");
+                    const double volume = pr["volume"].d();
+                    if (!std::isfinite(volume) || volume < -20.0 || volume > 20.0)
+                        throw std::invalid_argument("prosody.volume must be between -20 and 20 dB");
+                    synth_params.prosody_volume_db = static_cast<float>(volume);
+                }
+                if (pr.has("normalize_loudness"))
+                    throw std::invalid_argument("prosody.normalize_loudness is not implemented");
+            }
             if (json.has("min_end_tokens")) synth_params.gen.min_tokens_before_end = checked_json_i32(json["min_end_tokens"]);
             if (json.has("ras_window"))    synth_params.gen.ras_window_size = checked_json_i32(json["ras_window"]);
             if (json.has("ras_temp"))      synth_params.gen.ras_high_temp = static_cast<float>(json["ras_temp"].d());
             if (json.has("ras_top_p"))     synth_params.gen.ras_high_top_p = static_cast<float>(json["ras_top_p"].d());
             if (json.has("prompt_text"))   synth_params.prompt_text = json["prompt_text"].s();
             if (json.has("reference_audio")) synth_params.prompt_audio_path = json["reference_audio"].s();
-            if (json.has("voice"))         synth_params.voice_id = json["voice"].s();
+            // Fish Audio names a saved voice reference_id; s2.cpp historically uses voice.
+            const bool has_reference_id =
+                json.has("reference_id") && json["reference_id"].t() != crow::json::type::Null;
+            if (json.has("voice") && has_reference_id) {
+                const std::string a = json["voice"].s();
+                const std::string b = json["reference_id"].s();
+                if (a != b) throw std::invalid_argument("conflicting voice and reference_id");
+                synth_params.voice_id = a;
+            } else if (json.has("voice")) {
+                synth_params.voice_id = json["voice"].s();
+            } else if (has_reference_id) {
+                synth_params.voice_id = json["reference_id"].s();
+            }
             if (json.has("trim_silence"))  synth_params.trim_silence = json["trim_silence"].b();
             if (json.has("stream_stride")) synth_params.stream_decode_stride_frames = checked_json_i32(json["stream_stride"]);
 
@@ -953,12 +1282,40 @@ HTTP EXAMPLES:
             // "response_format". This implementation intentionally supports
             // only WAV and raw PCM rather than silently returning WAV as MP3/Opus.
             std::string format = "wav";
-            if (json.has("format")) format = json["format"].s();
-            else if (json.has("response_format")) format = json["response_format"].s();
-            std::transform(format.begin(), format.end(), format.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            auto normalized_format = [](std::string value) {
+                std::transform(value.begin(), value.end(), value.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                return value;
+            };
+            if (json.has("format") && json.has("response_format")) {
+                const std::string a = normalized_format(json["format"].s());
+                const std::string b = normalized_format(json["response_format"].s());
+                if (a != b) throw std::invalid_argument("conflicting format and response_format");
+                format = a;
+            } else if (json.has("format")) {
+                format = normalized_format(json["format"].s());
+            } else if (json.has("response_format")) {
+                format = normalized_format(json["response_format"].s());
+            }
             if (format != "wav" && format != "pcm") {
                 return crow::response(400, "Unsupported format. Supported formats: wav, pcm");
+            }
+
+            // From this point onward, exceptions are execution/storage failures,
+            // not malformed client input. Keep that distinction for HTTP status.
+            request_validated = true;
+
+            // Preserve the HTTP contract: a syntactically valid saved voice id
+            // that does not exist is a client-visible 404. If the file exists but
+            // is corrupt/unreadable, Pipeline::get_ref_codes() fails later and the
+            // request remains a 500. An explicit reference_audio has priority over
+            // voice/reference_id and therefore does not require a saved profile.
+            if (!synth_params.voice_id.empty() && synth_params.prompt_audio_path.empty()) {
+                s2::VoiceProfileManager mgr;
+                mgr.set_storage_dir(synth_params.voice_storage_dir);
+                if (!mgr.exists(synth_params.voice_id)) {
+                    return crow::response(404, "Voice not found: " + synth_params.voice_id);
+                }
             }
 
             // The Pipeline/model/codec/KV cache are shared and mutable. Parse and
@@ -990,9 +1347,34 @@ HTTP EXAMPLES:
         } catch (const std::bad_alloc &) {
             return crow::response(500, "Server ran out of memory while preparing the response");
         } catch (const std::exception & e) {
-            return crow::response(400, std::string("Invalid request: ") + e.what());
+            const int status = request_validated ? 500 : 400;
+            const char * prefix = request_validated ? "Synthesis failed: " : "Invalid request: ";
+            return crow::response(status, std::string(prefix) + e.what());
         } catch (...) {
-            return crow::response(400, "Invalid request");
+            return crow::response(request_validated ? 500 : 400,
+                                  request_validated ? "Synthesis failed" : "Invalid request");
+        }
+    };
+
+    // Strict JSON normalization may throw before Crow sees the body (for example,
+    // malformed UTF-16 surrogate escapes). Convert all client parse/type failures
+    // into 4xx here instead of letting them escape the route callback.
+    auto handle_synthesis_request = [&](const crow::request & req) -> crow::response {
+        if (req.body.size() > MAX_JSON_REQUEST_BYTES) {
+            return crow::response(413, "JSON request body too large");
+        }
+        try {
+            auto json = load_json_strict(req.body);
+            if (!json) {
+                return crow::response(400, "Invalid JSON");
+            }
+            return do_synthesize(json);
+        } catch (const std::bad_alloc &) {
+            return crow::response(500, "Server ran out of memory while parsing the request");
+        } catch (const std::exception & e) {
+            return crow::response(400, std::string("Invalid JSON request: ") + e.what());
+        } catch (...) {
+            return crow::response(400, "Invalid JSON request");
         }
     };
 
@@ -1002,12 +1384,7 @@ HTTP EXAMPLES:
     CROW_ROUTE(app, "/v1/tts")
     .methods("POST"_method)
     ([&](const crow::request& req) {
-        if (req.body.size() > MAX_JSON_REQUEST_BYTES) return crow::response(413, "JSON request body too large");
-        auto json = crow::json::load(req.body);
-        if (!json) {
-            return crow::response(400, "Invalid JSON");
-        }
-        return do_synthesize(json);
+        return handle_synthesis_request(req);
     });
 
     // ================================================================
@@ -1016,12 +1393,7 @@ HTTP EXAMPLES:
     CROW_ROUTE(app, "/synthesize")
     .methods("POST"_method)
     ([&](const crow::request& req) {
-        if (req.body.size() > MAX_JSON_REQUEST_BYTES) return crow::response(413, "JSON request body too large");
-        auto json = crow::json::load(req.body);
-        if (!json) {
-            return crow::response(400, "Invalid JSON");
-        }
-        return do_synthesize(json);
+        return handle_synthesis_request(req);
     });
 
     // ================================================================
@@ -1030,12 +1402,7 @@ HTTP EXAMPLES:
     CROW_ROUTE(app, "/v1/audio/speech")
     .methods("POST"_method)
     ([&](const crow::request& req) {
-        if (req.body.size() > MAX_JSON_REQUEST_BYTES) return crow::response(413, "JSON request body too large");
-        auto json = crow::json::load(req.body);
-        if (!json) {
-            return crow::response(400, "Invalid JSON");
-        }
-        return do_synthesize(json);
+        return handle_synthesis_request(req);
     });
 
     // ================================================================
@@ -1078,7 +1445,7 @@ HTTP EXAMPLES:
                 item["object"] = "voice";
                 resp["data"][idx++] = std::move(item);
             }
-            resp["count"] = static_cast<int>(ids.size());
+            resp["count"] = static_cast<int64_t>(ids.size());
             return crow::response(200, resp);
         } catch (const std::exception & e) {
             return crow::response(500, std::string("Failed to list voices: ") + e.what());
@@ -1090,9 +1457,10 @@ HTTP EXAMPLES:
     CROW_ROUTE(app, "/v1/voices/<string>")
     .methods("POST"_method)
     ([&](const crow::request& req, const std::string & voice_id) {
+        bool request_validated = false;
         try {
             if (req.body.size() > MAX_JSON_REQUEST_BYTES) return crow::response(413, "JSON request body too large");
-            auto json = crow::json::load(req.body);
+            auto json = load_json_strict(req.body);
             if (!json) return crow::response(400, "Invalid JSON");
             if (!json.has("audio_path") || !json.has("transcript")) {
                 return crow::response(400, "Required fields: audio_path, transcript");
@@ -1112,6 +1480,7 @@ HTTP EXAMPLES:
             if (!validate_pipeline_params(vp, validation_error, false)) {
                 return crow::response(400, validation_error);
             }
+            request_validated = true;
 
             std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex);
             std::vector<int32_t> codes;
@@ -1145,9 +1514,21 @@ HTTP EXAMPLES:
         } catch (const std::bad_alloc &) {
             return crow::response(500, "Server ran out of memory while creating the voice profile");
         } catch (const std::invalid_argument & e) {
-            return crow::response(400, std::string("Invalid voice request: ") + e.what());
+            const int status = request_validated ? 500 : 400;
+            const char * prefix = request_validated
+                ? "Failed to create voice profile: "
+                : "Invalid voice request: ";
+            return crow::response(status, std::string(prefix) + e.what());
         } catch (const std::exception & e) {
-            return crow::response(400, std::string("Invalid voice request: ") + e.what());
+            const int status = request_validated ? 500 : 400;
+            const char * prefix = request_validated
+                ? "Failed to create voice profile: "
+                : "Invalid voice request: ";
+            return crow::response(status, std::string(prefix) + e.what());
+        } catch (...) {
+            return crow::response(request_validated ? 500 : 400,
+                                  request_validated ? "Failed to create voice profile"
+                                                    : "Invalid voice request");
         }
     });
 
@@ -1159,6 +1540,9 @@ HTTP EXAMPLES:
             std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex);
             s2::VoiceProfileManager mgr;
             mgr.set_storage_dir(params.voice_storage_dir);
+            if (!mgr.exists(voice_id)) {
+                return crow::response(404, "Voice not found: " + voice_id);
+            }
             s2::VoiceProfile profile = mgr.load(voice_id);
             crow::json::wvalue resp;
             resp["id"] = voice_id;
@@ -1174,7 +1558,9 @@ HTTP EXAMPLES:
         } catch (const std::invalid_argument & e) {
             return crow::response(400, std::string("Invalid voice id: ") + e.what());
         } catch (const std::exception & e) {
-            return crow::response(404, std::string("Voice not found: ") + e.what());
+            // A profile that exists but cannot be parsed/read is a server-side
+            // storage error, not a missing resource.
+            return crow::response(500, std::string("Failed to load voice profile: ") + e.what());
         }
     });
 
@@ -1209,6 +1595,16 @@ HTTP EXAMPLES:
         return crow::response(200, "OK");
     });
 
+    // Fish Speech's documented local-server health endpoint. Keep /health as
+    // the historical alias so existing s2.cpp deployments do not break.
+    CROW_ROUTE(app, "/v1/health")
+    .methods("GET"_method)
+    ([]() {
+        crow::json::wvalue status;
+        status["status"] = "ok";
+        return crow::response(200, status);
+    });
+
     CROW_ROUTE(app, "/")
     ([&port, &bind_host]() {
         crow::json::wvalue info;
@@ -1221,11 +1617,14 @@ HTTP EXAMPLES:
         info["endpoints"][3] = "/v1/models";
         info["endpoints"][4] = "/v1/voices";
         info["endpoints"][5] = "/health";
+        info["endpoints"][6] = "/v1/health";
+        info["endpoints"][7] = "/v1/voices/<id>";
+        info["endpoints"][8] = "/ws/tts";
         return crow::response(200, info);
     });
 
     // ================================================================
-    // WebSocket /ws/tts -- streaming real por segmento de oracion.
+    // WebSocket /ws/tts -- streaming PCM durante la generacion.
     //
     // Protocolo (JSON sobre WebSocket):
     //
@@ -1233,17 +1632,17 @@ HTTP EXAMPLES:
     //     { "text": "...", "segment": true, "reference_audio": "path" }
     //
     //   Servidor -> Cliente (mensajes binarios):
-    //     [2 bytes little-endian: flags] [PCM int16 LE, mono, 44100Hz]
+    //     [2 bytes little-endian: flags] [PCM int16 LE, mono, codec sample rate]
     //     flags bit0 = is_last (1 si es el ultimo segmento)
     //
     //   Servidor -> Cliente (mensaje de texto al finalizar):
-    //     { "done": true, "segments": N, "sample_rate": 44100 }
+    //     { "done": true, "segments": N, "sample_rate": RATE }
     //
     //   Servidor -> Cliente (en caso de error):
     //     { "error": "descripcion" }
     //
-    // El cliente puede empezar a reproducir el primer mensaje binario
-    // antes de que lleguen los siguientes -- latencia = primera oracion.
+    // Con stride activo, el cliente puede empezar a reproducir PCM antes de
+    // que termine la oracion actual; con stride desactivado se envia por segmento.
     // ================================================================
     CROW_WEBSOCKET_ROUTE(app, "/ws/tts")
     .onopen([&](crow::websocket::connection& conn) {
@@ -1283,31 +1682,95 @@ HTTP EXAMPLES:
         }
 
         try {
-            auto json = crow::json::load(data);
-            if (!json || !json.has("text")) {
-                safe_send_text("{\"error\": \"missing 'text' field\"}");
+            auto json = load_json_strict(data);
+            if (!json || (!json.has("text") && !json.has("input"))) {
+                safe_send_text("{\"error\": \"missing 'text' or 'input' field\"}");
                 return;
             }
 
             s2::PipelineParams ws_params = params;
-            ws_params.text = json["text"].s();
+            validate_fish_json_subset(json, false);
+            if (json.has("text") && json.has("input")) {
+                const std::string a = json["text"].s();
+                const std::string b = json["input"].s();
+                if (a != b) throw std::invalid_argument("conflicting text and input");
+                ws_params.text = a;
+            } else if (json.has("text")) {
+                ws_params.text = json["text"].s();
+            } else {
+                ws_params.text = json["input"].s();
+            }
             if (json.has("segment"))          ws_params.segment_sentences = json["segment"].b();
             if (json.has("temperature"))      ws_params.gen.temperature = static_cast<float>(json["temperature"].d());
             if (json.has("top_p"))            ws_params.gen.top_p = static_cast<float>(json["top_p"].d());
             if (json.has("top_k"))            ws_params.gen.top_k = checked_json_i32(json["top_k"]);
+            if (json.has("seed"))             ws_params.gen.seed = checked_json_fish_seed(json["seed"]);
+            if (json.has("repetition_penalty")) ws_params.gen.repetition_penalty = static_cast<float>(json["repetition_penalty"].d());
+            if (json.has("repetition_window")) ws_params.gen.repetition_window = checked_json_i32(json["repetition_window"]);
+            if (json.has("multi_turn_history")) ws_params.multi_turn_history = checked_json_i32(json["multi_turn_history"]);
             if (json.has("threads"))          ws_params.gen.n_threads = checked_json_i32(json["threads"]);
-            if (json.has("max_tokens"))       ws_params.gen.max_new_tokens = checked_json_i32(json["max_tokens"]);
+            if (json.has("max_tokens") && json.has("max_new_tokens")) {
+                const int32_t a = checked_json_i32(json["max_tokens"]);
+                const int32_t b = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
+                if (a != b) throw std::invalid_argument("conflicting max_tokens and max_new_tokens");
+                ws_params.gen.max_new_tokens = a;
+            } else if (json.has("max_tokens")) {
+                ws_params.gen.max_new_tokens = checked_json_i32(json["max_tokens"]);
+            } else if (json.has("max_new_tokens")) {
+                ws_params.gen.max_new_tokens = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
+            }
             if (json.has("max_seg_tokens"))   ws_params.max_tokens_per_segment = checked_json_i32(json["max_seg_tokens"]);
             if (json.has("reference_audio"))  ws_params.prompt_audio_path = json["reference_audio"].s();
             if (json.has("codec_chunk"))      ws_params.codec_chunk_frames = checked_json_i32(json["codec_chunk"]);
             if (json.has("codec_overlap"))    ws_params.codec_overlap_frames = checked_json_i32(json["codec_overlap"]);
             if (json.has("min_seg_chars"))    ws_params.min_seg_chars = checked_json_i32(json["min_seg_chars"]);
+            if (json.has("chunk_length")) ws_params.chunk_length = checked_json_i32(json["chunk_length"]);
+            if (json.has("min_chunk_length")) ws_params.min_chunk_length = checked_json_i32(json["min_chunk_length"]);
+            if (json.has("condition_on_previous_chunks")) {
+                const auto & v = json["condition_on_previous_chunks"];
+                if (v.t() != crow::json::type::True && v.t() != crow::json::type::False)
+                    throw std::invalid_argument("condition_on_previous_chunks must be a boolean");
+                ws_params.condition_on_previous_chunks = v.b();
+            }
+            if (json.has("latency")) {
+                const std::string latency = json["latency"].s();
+                if (latency != "normal")
+                    throw std::invalid_argument("latency modes balanced/low are not implemented; use normal");
+            }
+            if (json.has("prosody")) {
+                const auto & pr = json["prosody"];
+                if (pr.t() != crow::json::type::Object) throw std::invalid_argument("prosody must be an object");
+                if (pr.has("speed")) {
+                    if (pr["speed"].t() != crow::json::type::Number) throw std::invalid_argument("prosody.speed must be a number");
+                    const double speed = pr["speed"].d();
+                    if (!std::isfinite(speed) || speed < 0.5 || speed > 2.0) throw std::invalid_argument("prosody.speed must be between 0.5 and 2.0");
+                    if (std::abs(speed - 1.0) > 1e-12) throw std::invalid_argument("prosody.speed other than 1.0 is not implemented without pitch-preserving time stretch");
+                }
+                if (pr.has("volume")) {
+                    if (pr["volume"].t() != crow::json::type::Number) throw std::invalid_argument("prosody.volume must be a number");
+                    const double volume = pr["volume"].d();
+                    if (!std::isfinite(volume) || volume < -20.0 || volume > 20.0) throw std::invalid_argument("prosody.volume must be between -20 and 20 dB");
+                    ws_params.prosody_volume_db = static_cast<float>(volume);
+                }
+                if (pr.has("normalize_loudness")) throw std::invalid_argument("prosody.normalize_loudness is not implemented");
+            }
             if (json.has("min_end_tokens"))   ws_params.gen.min_tokens_before_end = checked_json_i32(json["min_end_tokens"]);
             if (json.has("ras_window"))       ws_params.gen.ras_window_size = checked_json_i32(json["ras_window"]);
             if (json.has("ras_temp"))         ws_params.gen.ras_high_temp = static_cast<float>(json["ras_temp"].d());
             if (json.has("ras_top_p"))        ws_params.gen.ras_high_top_p = static_cast<float>(json["ras_top_p"].d());
             if (json.has("prompt_text"))      ws_params.prompt_text = json["prompt_text"].s();
-            if (json.has("voice"))            ws_params.voice_id = json["voice"].s();
+            const bool has_reference_id =
+                json.has("reference_id") && json["reference_id"].t() != crow::json::type::Null;
+            if (json.has("voice") && has_reference_id) {
+                const std::string a = json["voice"].s();
+                const std::string b = json["reference_id"].s();
+                if (a != b) throw std::invalid_argument("conflicting voice and reference_id");
+                ws_params.voice_id = a;
+            } else if (json.has("voice")) {
+                ws_params.voice_id = json["voice"].s();
+            } else if (has_reference_id) {
+                ws_params.voice_id = json["reference_id"].s();
+            }
             if (json.has("trim_silence"))     ws_params.trim_silence = json["trim_silence"].b();
             if (json.has("stream_stride"))    ws_params.stream_decode_stride_frames = checked_json_i32(json["stream_stride"]);
 
@@ -1340,7 +1803,10 @@ HTTP EXAMPLES:
             bool ok = false;
             {
                 std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex);
-                ok = pipeline.synthesize_streaming(ws_params, cb, &segment_count);
+                s2::CancelCallback should_continue = [alive]() -> bool {
+                    return alive->load(std::memory_order_relaxed);
+                };
+                ok = pipeline.synthesize_streaming(ws_params, cb, &segment_count, should_continue);
             }
 
             crow::json::wvalue done_msg;
@@ -1373,7 +1839,12 @@ HTTP EXAMPLES:
               << "  POST /synthesize       (legacy)\n"
               << "  POST /v1/audio/speech  (OpenAI compatible)\n"
               << "  GET  /v1/models\n"
+              << "  GET  /v1/voices        (list saved voices)\n"
+              << "  POST /v1/voices/<id>   (save voice)\n"
+              << "  GET  /v1/voices/<id>   (voice metadata)\n"
+              << "  DELETE /v1/voices/<id> (delete voice)\n"
               << "  GET  /health\n"
+              << "  GET  /v1/health\n"
               << "  WS   /ws/tts           (streaming -- minimum latency)\n\n";
 
     if (bind_host != "127.0.0.1" && bind_host != "::1") {

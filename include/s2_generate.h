@@ -24,6 +24,17 @@ struct GenerateParams {
     int32_t n_threads               = 4;
     bool    verbose                 = true;
 
+    // Reproducibility. 0 = random source, non-zero = deterministic request seed.
+    uint64_t seed                    = 0;
+
+    // Explicit repetition penalty, separate from RAS. 1.0 disables it.
+    float   repetition_penalty      = 1.0f;
+    int32_t repetition_window       = 64;
+
+    // Internal warmup knob: block EOS for the first decision even if the
+    // effective budget is exactly one frame. Not exposed as a sampling flag.
+    bool    force_first_token       = false;
+
     // RAS (Repetition Aware Sampling): previene loops de tokens repetidos.
     // Si el token actual ya aparece en la ventana reciente, se remuestrea
     // con temperatura alta para salir del bucle.

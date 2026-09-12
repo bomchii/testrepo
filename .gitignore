@@ -31,3 +31,6 @@ ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/
 # CI-generated embedded tokenizer sources
 /src/tokenizer_data.cpp
 /src/tokenizer_data.h
+
+# Versioned shared-library leftovers/symlinks
+*.so.*

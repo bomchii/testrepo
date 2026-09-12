@@ -37,6 +37,35 @@ static bool file_size_u64(std::FILE * f, uint64_t & out) {
     return true;
 }
 
+static bool active_backend_is_metal(ggml_backend_t backend) {
+#if defined(GGML_USE_METAL)
+    return backend != nullptr && ggml_backend_is_metal(backend);
+#else
+    (void) backend;
+    return false;
+#endif
+}
+
+struct GgmlContextGuard {
+    ggml_context * ptr = nullptr;
+    explicit GgmlContextGuard(ggml_context * p) : ptr(p) {}
+    ~GgmlContextGuard() { if (ptr) ggml_free(ptr); }
+    GgmlContextGuard(const GgmlContextGuard &) = delete;
+    GgmlContextGuard & operator=(const GgmlContextGuard &) = delete;
+};
+
+struct GallocrGuard {
+    ggml_gallocr_t ptr = nullptr;
+    explicit GallocrGuard(ggml_gallocr_t p) : ptr(p) {}
+    ~GallocrGuard() { if (ptr) ggml_gallocr_free(ptr); }
+    void reset() {
+        if (ptr) ggml_gallocr_free(ptr);
+        ptr = nullptr;
+    }
+    GallocrGuard(const GallocrGuard &) = delete;
+    GallocrGuard & operator=(const GallocrGuard &) = delete;
+};
+
 // ---------------------------------------------------------------------------
 // Internal structures
 // ---------------------------------------------------------------------------
@@ -130,6 +159,26 @@ static ggml_tensor * mul_mat_checked(ggml_context * ctx, ggml_tensor * a, ggml_t
     return ggml_mul_mat(ctx, a, b);
 }
 
+static bool same_shape(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!a || !b) return false;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) if (a->ne[d] != b->ne[d]) return false;
+    return true;
+}
+
+static ggml_tensor * add_same_shape_checked(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b,
+                                            const char * label) {
+    if (!ctx || !same_shape(a, b))
+        throw std::runtime_error(std::string(label) + ": incompatible add shapes");
+    return ggml_add(ctx, a, b);
+}
+
+static ggml_tensor * mul_same_shape_checked(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b,
+                                            const char * label) {
+    if (!ctx || !same_shape(a, b))
+        throw std::runtime_error(std::string(label) + ": incompatible multiply shapes");
+    return ggml_mul(ctx, a, b);
+}
+
 // Reshape a 1D weight tensor (channels,) to (channels, 1) for broadcasting (CL layout)
 static ggml_tensor * reshape_vector_cl(ggml_context * ctx, ggml_tensor * t, int64_t channels) {
     if (!t || channels <= 0 || ggml_nelements(t) != channels)
@@ -185,8 +234,17 @@ static ggml_tensor * snake_activation(ggml_context * ctx, ggml_tensor * x, ggml_
 
 // Calculate extra right-padding for causal conv so output has ceil(T/stride) frames
 static int64_t extra_padding_for_conv1d(int64_t length, int kernel_size, int stride, int padding_total) {
-    const float n_frames = (static_cast<float>(length - kernel_size + padding_total) / stride) + 1.0f;
-    const int64_t ideal  = (static_cast<int64_t>(std::ceil(n_frames)) - 1) * stride + (kernel_size - padding_total);
+    if (length < 0 || kernel_size <= 0 || stride <= 0 || padding_total < 0) {
+        throw std::runtime_error("invalid causal-conv padding parameters");
+    }
+    // Integer equivalent of ceil((length-kernel+padding_total)/stride).
+    // Avoid float precision loss for long inputs (> 2^24 samples).
+    const int64_t numer = length - static_cast<int64_t>(kernel_size) + padding_total;
+    const int64_t q = numer >= 0 ? (numer + stride - 1) / stride : numer / stride;
+    if (q > (std::numeric_limits<int64_t>::max() - kernel_size + padding_total) / stride) {
+        throw std::runtime_error("causal-conv padding overflow");
+    }
+    const int64_t ideal = q * stride + static_cast<int64_t>(kernel_size) - padding_total;
     return ideal - length;
 }
 
@@ -207,7 +265,7 @@ static ggml_tensor * lc_to_cl(ggml_context * ctx, ggml_tensor * x) {
 static ggml_tensor * causal_conv_1d(ggml_context * ctx,
                                      ggml_tensor * weight, ggml_tensor * bias,
                                      ggml_tensor * x, int stride, int dilation) {
-    if (!weight || !x || stride <= 0 || dilation <= 0)
+    if (!weight || !x || stride <= 0 || dilation <= 0 || x->ne[0] <= 0 || x->ne[1] <= 0)
         throw std::runtime_error("invalid causal convolution inputs");
     if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
     if (bias   && bias->type   != GGML_TYPE_F32) bias   = ggml_cast(ctx, bias,   GGML_TYPE_F32);
@@ -221,9 +279,19 @@ static ggml_tensor * causal_conv_1d(ggml_context * ctx,
             weight = ggml_reshape_3d(ctx, weight, kernel, in_ch, out_ch);
         }
     }
+    if (weight->ne[0] <= 0 || weight->ne[1] <= 0 || weight->ne[2] <= 0 ||
+        weight->ne[0] > (static_cast<int64_t>(std::numeric_limits<int>::max()) - 1) / dilation + 1)
+        throw std::runtime_error("causal convolution kernel is out of range");
+    // ggml_conv_1d expects [kernel,in_ch,out_ch] and matching input channels.
+    if (weight->ne[1] != x->ne[0])
+        throw std::runtime_error("causal convolution input-channel mismatch");
     const int kernel_size = static_cast<int>((weight->ne[0] - 1) * dilation + 1);
     const int pad   = kernel_size - stride;
-    const int extra = static_cast<int>(extra_padding_for_conv1d(x->ne[1], kernel_size, stride, pad));
+    if (pad < 0) throw std::runtime_error("causal convolution kernel smaller than stride");
+    const int64_t extra64 = extra_padding_for_conv1d(x->ne[1], kernel_size, stride, pad);
+    if (extra64 < 0 || extra64 > std::numeric_limits<int>::max())
+        throw std::runtime_error("causal convolution padding is out of int range");
+    const int extra = static_cast<int>(extra64);
     ggml_tensor * x_lc = cl_to_lc(ctx, x);
     x_lc = ggml_pad_ext(ctx, x_lc, pad, extra, 0, 0, 0, 0, 0, 0);
     ggml_tensor * y = ggml_conv_1d(ctx, weight, x_lc, stride, 0, dilation);
@@ -235,7 +303,7 @@ static ggml_tensor * causal_conv_1d(ggml_context * ctx,
 static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
                                                ggml_tensor * weight, ggml_tensor * bias,
                                                ggml_tensor * x, int stride, int crop_right) {
-    if (!weight || !x || stride <= 0 || crop_right < 0)
+    if (!weight || !x || stride <= 0 || crop_right < 0 || x->ne[0] <= 0 || x->ne[1] <= 0)
         throw std::runtime_error("invalid transposed convolution inputs");
     if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
     if (bias && bias->type != GGML_TYPE_F32) bias = ggml_cast(ctx, bias, GGML_TYPE_F32);
@@ -248,11 +316,23 @@ static ggml_tensor * causal_conv_transpose_1d(ggml_context * ctx,
             weight = ggml_reshape_3d(ctx, weight, kernel, out_ch, in_ch);
         }
     }
+    if (weight->ne[0] <= 0 || weight->ne[1] <= 0 || weight->ne[2] <= 0 ||
+        weight->ne[3] != 1 || weight->ne[2] != x->ne[0])
+        throw std::runtime_error("transposed convolution input-channel mismatch");
+    if (!bias || bias->ne[0] != weight->ne[1])
+        throw std::runtime_error("transposed convolution output-channel/bias mismatch");
+    if (x->ne[1] - 1 > (std::numeric_limits<int64_t>::max() - weight->ne[0]) / stride)
+        throw std::runtime_error("transposed convolution output length overflow");
+    const int64_t produced_len = (x->ne[1] - 1) * static_cast<int64_t>(stride) + weight->ne[0];
+    if (produced_len <= crop_right)
+        throw std::runtime_error("transposed convolution crop removes entire output");
     ggml_tensor * x_lc = cl_to_lc(ctx, x);
     if (x_lc->type != GGML_TYPE_F32) x_lc = ggml_cast(ctx, x_lc, GGML_TYPE_F32);
     ggml_tensor * y = ggml_conv_transpose_1d(ctx, weight, x_lc, stride, 0, 1);
     y = add_channel_bias_lc(ctx, y, bias);
     if (crop_right > 0) {
+        if (y->ne[0] <= crop_right)
+            throw std::runtime_error("transposed convolution crop removes entire output");
         y = ggml_view_2d(ctx, y, y->ne[0] - crop_right, y->ne[1], y->nb[1], 0);
     }
     return lc_to_cl(ctx, y);
@@ -280,7 +360,8 @@ static ggml_tensor * repeat_interleave_heads(ggml_context * ctx, ggml_tensor * x
 // ---------------------------------------------------------------------------
 
 static void prepare_transformer_inputs(ggml_context * ctx, transformer_inputs & inp,
-                                        int32_t seq_len, int32_t window_size) {
+                                        int32_t seq_len, int32_t window_size,
+                                        bool force_explicit_causal_mask) {
     if (inp.positions != nullptr) return;
     if (seq_len <= 0) throw std::runtime_error("invalid codec transformer sequence length");
 
@@ -288,7 +369,7 @@ static void prepare_transformer_inputs(ggml_context * ctx, transformer_inputs & 
     inp.position_values.resize(static_cast<size_t>(seq_len));
     for (int32_t i = 0; i < seq_len; ++i) inp.position_values[static_cast<size_t>(i)] = i;
 
-    if (window_size > 0 && window_size < seq_len) {
+    if (force_explicit_causal_mask || (window_size > 0 && window_size < seq_len)) {
         // GGML's local-attention mask is dense here. Bound it before both the
         // host vector and graph tensor allocate seq_len^2 floats. 64M entries
         // is already ~256 MiB for each copy and far above normal codec inputs.
@@ -300,7 +381,9 @@ static void prepare_transformer_inputs(ggml_context * ctx, transformer_inputs & 
         inp.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, seq_len, seq_len);
         inp.mask_values.resize(n * n);
         for (int32_t q = 0; q < seq_len; ++q) {
-            const int32_t min_k = std::max(0, q - window_size + 1);
+            const int32_t min_k = (window_size > 0 && window_size < seq_len)
+                ? std::max(0, q - window_size + 1)
+                : 0;
             for (int32_t k = 0; k < seq_len; ++k) {
                 const bool allowed = (k >= min_k && k <= q);
                 inp.mask_values[static_cast<size_t>(q) * seq_len + k] = allowed ? 0.0f : -1e9f;
@@ -312,7 +395,8 @@ static void prepare_transformer_inputs(ggml_context * ctx, transformer_inputs & 
 static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
                                         const std::string & prefix, ggml_tensor * x,
                                         int32_t block_size, int32_t n_local_heads, int32_t head_dim,
-                                        float rope_base, float norm_eps, int32_t window_size,
+                                        float rope_base, float norm_eps, int32_t n_layers,
+                                        int32_t window_size, bool force_explicit_causal_mask,
                                         transformer_inputs & inp) {
     if (x->ne[0] <= 0 || x->ne[0] > std::numeric_limits<int32_t>::max() ||
         x->ne[1] <= 0 || x->ne[1] > std::numeric_limits<int32_t>::max() ||
@@ -329,12 +413,14 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
     if (n_local_heads > n_head || n_head % n_local_heads != 0)
         throw std::runtime_error("invalid codec local-head configuration");
 
-    prepare_transformer_inputs(ctx, inp, seq_len, window_size);
+    if (n_layers < 0 || n_layers > 4096)
+        throw std::runtime_error("invalid codec transformer layer count");
+    prepare_transformer_inputs(ctx, inp, seq_len, window_size, force_explicit_causal_mask);
 
-    for (int32_t i = 0;; ++i) {
+    for (int32_t i = 0; i < n_layers; ++i) {
         const std::string stem = prefix + ".layers." + std::to_string(i);
         ggml_tensor * wqkv = ggml_get_tensor(ctx_w, (stem + ".attention.wqkv.weight").c_str());
-        if (!wqkv) break;
+        if (!wqkv) throw std::runtime_error("missing codec transformer tensor: " + stem + ".attention.wqkv.weight");
 
         auto req = [&](const std::string & n) -> ggml_tensor * {
             ggml_tensor * t = ggml_get_tensor(ctx_w, n.c_str());
@@ -361,7 +447,13 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
 
         ggml_tensor * attn_in = rms_norm_weighted_cl(ctx, x, attn_norm, norm_eps);
         ggml_tensor * qkv = mul_mat_checked(ctx, wqkv, attn_in, "mul_mat:codec_wqkv");
+        if (qkv->ne[0] != q64 + 2 * kv64 || qkv->ne[1] != seq_len ||
+            qkv->ne[2] != 1 || qkv->ne[3] != 1)
+            throw std::runtime_error("codec wqkv produced an unexpected shape");
         const size_t es = ggml_element_size(qkv);
+        if (static_cast<uint64_t>(q_size + kv_size) >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max() / es))
+            throw std::runtime_error("codec wqkv view offset overflow");
 
         ggml_tensor * q2d = ggml_view_2d(ctx, qkv, q_size,  seq_len, qkv->nb[1], 0);
         ggml_tensor * k2d = ggml_view_2d(ctx, qkv, kv_size, seq_len, qkv->nb[1], q_size * es);
@@ -385,7 +477,8 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
         ggml_tensor * KQs = ggml_scale(ctx, KQ, 1.0f / std::sqrt(static_cast<float>(head_dim)));
         ggml_tensor * KQm;
         if (inp.mask) {
-            KQm = ggml_add(ctx, KQs, repeat_checked(ctx, inp.mask, KQs, "repeat:attn_mask"));
+            KQm = add_same_shape_checked(ctx, KQs,
+                repeat_checked(ctx, inp.mask, KQs, "repeat:attn_mask"), "add:attn_mask");
         } else {
             KQm = ggml_diag_mask_inf(ctx, KQs, 0);
         }
@@ -394,20 +487,29 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
         ggml_tensor * V       = ggml_cont(ctx, ggml_permute(ctx, v_rep, 1, 2, 0, 3));
         ggml_tensor * KQV     = mul_mat_checked(ctx, V, KQf, "mul_mat:codec_kqv");
         ggml_tensor * KQVm    = ggml_permute(ctx, KQV, 0, 2, 1, 3);
-        ggml_tensor * attn_cur = ggml_cpy(ctx, KQVm, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_size, seq_len));
+        ggml_tensor * attn_dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_size, seq_len);
+        if (!same_shape(KQVm, attn_dst))
+            throw std::runtime_error("codec attention output shape mismatch");
+        ggml_tensor * attn_cur = ggml_cpy(ctx, KQVm, attn_dst);
         ggml_tensor * attn_out = mul_mat_checked(ctx, wo, attn_cur, "mul_mat:codec_wo");
         ggml_tensor * attn_sc  = scale_channels_cl(ctx, attn_out, attn_gamma);
 
-        ggml_tensor * h    = ggml_add(ctx, x, attn_sc);
+        ggml_tensor * h    = add_same_shape_checked(ctx, x, attn_sc, "add:codec_attn_residual");
         ggml_tensor * ff_in = rms_norm_weighted_cl(ctx, h, ffn_norm, norm_eps);
         ggml_tensor * gate  = mul_mat_checked(ctx, w1, ff_in, "mul_mat:codec_w1");
         ggml_tensor * up    = mul_mat_checked(ctx, w3, ff_in, "mul_mat:codec_w3");
-        ggml_tensor * ff_h  = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+        ggml_tensor * ff_h  = mul_same_shape_checked(ctx, ggml_silu(ctx, gate), up, "mul:codec_ff_gate");
         ggml_tensor * ff_out = mul_mat_checked(ctx, w2, ff_h, "mul_mat:codec_w2");
         ggml_tensor * ff_sc  = scale_channels_cl(ctx, ff_out, ffn_gamma);
 
-        x = ggml_add(ctx, h, ff_sc);
+        x = add_same_shape_checked(ctx, h, ff_sc, "add:codec_ff_residual");
     }
+    // Metadata is authoritative. Extra layer tensors are just as suspicious as
+    // missing ones because silently executing a different architecture makes a
+    // corrupt/custom GGUF produce unpredictable audio.
+    const std::string extra_stem = prefix + ".layers." + std::to_string(n_layers);
+    if (ggml_get_tensor(ctx_w, (extra_stem + ".attention.wqkv.weight").c_str()))
+        throw std::runtime_error("codec transformer contains layers beyond metadata: " + prefix);
 
     ggml_tensor * norm_w = ggml_get_tensor(ctx_w, (prefix + ".norm.weight").c_str());
     if (!norm_w) throw std::runtime_error("missing tensor: " + prefix + ".norm.weight");
@@ -429,7 +531,7 @@ static ggml_tensor * build_residual_unit(ggml_context * ctx, ggml_context * ctx_
     y = causal_conv_1d(ctx, req(prefix + ".block.1.conv.weight"), req(prefix + ".block.1.conv.bias"), y, 1, dilation);
     y = snake_activation(ctx, y, req(prefix + ".block.2.alpha"));
     y = causal_conv_1d(ctx, req(prefix + ".block.3.conv.weight"), req(prefix + ".block.3.conv.bias"), y, 1, 1);
-    return ggml_add(ctx, x, y);
+    return add_same_shape_checked(ctx, x, y, "add:residual_unit");
 }
 
 // ---------------------------------------------------------------------------
@@ -447,9 +549,18 @@ static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx
     // depthwise conv (conv_1d on each channel independently)
     ggml_tensor * dw_w = req(prefix + ".dwconv.conv.weight");
     ggml_tensor * dw_b = req(prefix + ".dwconv.conv.bias");
+    if (!dw_w || !dw_b || x->ne[0] <= 0 || x->ne[1] <= 0 ||
+        dw_w->ne[0] <= 0 || dw_w->ne[0] > std::numeric_limits<int>::max() ||
+        dw_w->ne[1] != 1 || dw_w->ne[2] != x->ne[0] || dw_w->ne[3] != 1 ||
+        ggml_nelements(dw_b) != x->ne[0]) {
+        throw std::runtime_error("invalid ConvNext depthwise-convolution shape");
+    }
     const int kernel_size_dw = static_cast<int>(dw_w->ne[0]);
     const int pad_dw = kernel_size_dw - 1;
-    const int extra_dw = static_cast<int>(extra_padding_for_conv1d(x->ne[1], kernel_size_dw, 1, pad_dw));
+    const int64_t extra_dw64 = extra_padding_for_conv1d(x->ne[1], kernel_size_dw, 1, pad_dw);
+    if (extra_dw64 < 0 || extra_dw64 > std::numeric_limits<int>::max())
+        throw std::runtime_error("ConvNext padding is out of int range");
+    const int extra_dw = static_cast<int>(extra_dw64);
     ggml_tensor * x_lc = cl_to_lc(ctx, x);
     x_lc = ggml_pad_ext(ctx, x_lc, pad_dw, extra_dw, 0, 0, 0, 0, 0, 0);
     ggml_tensor * y_lc = ggml_conv_1d_dw(ctx, dw_w, x_lc, 1, 0, 1);
@@ -461,7 +572,7 @@ static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx
     y = ggml_gelu_erf(ctx, y);
     y = linear_bias(ctx, req(prefix + ".pwconv2.weight"), req(prefix + ".pwconv2.bias"), y, "mul_mat:cn_pw2");
     y = scale_channels_cl(ctx, y, req(prefix + ".gamma"));
-    return ggml_add(ctx, x, y);
+    return add_same_shape_checked(ctx, x, y, "add:convnext");
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +601,9 @@ static ggml_tensor * build_encoder_block(ggml_context * ctx, AudioCodec::Impl & 
                                impl.transformer_head_dim,
                                impl.transformer_rope_base,
                                impl.transformer_norm_eps,
+                               n_transformer_layers,
                                512,
+                               active_backend_is_metal(impl.backend),
                                inp);
     }
     return x;
@@ -520,7 +633,9 @@ static ggml_tensor * build_quantizer_decode_stage(ggml_context * ctx, AudioCodec
                                          impl.rvq_transformer_head_dim,
                                          impl.rvq_transformer_rope_base,
                                          impl.rvq_transformer_norm_eps,
+                                         impl.rvq_transformer_n_layer,
                                          impl.rvq_transformer_window_size,
+                                         active_backend_is_metal(impl.backend),
                                          inp);
     const size_t n = impl.quantizer_downsample_factor.size();
     for (size_t i = 0; i < n; ++i) {
@@ -592,16 +707,33 @@ static std::vector<float> tensor_to_f32(ggml_tensor * t) {
         ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
         for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(tmp[i]);
     } else {
-        // Dequantification generique via ggml type traits (Q8_0, Q4_K, etc.)
+        // Quantized conversion must respect row boundaries. Several K-quant
+        // to_float implementations assume a complete quantization row and may
+        // assert/read past input if handed a flattened multi-row tensor.
         const ggml_type_traits * tr = ggml_get_type_traits(t->type);
         if (!tr || !tr->to_float) {
             throw std::runtime_error("unsupported tensor type for host copy: " +
                                      std::string(ggml_type_name(t->type)));
         }
-        const size_t nbytes = ggml_nbytes(t);
-        std::vector<uint8_t> raw(nbytes);
-        ggml_backend_tensor_get(t, raw.data(), 0, nbytes);
-        tr->to_float(raw.data(), out.data(), static_cast<int64_t>(n));
+        const int64_t row_elems_i64 = t->ne[0];
+        const int64_t n_rows_i64 = ggml_nrows(t);
+        const int64_t block = ggml_blck_size(t->type);
+        if (row_elems_i64 <= 0 || n_rows_i64 <= 0 || block <= 0 || row_elems_i64 % block != 0)
+            throw std::runtime_error("invalid quantized tensor row layout for host copy");
+        const size_t row_elems = static_cast<size_t>(row_elems_i64);
+        const size_t n_rows = static_cast<size_t>(n_rows_i64);
+        const size_t row_bytes = ggml_row_size(t->type, row_elems_i64);
+        if (row_bytes == 0 || n_rows > std::numeric_limits<size_t>::max() / row_bytes ||
+            row_elems > std::numeric_limits<size_t>::max() / n_rows || row_elems * n_rows != n)
+            throw std::runtime_error("quantized tensor row size overflow");
+        std::vector<uint8_t> raw_row(row_bytes);
+        for (size_t row = 0; row < n_rows; ++row) {
+            const size_t src_off = row * t->nb[1];
+            if (src_off > ggml_nbytes(t) || row_bytes > ggml_nbytes(t) - src_off)
+                throw std::runtime_error("quantized tensor row exceeds backend storage");
+            ggml_backend_tensor_get(t, raw_row.data(), src_off, row_bytes);
+            tr->to_float(raw_row.data(), out.data() + row * row_elems, row_elems_i64);
+        }
     }
     return out;
 }
@@ -617,11 +749,6 @@ static vq_cache load_vq_cache(ggml_context * ctx_w, const std::string & prefix,
     vq.input_dim    = in_dim;
     vq.codebook_dim = cb_dim;
     vq.codebook_size = cb_size;
-    vq.in_proj_weight  = tensor_to_f32(req(prefix + ".in_proj.weight"));
-    vq.in_proj_bias    = tensor_to_f32(req(prefix + ".in_proj.bias"));
-    vq.out_proj_weight = tensor_to_f32(req(prefix + ".out_proj.weight"));
-    vq.out_proj_bias   = tensor_to_f32(req(prefix + ".out_proj.bias"));
-    vq.codebook        = tensor_to_f32(req(prefix + ".codebook.weight"));
 
     auto checked_product = [](int32_t a, int32_t b, const char * what) -> size_t {
         if (a <= 0 || b <= 0 || static_cast<size_t>(a) > std::numeric_limits<size_t>::max() / static_cast<size_t>(b))
@@ -630,6 +757,20 @@ static vq_cache load_vq_cache(ggml_context * ctx_w, const std::string & prefix,
     };
     const size_t proj_elems = checked_product(in_dim, cb_dim, "projection");
     const size_t codebook_elems = checked_product(cb_size, cb_dim, "codebook");
+    ggml_tensor * in_w  = req(prefix + ".in_proj.weight");
+    ggml_tensor * in_b  = req(prefix + ".in_proj.bias");
+    ggml_tensor * out_w = req(prefix + ".out_proj.weight");
+    ggml_tensor * out_b = req(prefix + ".out_proj.bias");
+    ggml_tensor * cb_w  = req(prefix + ".codebook.weight");
+    if (ggml_nelements(in_w) != static_cast<int64_t>(proj_elems) ||
+        ggml_nelements(in_b) != cb_dim || ggml_nelements(out_w) != static_cast<int64_t>(proj_elems) ||
+        ggml_nelements(out_b) != in_dim || ggml_nelements(cb_w) != static_cast<int64_t>(codebook_elems))
+        throw std::runtime_error("VQ tensor shapes do not match codec metadata before host copy: " + prefix);
+    vq.in_proj_weight  = tensor_to_f32(in_w);
+    vq.in_proj_bias    = tensor_to_f32(in_b);
+    vq.out_proj_weight = tensor_to_f32(out_w);
+    vq.out_proj_bias   = tensor_to_f32(out_b);
+    vq.codebook        = tensor_to_f32(cb_w);
     if (vq.in_proj_weight.size() != proj_elems ||
         vq.in_proj_bias.size() != static_cast<size_t>(cb_dim) ||
         vq.out_proj_weight.size() != proj_elems ||
@@ -793,6 +934,8 @@ void AudioCodec::unload() {
     semantic_codebook_size_ = 4096;
     residual_codebook_size_ = 4096;
     max_decode_frames_      = 0;
+    samples_per_code_frame_   = 2048;
+    streaming_history_frames_ = 160;
 }
 
 // ---------------------------------------------------------------------------
@@ -870,6 +1013,18 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
             require_type(id, k, GGUF_TYPE_UINT32);
             return gguf_get_val_u32(gguf_ctx, id);
         };
+        auto req_i32_u32 = [&](const char * k) -> int32_t {
+            const uint32_t value = req_u32(k);
+            if (value > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+                throw std::runtime_error(std::string("value out of int32 range for key: ") + k);
+            return static_cast<int32_t>(value);
+        };
+        auto opt_i32_u32 = [&](const char * k, uint32_t def) -> int32_t {
+            const uint32_t value = opt_u32(k, def);
+            if (value > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+                throw std::runtime_error(std::string("value out of int32 range for key: ") + k);
+            return static_cast<int32_t>(value);
+        };
         auto req_f32 = [&](const char * k) -> float {
             int64_t id = gguf_find_key(gguf_ctx, k);
             if (id < 0) throw std::runtime_error(std::string("missing key: ") + k);
@@ -932,35 +1087,35 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
             throw std::runtime_error("unexpected architecture: " + arch);
         }
 
-        impl_->sample_rate    = static_cast<int32_t>(req_u32("fish_speech.codec.sample_rate"));
-        impl_->hop_length     = static_cast<int32_t>(req_u32("fish_speech.codec.hop_length"));
-        impl_->frame_length   = static_cast<int32_t>(opt_u32("fish_speech.codec.frame_length", 512));
-        impl_->encoder_dim    = static_cast<int32_t>(req_u32("fish_speech.codec.encoder_dim"));
-        impl_->decoder_dim    = static_cast<int32_t>(req_u32("fish_speech.codec.decoder_dim"));
-        impl_->latent_dim     = static_cast<int32_t>(req_u32("fish_speech.codec.latent_dim"));
+        impl_->sample_rate    = req_i32_u32("fish_speech.codec.sample_rate");
+        impl_->hop_length     = req_i32_u32("fish_speech.codec.hop_length");
+        impl_->frame_length   = opt_i32_u32("fish_speech.codec.frame_length", 512);
+        impl_->encoder_dim    = req_i32_u32("fish_speech.codec.encoder_dim");
+        impl_->decoder_dim    = req_i32_u32("fish_speech.codec.decoder_dim");
+        impl_->latent_dim     = req_i32_u32("fish_speech.codec.latent_dim");
         impl_->encoder_rates  = req_u32_arr("fish_speech.codec.encoder_rates");
         impl_->decoder_rates  = req_u32_arr("fish_speech.codec.decoder_rates");
         impl_->encoder_transformer_layers = req_u32_arr("fish_speech.codec.encoder_transformer_layers");
 
-        impl_->quantizer_input_dim              = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_input_dim"));
-        impl_->quantizer_codebook_dim           = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_codebook_dim"));
-        impl_->quantizer_residual_codebooks     = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_residual_codebooks"));
-        impl_->quantizer_residual_codebook_size = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_residual_codebook_size"));
-        impl_->quantizer_semantic_codebook_size = static_cast<int32_t>(req_u32("fish_speech.codec.quantizer_semantic_codebook_size"));
+        impl_->quantizer_input_dim              = req_i32_u32("fish_speech.codec.quantizer_input_dim");
+        impl_->quantizer_codebook_dim           = req_i32_u32("fish_speech.codec.quantizer_codebook_dim");
+        impl_->quantizer_residual_codebooks     = req_i32_u32("fish_speech.codec.quantizer_residual_codebooks");
+        impl_->quantizer_residual_codebook_size = req_i32_u32("fish_speech.codec.quantizer_residual_codebook_size");
+        impl_->quantizer_semantic_codebook_size = req_i32_u32("fish_speech.codec.quantizer_semantic_codebook_size");
         impl_->quantizer_downsample_factor      = req_u32_arr("fish_speech.codec.quantizer_downsample_factor");
 
-        impl_->transformer_block_size    = static_cast<int32_t>(req_u32("fish_speech.codec.transformer.block_size"));
+        impl_->transformer_block_size    = req_i32_u32("fish_speech.codec.transformer.block_size");
         impl_->transformer_n_local_heads = req_i32_or_u32("fish_speech.codec.transformer.n_local_heads");
-        impl_->transformer_head_dim      = static_cast<int32_t>(req_u32("fish_speech.codec.transformer.head_dim"));
+        impl_->transformer_head_dim      = req_i32_u32("fish_speech.codec.transformer.head_dim");
         impl_->transformer_rope_base     = req_f32("fish_speech.codec.transformer.rope_freq_base");
         impl_->transformer_norm_eps      = req_f32("fish_speech.codec.transformer.layer_norm_rms_eps");
 
-        impl_->rvq_transformer_window_size   = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.window_size"));
-        impl_->rvq_transformer_block_size    = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.block_size"));
-        impl_->rvq_transformer_n_layer       = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.n_layer"));
+        impl_->rvq_transformer_window_size   = req_i32_u32("fish_speech.codec.rvq_transformer.window_size");
+        impl_->rvq_transformer_block_size    = req_i32_u32("fish_speech.codec.rvq_transformer.block_size");
+        impl_->rvq_transformer_n_layer       = req_i32_u32("fish_speech.codec.rvq_transformer.n_layer");
         impl_->rvq_transformer_n_local_heads = req_i32_or_u32("fish_speech.codec.rvq_transformer.n_local_heads");
-        impl_->rvq_transformer_head_dim      = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.head_dim"));
-        impl_->rvq_transformer_dim           = static_cast<int32_t>(req_u32("fish_speech.codec.rvq_transformer.dim"));
+        impl_->rvq_transformer_head_dim      = req_i32_u32("fish_speech.codec.rvq_transformer.head_dim");
+        impl_->rvq_transformer_dim           = req_i32_u32("fish_speech.codec.rvq_transformer.dim");
         impl_->rvq_transformer_rope_base     = req_f32("fish_speech.codec.rvq_transformer.rope_freq_base");
         impl_->rvq_transformer_norm_eps      = req_f32("fish_speech.codec.rvq_transformer.layer_norm_rms_eps");
 
@@ -970,13 +1125,14 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
             return std::all_of(v.begin(), v.end(), [&](int32_t x) { return x >= lo && x <= hi; });
         };
         const bool metadata_ok =
-            sane_pos(impl_->sample_rate, 768000) &&
+            impl_->sample_rate >= 1000 && impl_->sample_rate <= 768000 &&
             sane_pos(impl_->hop_length, 10000000) &&
             sane_pos(impl_->frame_length, 10000000) &&
             sane_pos(impl_->encoder_dim, 1000000) &&
             sane_pos(impl_->decoder_dim, 1000000) &&
             sane_pos(impl_->latent_dim, 1000000) &&
             !impl_->encoder_rates.empty() && !impl_->decoder_rates.empty() &&
+            impl_->encoder_transformer_layers.size() == impl_->encoder_rates.size() &&
             all_between(impl_->encoder_rates, 1, 1000000) &&
             all_between(impl_->decoder_rates, 1, 1000000) &&
             all_between(impl_->encoder_transformer_layers, 0, 4096) &&
@@ -1000,6 +1156,25 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
             std::isfinite(impl_->rvq_transformer_rope_base) && impl_->rvq_transformer_rope_base > 0.0f &&
             std::isfinite(impl_->rvq_transformer_norm_eps) && impl_->rvq_transformer_norm_eps > 0.0f;
         if (!metadata_ok) throw std::runtime_error("invalid/out-of-range codec GGUF metadata");
+        if (impl_->rvq_transformer_window_size > impl_->rvq_transformer_block_size)
+            throw std::runtime_error("RVQ transformer window exceeds block size");
+
+        auto checked_rate_product = [](const std::vector<int32_t> & rates, const char * label) -> int64_t {
+            int64_t product = 1;
+            for (int32_t r : rates) {
+                if (r <= 0 || product > std::numeric_limits<int64_t>::max() / r)
+                    throw std::runtime_error(std::string(label) + " rate product overflow");
+                product *= r;
+            }
+            return product;
+        };
+        const int64_t encoder_scale = checked_rate_product(impl_->encoder_rates, "encoder");
+        const int64_t decoder_scale = checked_rate_product(impl_->decoder_rates, "decoder");
+        if (encoder_scale != impl_->hop_length || decoder_scale != impl_->hop_length)
+            throw std::runtime_error("codec encoder/decoder rate product is inconsistent with hop_length");
+        const int64_t code_frame_factor = checked_rate_product(impl_->quantizer_downsample_factor, "quantizer");
+        if (code_frame_factor > std::numeric_limits<int32_t>::max() / impl_->hop_length)
+            throw std::runtime_error("samples-per-code-frame overflow");
 
         sample_rate_              = impl_->sample_rate;
         hop_length_               = impl_->hop_length;
@@ -1007,8 +1182,17 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
         semantic_codebook_size_   = impl_->quantizer_semantic_codebook_size;
         residual_codebook_size_   = impl_->quantizer_residual_codebook_size;
         max_decode_frames_        = impl_->rvq_transformer_block_size;
+        samples_per_code_frame_   = static_cast<int32_t>(code_frame_factor) * hop_length_;
+        const int32_t rvq_history = std::max(0, impl_->rvq_transformer_window_size - 1);
+        int64_t history64 = ((static_cast<int64_t>(rvq_history) + 16 + 7) / 8) * 8;
+        if (history64 <= 0) history64 = 160;
+        streaming_history_frames_ = max_decode_frames_ > 1
+            ? static_cast<int32_t>(std::min<int64_t>(history64, max_decode_frames_ - 1))
+            : 0;
 
-        // Pre-pass: retype Q4_K/Q5_K/Q6_K tensors to F16 BEFORE allocation.
+        // Pre-pass: only convolution weights requiring a K-quant->F32 CAST on a
+        // GPU backend are expanded to F16. Linear/attention matrices stay
+        // quantized so CUDA/Vulkan/Metal can use their native matmul kernels.
         // With the CUDA backend, ggml_backend_alloc_ctx_tensors uses
         // ggml_nbytes(t) (which reads t->nb[]) to size device buffers.
         // We must update BOTH t->type AND t->nb[] so that ggml_nbytes returns
@@ -1019,34 +1203,60 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
         // F16 strides: nb[0] = sizeof(ggml_fp16_t) = 2
         //              nb[i] = nb[i-1] * ne[i-1]  for i >= 1
         {
+            const bool gpu_backend = !ggml_backend_is_cpu(impl_->backend);
+            auto is_k_quant = [](ggml_type ty) {
+                return ty == GGML_TYPE_Q2_K || ty == GGML_TYPE_Q3_K || ty == GGML_TYPE_Q4_K ||
+                       ty == GGML_TYPE_Q5_K || ty == GGML_TYPE_Q6_K;
+            };
             for (ggml_tensor * t = ggml_get_first_tensor(impl_->ctx_w);
-                 t != nullptr;
-                 t = ggml_get_next_tensor(impl_->ctx_w, t)) {
-                if (t->type == GGML_TYPE_Q4_K ||
-                    t->type == GGML_TYPE_Q5_K ||
-                    t->type == GGML_TYPE_Q6_K) {
+                 t != nullptr; t = ggml_get_next_tensor(impl_->ctx_w, t)) {
+                const char * raw_name = t->name;
+                const std::string name = raw_name ? raw_name : "";
+                const bool conv_weight = name.size() >= 12 &&
+                    name.compare(name.size() - 12, 12, ".conv.weight") == 0;
+                if (gpu_backend && conv_weight && is_k_quant(t->type)) {
                     t->type  = GGML_TYPE_F16;
-                    t->nb[0] = sizeof(ggml_fp16_t);   // 2 bytes per element
+                    t->nb[0] = sizeof(ggml_fp16_t);
                     for (int d = 1; d < GGML_MAX_DIMS; ++d) {
-                        t->nb[d] = t->nb[d - 1] * t->ne[d - 1];
+                        if (t->ne[d - 1] <= 0 || static_cast<uint64_t>(t->ne[d - 1]) >
+                            static_cast<uint64_t>(std::numeric_limits<size_t>::max() / t->nb[d - 1]))
+                            throw std::runtime_error("F16 tensor layout overflow: " + name);
+                        t->nb[d] = t->nb[d - 1] * static_cast<size_t>(t->ne[d - 1]);
                     }
                 }
             }
         }
 
-        // Allocate and load tensor data
-        impl_->model_buf = ggml_backend_alloc_ctx_tensors(impl_->ctx_w, impl_->backend);
-        if (!impl_->model_buf) throw std::runtime_error("ggml_backend_alloc_ctx_tensors() failed");
-
+        // Validate every tensor span against the physical file before allocating
+        // backend buffers. A truncated/hostile GGUF must fail cheaply instead of
+        // first forcing a potentially very large CUDA/Vulkan/Metal allocation.
         const size_t data_offset = gguf_get_data_offset(gguf_ctx);
         const int64_t n_tensors  = gguf_get_n_tensors(gguf_ctx);
-        int32_t dequant_count = 0;
         std::FILE * f = open_binary_input_utf8(gguf_path);
         if (!f) throw std::runtime_error("failed to reopen codec file");
         struct FileGuard { std::FILE * f; ~FileGuard() { if (f) std::fclose(f); } } file_guard{f};
         uint64_t physical_file_size = 0;
         if (!file_size_u64(f, physical_file_size))
             throw std::runtime_error("failed to determine codec GGUF file size");
+        for (int64_t ti = 0; ti < n_tensors; ++ti) {
+            const char * name = gguf_get_tensor_name(gguf_ctx, ti);
+            const size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx, ti);
+            if (tensor_offset > std::numeric_limits<size_t>::max() - data_offset)
+                throw std::runtime_error(std::string("invalid tensor offset: ") + (name ? name : "<unnamed>"));
+            const size_t off = data_offset + tensor_offset;
+            const size_t gguf_file_bytes = gguf_get_tensor_size(gguf_ctx, ti);
+            const uint64_t off64 = static_cast<uint64_t>(off);
+            if (off64 > physical_file_size ||
+                static_cast<uint64_t>(gguf_file_bytes) > physical_file_size - off64)
+                throw std::runtime_error(std::string("tensor extends past end of codec GGUF: ") +
+                                         (name ? name : "<unnamed>"));
+        }
+
+        // Allocate only after the file has passed the cheap physical-span pass.
+        impl_->model_buf = ggml_backend_alloc_ctx_tensors(impl_->ctx_w, impl_->backend);
+        if (!impl_->model_buf) throw std::runtime_error("ggml_backend_alloc_ctx_tensors() failed");
+
+        int32_t dequant_count = 0;
         for (int64_t ti = 0; ti < n_tensors; ++ti) {
             const char * name = gguf_get_tensor_name(gguf_ctx, ti);
             ggml_tensor * t = ggml_get_tensor(impl_->ctx_w, name);
@@ -1063,37 +1273,54 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
             // Determine original type from GGUF (tensor in ctx_w may already be F16
             // after pre-pass; read original quantized type from gguf metadata).
             ggml_type orig_type = gguf_get_tensor_type(gguf_ctx, ti);
-            if (orig_type == GGML_TYPE_Q4_K ||
-                orig_type == GGML_TYPE_Q5_K ||
-                orig_type == GGML_TYPE_Q6_K) {
-                // Read raw quantized bytes from file, dequantize to F16 inline.
-                const size_t q_bytes = gguf_file_bytes;
+            const bool orig_k_quant = orig_type == GGML_TYPE_Q2_K || orig_type == GGML_TYPE_Q3_K ||
+                                      orig_type == GGML_TYPE_Q4_K || orig_type == GGML_TYPE_Q5_K ||
+                                      orig_type == GGML_TYPE_Q6_K;
+            if (orig_k_quant && t->type == GGML_TYPE_F16) {
+                // Dequantize one row at a time directly to the final F16 backend
+                // tensor. This avoids holding full quantized + F32 + F16 copies.
                 const int64_t n_elems_i64 = ggml_nelements(t);
-                if (n_elems_i64 <= 0 || static_cast<uint64_t>(n_elems_i64) >
-                    static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
-                    throw std::runtime_error(std::string("invalid tensor element count: ") + name);
-                const size_t n_elems = static_cast<size_t>(n_elems_i64);
-                if (n_elems > std::numeric_limits<size_t>::max() / sizeof(ggml_fp16_t) ||
-                    n_elems * sizeof(ggml_fp16_t) != ggml_nbytes(t))
+                const int64_t row_elems_i64 = t->ne[0];
+                const int64_t n_rows_i64 = ggml_nrows(t);
+                if (n_elems_i64 <= 0 || row_elems_i64 <= 0 || n_rows_i64 <= 0 ||
+                    row_elems_i64 > std::numeric_limits<int>::max())
+                    throw std::runtime_error(std::string("invalid tensor row layout: ") + name);
+                const int64_t block = ggml_blck_size(orig_type);
+                if (block <= 0 || row_elems_i64 % block != 0)
+                    throw std::runtime_error(std::string("quantized row width is not block-aligned: ") + name);
+                const size_t row_elems = static_cast<size_t>(row_elems_i64);
+                const size_t n_rows = static_cast<size_t>(n_rows_i64);
+                const size_t q_row_bytes = ggml_row_size(orig_type, row_elems_i64);
+                if (q_row_bytes == 0 || n_rows > std::numeric_limits<size_t>::max() / q_row_bytes ||
+                    q_row_bytes * n_rows != gguf_file_bytes)
+                    throw std::runtime_error(std::string("invalid quantized row layout: ") + name);
+                if (row_elems > std::numeric_limits<size_t>::max() / sizeof(ggml_fp16_t) ||
+                    n_rows > std::numeric_limits<size_t>::max() / (row_elems * sizeof(ggml_fp16_t)) ||
+                    row_elems * n_rows * sizeof(ggml_fp16_t) != ggml_nbytes(t))
                     throw std::runtime_error(std::string("invalid F16 tensor destination size: ") + name);
-                std::vector<uint8_t> q_data(q_bytes);
 #ifdef _WIN32
-                const int seek_rc = _fseeki64(f, static_cast<int64_t>(off), SEEK_SET);
+                const int seek_rc = (off > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+                                    ? -1 : _fseeki64(f, static_cast<int64_t>(off), SEEK_SET);
 #else
                 const int seek_rc = (off > static_cast<size_t>(std::numeric_limits<off_t>::max()))
                                     ? -1 : fseeko(f, static_cast<off_t>(off), SEEK_SET);
 #endif
-                if (seek_rc != 0 || std::fread(q_data.data(), 1, q_bytes, f) != q_bytes) {
-                    throw std::runtime_error(std::string("failed to read tensor: ") + name);
-                }
-                std::vector<float> f32_buf(n_elems);
+                if (seek_rc != 0)
+                    throw std::runtime_error(std::string("failed to seek tensor: ") + name);
                 const struct ggml_type_traits * tt = ggml_get_type_traits(orig_type);
                 if (!tt || !tt->to_float)
                     throw std::runtime_error(std::string("tensor type cannot be dequantized: ") + name);
-                tt->to_float(q_data.data(), f32_buf.data(), n_elems_i64);
-                std::vector<ggml_fp16_t> f16_buf(n_elems);
-                ggml_fp32_to_fp16_row(f32_buf.data(), f16_buf.data(), n_elems_i64);
-                ggml_backend_tensor_set(t, f16_buf.data(), 0, n_elems * sizeof(ggml_fp16_t));
+                std::vector<uint8_t> q_row(q_row_bytes);
+                std::vector<float> f32_row(row_elems);
+                std::vector<ggml_fp16_t> f16_row(row_elems);
+                const size_t f16_row_bytes = row_elems * sizeof(ggml_fp16_t);
+                for (size_t row = 0; row < n_rows; ++row) {
+                    if (std::fread(q_row.data(), 1, q_row_bytes, f) != q_row_bytes)
+                        throw std::runtime_error(std::string("failed to read tensor row: ") + name);
+                    tt->to_float(q_row.data(), f32_row.data(), row_elems_i64);
+                    ggml_fp32_to_fp16_row(f32_row.data(), f16_row.data(), row_elems_i64);
+                    ggml_backend_tensor_set(t, f16_row.data(), row * f16_row_bytes, f16_row_bytes);
+                }
                 dequant_count++;
             } else {
                 const size_t nbytes = ggml_nbytes(t);
@@ -1101,7 +1328,8 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
                     throw std::runtime_error(std::string("GGUF/backend tensor byte-size mismatch: ") + name);
                 std::vector<uint8_t> tmp(nbytes);
 #ifdef _WIN32
-                const int seek_rc = _fseeki64(f, static_cast<int64_t>(off), SEEK_SET);
+                const int seek_rc = (off > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+                                    ? -1 : _fseeki64(f, static_cast<int64_t>(off), SEEK_SET);
 #else
                 const int seek_rc = (off > static_cast<size_t>(std::numeric_limits<off_t>::max()))
                                     ? -1 : fseeko(f, static_cast<off_t>(off), SEEK_SET);
@@ -1175,8 +1403,9 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
     ggml_init_params p = { ctx_size, ctx_buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     if (!ctx) return false;
+    GgmlContextGuard ctx_guard(ctx);
 
-    transformer_inputs enc_inp;
+    std::vector<transformer_inputs> enc_inputs(impl_->encoder_rates.size());
     ggml_tensor * audio_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, padded);
     ggml_tensor * latent    = nullptr;
     try {
@@ -1188,9 +1417,8 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
 
         for (size_t i = 0; i < impl_->encoder_rates.size(); ++i) {
             const std::string prefix = impl_->tprefix + "encoder.block." + std::to_string(i + 1) + ".block";
-            const int32_t n_layers = (i < impl_->encoder_transformer_layers.size())
-                                     ? impl_->encoder_transformer_layers[i] : 0;
-            x = build_encoder_block(ctx, *impl_, prefix, x, impl_->encoder_rates[i], n_layers, enc_inp);
+            const int32_t n_layers = impl_->encoder_transformer_layers[i];
+            x = build_encoder_block(ctx, *impl_, prefix, x, impl_->encoder_rates[i], n_layers, enc_inputs[i]);
         }
 
         const int last = static_cast<int>(impl_->encoder_rates.size()) + 1;
@@ -1204,10 +1432,13 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
             req(impl_->tprefix + "encoder.block." + std::to_string(last + 1) + ".conv.weight"),
             req(impl_->tprefix + "encoder.block." + std::to_string(last + 1) + ".conv.bias"),
             x, 1, 1);
+        if (x->ne[0] != impl_->latent_dim || x->ne[1] <= 0 ||
+            x->ne[1] > std::numeric_limits<int32_t>::max() || x->ne[2] != 1 || x->ne[3] != 1) {
+            throw std::runtime_error("encoder output shape does not match codec latent metadata");
+        }
         latent = ggml_cpy(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1]));
     } catch (const std::exception & e) {
         std::cerr << "[Codec::encode] encoder build failed: " << e.what() << std::endl;
-        ggml_free(ctx);
         return false;
     }
 
@@ -1215,35 +1446,35 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
     ggml_build_forward_expand(gf, latent);
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
+    GallocrGuard allocr_guard(allocr);
     if (!allocr || !ggml_gallocr_alloc_graph(allocr, gf)) {
-        if (allocr) ggml_gallocr_free(allocr);
-        ggml_free(ctx);
         return false;
     }
 
     ggml_backend_tensor_set(audio_in, audio_padded.data(), 0, audio_padded.size() * sizeof(float));
-    if (enc_inp.positions) {
-        ggml_backend_tensor_set(enc_inp.positions, enc_inp.position_values.data(), 0,
-                                enc_inp.position_values.size() * sizeof(int32_t));
-    }
-    if (enc_inp.mask) {
-        ggml_backend_tensor_set(enc_inp.mask, enc_inp.mask_values.data(), 0,
-                                enc_inp.mask_values.size() * sizeof(float));
+    for (auto & enc_inp : enc_inputs) {
+        if (enc_inp.positions) {
+            ggml_backend_tensor_set(enc_inp.positions, enc_inp.position_values.data(), 0,
+                                    enc_inp.position_values.size() * sizeof(int32_t));
+        }
+        if (enc_inp.mask) {
+            ggml_backend_tensor_set(enc_inp.mask, enc_inp.mask_values.data(), 0,
+                                    enc_inp.mask_values.size() * sizeof(float));
+        }
     }
 
     if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
     if (ggml_backend_graph_compute(impl_->backend, gf) != GGML_STATUS_SUCCESS) {
         std::cerr << "[Codec::encode] encoder compute failed." << std::endl;
-        ggml_gallocr_free(allocr);
-        ggml_free(ctx);
         return false;
     }
 
     const int32_t latent_frames = static_cast<int32_t>(latent->ne[1]);
     std::vector<float> latent_out(static_cast<size_t>(latent->ne[0]) * latent_frames);
     ggml_backend_tensor_get(latent, latent_out.data(), 0, latent_out.size() * sizeof(float));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
+    // Release the temporary graph allocation before the quantizer graph to
+    // avoid overlapping backend buffers and unnecessarily high peak VRAM.
+    allocr_guard.reset();
     if (std::any_of(latent_out.begin(), latent_out.end(), [](float v) { return !std::isfinite(v); })) {
         std::cerr << "[Codec::encode] encoder produced NaN/Inf latent values.\n";
         return false;
@@ -1256,6 +1487,7 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
         ggml_init_params p2 = { ctx2_size, ctx2_buf.data(), true };
         ggml_context * ctx2 = ggml_init(p2);
         if (!ctx2) return false;
+        GgmlContextGuard ctx2_guard(ctx2);
 
         transformer_inputs qenc_inp;
         ggml_tensor * latent_in = ggml_new_tensor_2d(ctx2, GGML_TYPE_F32, impl_->latent_dim, latent_frames);
@@ -1279,12 +1511,17 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
                                     impl_->rvq_transformer_head_dim,
                                     impl_->rvq_transformer_rope_base,
                                     impl_->rvq_transformer_norm_eps,
+                                    impl_->rvq_transformer_n_layer,
                                     impl_->rvq_transformer_window_size,
+                                    active_backend_is_metal(impl_->backend),
                                     qenc_inp);
+            if (x2->ne[0] != impl_->quantizer_input_dim || x2->ne[1] <= 0 ||
+                x2->ne[1] > std::numeric_limits<int32_t>::max() || x2->ne[2] != 1 || x2->ne[3] != 1) {
+                throw std::runtime_error("quantizer encoder output shape does not match metadata");
+            }
             stage = ggml_cpy(ctx2, x2, ggml_new_tensor_2d(ctx2, GGML_TYPE_F32, x2->ne[0], x2->ne[1]));
         } catch (const std::exception & e) {
             std::cerr << "[Codec::encode] quantizer encode stage failed: " << e.what() << std::endl;
-            ggml_free(ctx2);
             return false;
         }
 
@@ -1292,9 +1529,8 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
         ggml_build_forward_expand(gf2, stage);
 
         ggml_gallocr_t allocr2 = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
+        GallocrGuard allocr2_guard(allocr2);
         if (!allocr2 || !ggml_gallocr_alloc_graph(allocr2, gf2)) {
-            if (allocr2) ggml_gallocr_free(allocr2);
-            ggml_free(ctx2);
             return false;
         }
 
@@ -1311,16 +1547,13 @@ bool AudioCodec::encode(const float * audio, int32_t n_samples, int32_t n_thread
         if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
         if (ggml_backend_graph_compute(impl_->backend, gf2) != GGML_STATUS_SUCCESS) {
             std::cerr << "[Codec::encode] quantizer stage compute failed." << std::endl;
-            ggml_gallocr_free(allocr2);
-            ggml_free(ctx2);
             return false;
         }
 
         const int32_t stage_frames = static_cast<int32_t>(stage->ne[1]);
         std::vector<float> stage_out(static_cast<size_t>(stage->ne[0]) * stage_frames);
         ggml_backend_tensor_get(stage, stage_out.data(), 0, stage_out.size() * sizeof(float));
-        ggml_gallocr_free(allocr2);
-        ggml_free(ctx2);
+        allocr2_guard.reset();
         if (std::any_of(stage_out.begin(), stage_out.end(), [](float v) { return !std::isfinite(v); })) {
             std::cerr << "[Codec::encode] quantizer stage produced NaN/Inf values.\n";
             return false;
@@ -1400,16 +1633,27 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         ggml_init_params p = { ctx_size, ctx_buf.data(), true };
         ggml_context * ctx = ggml_init(p);
         if (!ctx) return false;
+        GgmlContextGuard ctx_guard(ctx);
 
         transformer_inputs inp;
         ggml_tensor * stage_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, impl_->quantizer_input_dim, n_frames);
         ggml_tensor * latent   = nullptr;
         try {
             latent = build_quantizer_decode_stage(ctx, *impl_, stage_in, inp);
+            int64_t expected_latent_frames = n_frames;
+            for (int32_t factor : impl_->quantizer_downsample_factor) {
+                if (factor <= 0 || expected_latent_frames > std::numeric_limits<int64_t>::max() / factor)
+                    throw std::runtime_error("quantizer decode frame-count overflow");
+                expected_latent_frames *= factor;
+            }
+            if (latent->ne[0] != impl_->latent_dim || latent->ne[1] != expected_latent_frames ||
+                latent->ne[2] != 1 || latent->ne[3] != 1 ||
+                latent->ne[1] > std::numeric_limits<int32_t>::max()) {
+                throw std::runtime_error("quantizer decoder output shape does not match metadata");
+            }
             latent = ggml_cpy(ctx, latent, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, latent->ne[0], latent->ne[1]));
         } catch (const std::exception & e) {
             std::cerr << "[Codec::decode] quantizer decode stage failed: " << e.what() << std::endl;
-            ggml_free(ctx);
             return false;
         }
 
@@ -1417,9 +1661,8 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         ggml_build_forward_expand(gf, latent);
 
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
+        GallocrGuard allocr_guard(allocr);
         if (!allocr || !ggml_gallocr_alloc_graph(allocr, gf)) {
-            if (allocr) ggml_gallocr_free(allocr);
-            ggml_free(ctx);
             return false;
         }
 
@@ -1436,16 +1679,13 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
         if (ggml_backend_graph_compute(impl_->backend, gf) != GGML_STATUS_SUCCESS) {
             std::cerr << "[Codec::decode] quantizer decode compute failed." << std::endl;
-            ggml_gallocr_free(allocr);
-            ggml_free(ctx);
             return false;
         }
 
         latent_frames = static_cast<int32_t>(latent->ne[1]);
         latent_out.resize(static_cast<size_t>(latent->ne[0]) * latent_frames);
         ggml_backend_tensor_get(latent, latent_out.data(), 0, latent_out.size() * sizeof(float));
-        ggml_gallocr_free(allocr);
-        ggml_free(ctx);
+        allocr_guard.reset();
         if (std::any_of(latent_out.begin(), latent_out.end(), [](float v) { return !std::isfinite(v); })) {
             std::cerr << "[Codec::decode] quantizer decode produced NaN/Inf latent values.\n";
             return false;
@@ -1459,15 +1699,22 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         ggml_init_params p = { ctx_size, ctx_buf.data(), true };
         ggml_context * ctx = ggml_init(p);
         if (!ctx) return false;
+        GgmlContextGuard ctx_guard(ctx);
 
         ggml_tensor * latent_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, impl_->latent_dim, latent_frames);
         ggml_tensor * audio_t   = nullptr;
         try {
             audio_t = build_decoder(ctx, *impl_, latent_in);
+            const int64_t expected_samples = static_cast<int64_t>(n_frames) * samples_per_code_frame_;
+            if (samples_per_code_frame_ <= 0 || expected_samples <= 0 ||
+                expected_samples > std::numeric_limits<int32_t>::max() ||
+                audio_t->ne[0] != 1 || audio_t->ne[1] != expected_samples ||
+                audio_t->ne[2] != 1 || audio_t->ne[3] != 1) {
+                throw std::runtime_error("decoder output duration/shape does not match codec metadata");
+            }
             audio_t = ggml_cpy(ctx, audio_t, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, audio_t->ne[0], audio_t->ne[1]));
         } catch (const std::exception & e) {
             std::cerr << "[Codec::decode] decoder build failed: " << e.what() << std::endl;
-            ggml_free(ctx);
             return false;
         }
 
@@ -1475,9 +1722,8 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         ggml_build_forward_expand(gf, audio_t);
 
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
+        GallocrGuard allocr_guard(allocr);
         if (!allocr || !ggml_gallocr_alloc_graph(allocr, gf)) {
-            if (allocr) ggml_gallocr_free(allocr);
-            ggml_free(ctx);
             return false;
         }
 
@@ -1485,8 +1731,6 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         if (ggml_backend_is_cpu(impl_->backend)) ggml_backend_cpu_set_n_threads(impl_->backend, n_threads);
         if (ggml_backend_graph_compute(impl_->backend, gf) != GGML_STATUS_SUCCESS) {
             std::cerr << "[Codec::decode] decoder compute failed." << std::endl;
-            ggml_gallocr_free(allocr);
-            ggml_free(ctx);
             return false;
         }
 
@@ -1494,15 +1738,12 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
         const int64_t n_samples64 = ggml_nelements(audio_t);
         if (n_samples64 <= 0 || n_samples64 > std::numeric_limits<int32_t>::max()) {
             std::cerr << "[Codec::decode] decoded audio exceeds supported size.\n";
-            ggml_gallocr_free(allocr);
-            ggml_free(ctx);
             return false;
         }
         const int32_t n_samples = static_cast<int32_t>(n_samples64);
         audio_out.resize(static_cast<size_t>(n_samples));
         ggml_backend_tensor_get(audio_t, audio_out.data(), 0, static_cast<size_t>(n_samples) * sizeof(float));
-        ggml_gallocr_free(allocr);
-        ggml_free(ctx);
+        allocr_guard.reset();
     }
     if (std::any_of(audio_out.begin(), audio_out.end(), [](float v) { return !std::isfinite(v); })) {
         std::cerr << "[Codec::decode] decoder produced NaN/Inf audio.\n";
@@ -1513,117 +1754,122 @@ bool AudioCodec::decode(const int32_t * codes, int32_t n_frames, int32_t n_threa
 }
 
 // ---------------------------------------------------------------------------
-// decode_chunked()  -- igual que decode() pero procesa en ventanas para
-// evitar OOM en GPUs con VRAM limitada (ej. RTX 3050 4 GB).
+// decode_chunked() -- bounded-window decode with stable interior commits.
 //
-// Estrategia:
-//   - chunk_frames  : cuantos frames procesar por llamada a decode()
-//   - overlap       : frames del chunk anterior que se re-procesan al inicio
-//                     del siguiente para "calentar" el transformer y las
-//                     convoluciones dilatadas sin artefactos de borde.
-//                     Se descarta del output de cada chunk (excepto el primero).
-//
-// El overlap adecuado es max(rvq_transformer_window_size, 64).
-// Con chunk_frames=0 se elige automaticamente basandose en window_size.
+// Each interior output range is decoded with both left context and right
+// look-ahead. Only the stable center of that window is committed, which avoids
+// exposing convolution/transformer edge artifacts at chunk boundaries.
+// `chunk_frames` is the maximum number of code frames decoded in one graph;
+// 0 chooses an automatic window large enough for the codec's preferred history
+// when the advertised transformer block size allows it. `overlap_frames == 0`
+// means automatic codec history; a positive value explicitly overrides it.
 // ---------------------------------------------------------------------------
 
 bool AudioCodec::decode_chunked(const int32_t * codes, int32_t n_frames, int32_t n_threads,
                                  std::vector<float> & audio_out, int32_t chunk_frames,
                                  int32_t overlap_frames) {
+    audio_out.clear();
     if (!impl_ || !codes || n_frames <= 0 || n_threads <= 0 ||
-        chunk_frames < 0 || overlap_frames < 0) return false;
-
-    const int32_t num_cb  = impl_->quantizer_residual_codebooks + 1;
-
-    // Overlap entre chunks: con overlap > 0 el codec re-procesa N frames del chunk
-    // anterior para suavizar las uniones. ADVERTENCIA: en el codec Firefly GAN el
-    // grafo de ggml escala con chunk_len = chunk_frames + overlap -- con overlap=31
-    // y chunk=32 el segundo chunk necesita ~373 MB (OOM en RTX 3050 con transformer
-    // en VRAM). Default=0 (sin overlap): todos los chunks tienen el mismo grafo.
-    // Usar overlap > 0 solo si la VRAM lo permite (codec solo en GPU sin transformer).
-    // Resolve automatic chunk size first. Clamping overlap against chunk_frames
-    // while it is still zero produces -1 and later an invalid vector offset.
-    const int32_t codec_max_frames = impl_->rvq_transformer_block_size;
-    if (codec_max_frames <= 0) return false;
-    if (chunk_frames <= 0) {
-        // Auto mode must also work with compatible codecs whose transformer
-        // block is smaller than the historical 120-frame default.
-        chunk_frames = std::min(120, codec_max_frames);
-    }
-    if (chunk_frames <= 0 || chunk_frames > codec_max_frames) {
-        std::cerr << "[Codec::decode_chunked] chunk size exceeds codec transformer block size ("
-                  << chunk_frames << " > " << codec_max_frames << ").\n";
+        chunk_frames < 0 || overlap_frames < 0 || samples_per_code_frame_ <= 0) {
         return false;
     }
-    // Non-first windows contain `chunk_frames + overlap` frames. Clamp overlap
-    // against BOTH the chunk and the codec block size so decode() can never be
-    // handed a window larger than the model advertises.
-    const int32_t max_overlap_by_block = codec_max_frames - chunk_frames;
-    const int32_t overlap = (overlap_frames > 0)
-        ? std::min({overlap_frames, chunk_frames - 1, max_overlap_by_block})
-        : 0;
+
+    const int32_t num_cb = impl_->quantizer_residual_codebooks + 1;
+    const int32_t codec_max_frames = impl_->rvq_transformer_block_size;
+    if (num_cb <= 0 || codec_max_frames <= 0) return false;
+
+    const int32_t requested_history = overlap_frames > 0
+        ? overlap_frames
+        : std::max(0, streaming_history_frames_);
+
+    int32_t window_limit = 0;
+    if (chunk_frames > 0) {
+        window_limit = std::min(chunk_frames, codec_max_frames);
+    } else {
+        // Historical auto mode used ~120 frames, but that is too small to carry
+        // the codec's own history on both sides. Grow only as much as required
+        // for stable boundaries, never beyond the model's block size.
+        const int64_t desired = std::max<int64_t>(120,
+            static_cast<int64_t>(requested_history) * 2 + 4);
+        window_limit = static_cast<int32_t>(std::min<int64_t>(codec_max_frames, desired));
+    }
+    if (window_limit <= 0) return false;
+
+    // A bounded graph needs room for at least one newly committed frame between
+    // left and right context. Explicit small --codec-chunk values therefore
+    // reduce effective history instead of creating an oversized graph/OOM.
+    const int32_t max_history = std::max(0, (window_limit - 1) / 2);
+    const int32_t history = std::min(requested_history, max_history);
+    const int32_t payload = std::max(1, window_limit - 2 * history);
+
+    if (history < requested_history) {
+        std::cerr << "[Codec::decode_chunked] history reduced from " << requested_history
+                  << " to " << history << " frames to respect decode window "
+                  << window_limit << ".\n";
+    }
+
+    const uint64_t expected_total = static_cast<uint64_t>(n_frames) *
+                                    static_cast<uint64_t>(samples_per_code_frame_);
+    if (expected_total > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(float))) {
+        return false;
+    }
+    audio_out.reserve(static_cast<size_t>(expected_total));
 
     std::cerr << "[Codec::decode_chunked] n_frames=" << n_frames
-              << " chunk=" << chunk_frames << " overlap=" << overlap
-              << " num_codebooks=" << num_cb << std::endl;
+              << " window=" << window_limit << " history=" << history
+              << " payload=" << payload << " num_codebooks=" << num_cb << std::endl;
 
-    audio_out.clear();
-
-    int32_t frame_pos = 0;   // posicion actual en el stream de codes
-    bool first_chunk  = true;
-
-    while (frame_pos < n_frames) {
-        // Determinar ventana con overlap del chunk anterior
-        const int32_t chunk_start_with_overlap = first_chunk
-            ? frame_pos
-            : std::max(0, frame_pos - overlap);
-        const int32_t chunk_end = frame_pos + std::min(chunk_frames, n_frames - frame_pos);
-        const int32_t chunk_len = chunk_end - chunk_start_with_overlap;
-
-        // Copiar chunk de codes a buffer contiguo (num_cb, chunk_len) row-major
-        // El layout original es (num_cb, n_frames) -- cada codebook ocupa n_frames slots.
-        std::vector<int32_t> chunk_codes(static_cast<size_t>(num_cb) * chunk_len);
-        for (int32_t cb = 0; cb < num_cb; ++cb) {
-            const int32_t * src = codes + static_cast<size_t>(cb) * n_frames + chunk_start_with_overlap;
-            int32_t *       dst = chunk_codes.data() + static_cast<size_t>(cb) * chunk_len;
-            std::copy(src, src + chunk_len, dst);
-        }
-
-        // Decodificar el chunk completo (incluyendo overlap)
-        std::vector<float> chunk_audio;
-        if (!decode(chunk_codes.data(), chunk_len, n_threads, chunk_audio)) {
-            std::cerr << "[Codec::decode_chunked] decode() failed at frame_pos=" << frame_pos << std::endl;
+    int32_t commit_begin = 0;
+    while (commit_begin < n_frames) {
+        const int32_t commit_end = std::min(n_frames, commit_begin + payload);
+        const int32_t window_start = std::max(0, commit_begin - history);
+        const int32_t window_end = std::min(n_frames, commit_end + history);
+        const int32_t window_frames = window_end - window_start;
+        if (window_frames <= 0 || window_frames > window_limit || window_frames > codec_max_frames) {
+            std::cerr << "[Codec::decode_chunked] internal window exceeds configured bounds.\n";
+            audio_out.clear();
             return false;
         }
 
-        // Discard the repeated history proportionally. Integer
-        // `samples_per_frame = size/chunk_len` loses the remainder and can
-        // accumulate a boundary drift when a compatible codec's output length
-        // is not exactly divisible by the number of input frames.
-        size_t discard_samples = 0;
-        if (!first_chunk && overlap > 0) {
-            const size_t ov = static_cast<size_t>(overlap);
-            const size_t len = static_cast<size_t>(chunk_len);
-            if (chunk_audio.size() > std::numeric_limits<size_t>::max() / ov) return false;
-            discard_samples = (chunk_audio.size() * ov) / len;
+        const uint64_t code_count64 = static_cast<uint64_t>(num_cb) * window_frames;
+        if (code_count64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(int32_t))) {
+            audio_out.clear();
+            return false;
+        }
+        std::vector<int32_t> window_codes(static_cast<size_t>(code_count64));
+        for (int32_t cb = 0; cb < num_cb; ++cb) {
+            const int32_t * src = codes + static_cast<size_t>(cb) * n_frames + window_start;
+            int32_t * dst = window_codes.data() + static_cast<size_t>(cb) * window_frames;
+            std::copy(src, src + window_frames, dst);
         }
 
-        // Append al output descartando el overlap inicial
-        if (discard_samples < chunk_audio.size()) {
-            audio_out.insert(audio_out.end(),
-                             chunk_audio.begin() + static_cast<std::ptrdiff_t>(discard_samples),
-                             chunk_audio.end());
+        std::vector<float> window_audio;
+        if (!decode(window_codes.data(), window_frames, n_threads, window_audio)) {
+            std::cerr << "[Codec::decode_chunked] decode() failed for window ["
+                      << window_start << ".." << window_end << ").\n";
+            audio_out.clear();
+            return false;
         }
 
-        std::cerr << "[Codec::decode_chunked] chunk [" << chunk_start_with_overlap
-                  << ".." << chunk_end << ") -> " << chunk_audio.size()
-                  << " samples, discarded=" << discard_samples
-                  << ", total_so_far=" << audio_out.size() << std::endl;
-
-        frame_pos   = chunk_end;
-        first_chunk = false;
+        const size_t samples_per_frame = static_cast<size_t>(samples_per_code_frame_);
+        const size_t crop_begin = static_cast<size_t>(commit_begin - window_start) * samples_per_frame;
+        const size_t crop_end = static_cast<size_t>(commit_end - window_start) * samples_per_frame;
+        if (crop_begin > crop_end || crop_end > window_audio.size()) {
+            std::cerr << "[Codec::decode_chunked] decoder returned an inconsistent frame/sample mapping.\n";
+            audio_out.clear();
+            return false;
+        }
+        audio_out.insert(audio_out.end(), window_audio.begin() + static_cast<std::ptrdiff_t>(crop_begin),
+                         window_audio.begin() + static_cast<std::ptrdiff_t>(crop_end));
+        commit_begin = commit_end;
     }
 
+    if (audio_out.size() != static_cast<size_t>(expected_total)) {
+        std::cerr << "[Codec::decode_chunked] final sample count mismatch: got " << audio_out.size()
+                  << ", expected " << expected_total << ".\n";
+        audio_out.clear();
+        return false;
+    }
     return true;
 }
 

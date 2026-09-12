@@ -1,6 +1,7 @@
 // s2_voice.cpp — Voice profile persistence
 #include "../include/s2_voice.h"
 #include "../third_party/filesystem.hpp"
+#include "s2_utf8.h"
 
 #include <cstring>
 #include <fstream>
@@ -48,10 +49,15 @@ static bool sync_profile_file(FILE * f) {
 #endif
 }
 
-static void remove_profile_file(const std::string & path) {
+static void remove_profile_file(const std::string & path) noexcept {
 #ifdef _WIN32
-    const std::wstring wp = fs::path(path).wstring();
-    if (!wp.empty()) DeleteFileW(wp.c_str());
+    // Called by rollback destructors: path conversion may allocate, so keep
+    // cleanup non-throwing even under memory pressure.
+    try {
+        const std::wstring wp = fs::path(path).wstring();
+        if (!wp.empty()) DeleteFileW(wp.c_str());
+    } catch (...) {
+    }
 #else
     std::remove(path.c_str());
 #endif
@@ -68,13 +74,22 @@ static bool is_valid_voice_id(const std::string & voice_id) noexcept {
     return true;
 }
 
+static bool transcript_has_non_whitespace(const std::string & value) noexcept {
+    return utf8::is_valid(value) && utf8::has_non_whitespace(value);
+}
+
 bool VoiceProfile::save(const std::string & path) const {
-    if (transcript.empty() || transcript.size() >= 1024u * 1024u ||
-        num_codebooks <= 0 || T_prompt <= 0 || sample_rate <= 0 || codebook_size <= 0) {
+    constexpr size_t MAX_TRANSCRIPT_TEXT_BYTES = 1024u * 1024u;
+    constexpr size_t MAX_CODES_BYTES = 512u * 1024u * 1024u;
+    if (!transcript_has_non_whitespace(transcript) || transcript.size() > MAX_TRANSCRIPT_TEXT_BYTES ||
+        num_codebooks <= 0 || num_codebooks > 1024 || T_prompt <= 0 ||
+        sample_rate < 1000 || sample_rate > 768000 ||
+        codebook_size <= 0 || codebook_size > 1000000) {
         return false;
     }
     const uint64_t expected_codes = static_cast<uint64_t>(num_codebooks) * static_cast<uint64_t>(T_prompt);
-    if (expected_codes != static_cast<uint64_t>(codes.size())) return false;
+    if (expected_codes != static_cast<uint64_t>(codes.size()) ||
+        codes.size() > MAX_CODES_BYTES / sizeof(int32_t)) return false;
     for (int32_t code : codes) if (code < 0 || code >= codebook_size) return false;
 
     // Write beside the destination and replace only after every byte was written,
@@ -161,11 +176,16 @@ VoiceProfile VoiceProfile::load(const std::string & path) {
     get(&transcript_len, sizeof(transcript_len), "header");
     get(&codes_size, sizeof(codes_size), "header");
 
-    constexpr uint64_t MAX_TRANSCRIPT = 1024 * 1024;
+    // Request/CLI policy allows up to 1 MiB of transcript text. The on-disk
+    // field includes one trailing NUL byte, so account for it separately.
+    constexpr uint64_t MAX_TRANSCRIPT_TEXT_BYTES = 1024ull * 1024ull;
+    constexpr uint64_t MAX_TRANSCRIPT_FIELD_BYTES = MAX_TRANSCRIPT_TEXT_BYTES + 1ull;
     constexpr uint64_t MAX_CODES_BYTES = 512ull * 1024 * 1024;
-    if (profile.num_codebooks <= 0 || profile.T_prompt <= 0 || profile.sample_rate <= 0 || profile.codebook_size <= 0)
-        throw std::runtime_error("invalid voice profile dimensions");
-    if (transcript_len == 0 || transcript_len > MAX_TRANSCRIPT)
+    if (profile.num_codebooks <= 0 || profile.num_codebooks > 1024 || profile.T_prompt <= 0 ||
+        profile.sample_rate < 1000 || profile.sample_rate > 768000 ||
+        profile.codebook_size <= 0 || profile.codebook_size > 1000000)
+        throw std::runtime_error("invalid voice profile dimensions/sample rate");
+    if (transcript_len == 0 || transcript_len > MAX_TRANSCRIPT_FIELD_BYTES)
         throw std::runtime_error("invalid voice profile transcript length");
     if (codes_size == 0 || codes_size > MAX_CODES_BYTES || codes_size % sizeof(int32_t) != 0)
         throw std::runtime_error("invalid voice profile codes size");
@@ -182,7 +202,8 @@ VoiceProfile VoiceProfile::load(const std::string & path) {
     get(transcript_buf.data(), transcript_buf.size(), "transcript");
     if (transcript_buf.back() != '\0') throw std::runtime_error("transcript not null-terminated");
     profile.transcript.assign(transcript_buf.data(), transcript_buf.size() - 1);
-    if (profile.transcript.empty()) throw std::runtime_error("voice profile transcript is empty");
+    if (!transcript_has_non_whitespace(profile.transcript))
+        throw std::runtime_error("voice profile transcript is empty or whitespace-only");
 
     profile.codes.resize(static_cast<size_t>(n_codes_u64));
     get(profile.codes.data(), static_cast<size_t>(codes_size), "codes");
@@ -221,6 +242,11 @@ bool VoiceProfileManager::save(const std::string & voice_id, const VoiceProfile 
     if (!fs::exists(dir)) fs::create_directories(dir);
     if (!fs::is_directory(dir)) return false;
     return profile.save(path);
+}
+
+bool VoiceProfileManager::exists(const std::string & voice_id) const {
+    const fs::path path(get_path(voice_id));
+    return fs::exists(path) && fs::is_regular_file(path);
 }
 
 VoiceProfile VoiceProfileManager::load(const std::string & voice_id) {
