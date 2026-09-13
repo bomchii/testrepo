@@ -115,6 +115,19 @@ endif()
 
 add_executable(s2 ${S2_SOURCES})
 
+# Backend-specific release name. Keeping this in CMake (instead of renaming
+# after the build) makes local builds, CI artifacts, README examples and --help
+# agree on the executable a user actually runs.
+if(S2_VULKAN)
+    set_target_properties(s2 PROPERTIES OUTPUT_NAME "s2-vulkan")
+elseif(S2_CUDA)
+    set_target_properties(s2 PROPERTIES OUTPUT_NAME "s2-cuda")
+elseif(S2_METAL)
+    set_target_properties(s2 PROPERTIES OUTPUT_NAME "s2-metal")
+else()
+    set_target_properties(s2 PROPERTIES OUTPUT_NAME "s2-cpu")
+endif()
+
 if(WIN32 AND S2_CUDA)
     add_executable(s2-cuda-launcher tools/cuda_launcher.cpp)
     target_compile_features(s2-cuda-launcher PRIVATE cxx_std_17)

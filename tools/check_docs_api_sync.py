@@ -93,6 +93,12 @@ must('stream_stride' in readme and 'rejected on HTTP' in readme,
      'README must explain HTTP stream_stride rejection')
 must('format`/`response_format` are rejected' in readme,
      'README must explain WS format rejection')
+must('websocket_max_payload' in main,
+     'server must configure the Crow WebSocket frame payload limit')
+must('Crow 1.3.4' in readme and 'complete reassembled message' in readme and 'fragmented messages' in readme,
+     'README must document Crow 1.3.4 cumulative WebSocket payload enforcement')
+must('Crow 1.3.4' in help_text and 'complete reassembled' in help_text and 'fragmented messages' in help_text,
+     '--help must document Crow 1.3.4 cumulative WebSocket payload enforcement')
 
 # All inline curl JSON examples must remain valid JSON. This catches quoting edits
 # that look fine in Markdown/help but fail when copied into a shell.
@@ -123,17 +129,20 @@ for label, text in (("README", readme), ("--help", help_text)):
             must(known_route(path), f"{label} curl example uses unregistered route {path}")
 
 # Check the practical startup/cURL paths the README is meant to teach.
-for token in ('s2-cpu.exe', 's2.exe', 's2-cuda.exe', 's2-metal'):
+for token in ('s2-cpu.exe', 's2-vulkan.exe', 's2-cuda.exe', './s2-cpu', './s2-vulkan', './s2-cuda', 's2-metal'):
     must(token in readme, f"README is missing release executable {token}")
     must(token in help_text, f"--help is missing release executable {token}")
 
 # A new user should be able to start every downloaded backend without guessing
 # whether a separate --server mode exists or which -v value to use.
 startup_pairs = (
-    ('s2-cpu.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1', 'CPU'),
-    ('s2.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0', 'Vulkan'),
-    ('s2-cuda.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0', 'CUDA'),
-    ('./s2-metal --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0', 'Metal'),
+    ('s2-cpu.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080', 'CPU'),
+    ('s2-vulkan.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080', 'Windows Vulkan'),
+    ('s2-cuda.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Windows CUDA'),
+    ('./s2-cpu --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080', 'Linux CPU'),
+    ('./s2-vulkan --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080', 'Linux Vulkan'),
+    ('./s2-cuda --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Linux CUDA'),
+    ('./s2-metal --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Metal'),
 )
 for command, backend in startup_pairs:
     must(command in help_text, f"--help is missing copy-paste {backend} server start")
@@ -155,8 +164,24 @@ for token in ('--runtime-info', '--clean-runtime'):
     must(token in help_text, f"--help is missing CUDA launcher command {token}")
 
 workflow = (ROOT / '.github/workflows/build-all-backends.yml').read_text(encoding='utf-8')
-must('ditto -c -k --keepParent release-metal/s2-metal s2-macos-metal.zip' in workflow,
-     'Metal release ZIP must place s2-metal at archive root')
+for token in (
+    'glibc 2.17 or newer', 'glibc 2.28 or newer', 'manylinux2014',
+    'Rocky Linux 8', '**580+** under CUDA minor-version compatibility', 'R595',
+    'Apple Silicon (arm64)',
+):
+    must(token in readme, f"README is missing Linux portability note {token}")
+for token in (
+    's2-linux-x86_64-cpu.tar.gz', 's2-linux-x86_64-vulkan.tar.gz',
+    's2-linux-x86_64-cuda.tar.gz', 'quay.io/pypa/manylinux2014_x86_64',
+    'nvidia/cuda:13.2.0-devel-rockylinux8',
+):
+    must(token in workflow, f"workflow is missing Linux release token {token}")
+must('(cd release-metal && ditto -c -k --norsrc --keepParent s2-metal ../s2-macos-metal.zip)' in workflow,
+     'Metal release ZIP must run ditto inside staging so only s2-metal is kept at the root')
+must('test "$zip_entries" = "s2-metal"' in workflow,
+     'Metal release ZIP must verify an exact one-file root manifest')
+must('--keepParent release-metal/s2-metal' not in workflow,
+     'Metal packaging must never pass the parent directory path to --keepParent')
 must('test -f verify-metal-zip/s2-metal' in workflow and 'test -x verify-metal-zip/s2-metal' in workflow,
      'Metal packaging must verify root path and executable mode')
 print(

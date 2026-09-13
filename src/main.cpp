@@ -567,30 +567,37 @@ USAGE:
   s2 [options] --list-voices           List saved profiles and exit.
   s2 --help                            Show this help and exit.
 
-  Release filenames: Windows CPU = s2-cpu.exe, Vulkan = s2.exe,
-  CUDA = s2-cuda.exe, macOS Metal = s2-metal. The examples below use `s2`
-  as a placeholder for whichever backend-specific executable you downloaded.
+  Release filenames: Windows CPU = s2-cpu.exe, Vulkan = s2-vulkan.exe,
+  CUDA = s2-cuda.exe; Linux CPU = s2-cpu, Vulkan = s2-vulkan, CUDA = s2-cuda;
+  macOS Metal (Apple Silicon/arm64) = s2-metal. The examples below use `s2` as a placeholder for
+  whichever backend-specific executable you downloaded.
 
 QUICK START - DOWNLOADED RELEASE:
   There is no --server flag. Server mode is the default when --output is absent.
   Replace the model filenames below with the files you downloaded.
 
   Windows CPU:
-    s2-cpu.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1
+    s2-cpu.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080
   Windows Vulkan, GPU 0:
-    s2.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0
+    s2-vulkan.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080
   Windows CUDA, GPU 0:
-    s2-cuda.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0
-  macOS Metal:
-    ./s2-metal --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0
+    s2-cuda.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
+  Linux CPU:
+    ./s2-cpu --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080
+  Linux Vulkan, GPU 0:
+    ./s2-vulkan --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080
+  Linux CUDA, GPU 0:
+    ./s2-cuda --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
+  macOS Metal (Apple Silicon/arm64):
+    ./s2-metal --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
 
-  All four listen on http://127.0.0.1:8080 by default. Check the server with:
+  All seven release targets listen on http://127.0.0.1:8080 by default. Check the server with:
     curl http://127.0.0.1:8080/v1/health
   On Windows PowerShell, use curl.exe instead of curl if curl is an alias.
   If one combined GGUF contains both parts, pass that same file to --model and
   --model-codec. The codec follows the transformer device by default.
 
-  CUDA packaged launcher only:
+  Windows CUDA packaged launcher only:
     s2-cuda.exe --runtime-info        Show embedded CUDA runtime/cache details.
     s2-cuda.exe --clean-runtime       Remove inactive extracted runtime caches.
 
@@ -855,8 +862,10 @@ HTTP/WS SYNTHESIS FIELDS:
   prosody.normalize_loudness, latency balanced/low, and prosody.speed != 1.0.
   These fail explicitly instead of being silently ignored.
   Application request/message limit: 8 MiB; text and prompt_text: 1 MiB each.
-  Crow 1.3.3 buffers HTTP bodies before route handlers; for a pre-buffer HTTP
+  Crow 1.3.4 buffers HTTP bodies before route handlers; for a pre-buffer HTTP
   limit on non-loopback deployments, enforce a body limit in the reverse proxy.
+  Crow 1.3.4 applies the WebSocket payload limit to the complete reassembled
+  message, including fragmented messages; the app checks JSON size again.
   There is no built-in authentication. Put authentication/access control in a
   reverse proxy before exposing a non-loopback bind to untrusted clients.
   WebSocket clients must follow RFC 6455 masking; non-conforming clients close.
@@ -1147,9 +1156,9 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // Respuestas > 1MB se streamean automaticamente (sin timeout).
     // Los WAV de audio suelen ser varios MB -- sin esto pueden cortar.
     app.stream_threshold(1024 * 1024); // 1 MB
-    // Crow applies this limit to WebSocket payload frames. Fragmented messages can
-    // still be reassembled by the protocol stack, so onmessage keeps a second
-    // check against the complete JSON message as defense in depth.
+    // Crow 1.3.4 enforces this limit against the complete reassembled WebSocket
+    // message, including fragmented messages. onmessage keeps the same complete
+    // JSON-size check as an application-level defense in depth.
     app.websocket_max_payload(MAX_JSON_REQUEST_BYTES);
 
     // Per-connection cancellation state lets a disconnect stop an expensive

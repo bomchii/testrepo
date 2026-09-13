@@ -34,3 +34,11 @@ ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/
 
 # Versioned shared-library leftovers/symlinks
 *.so.*
+# Python/editor/OS leftovers
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+*.orig
+*.rej
+

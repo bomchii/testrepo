@@ -31,20 +31,29 @@ There is no universal CPU+Vulkan+CUDA+Metal binary. Each backend is built separa
 | Platform | Backend | Actions artifact | Executable |
 |---|---|---|---|
 | Windows x64 | CPU | `s2-windows-cpu` | `s2-cpu.exe` |
-| Windows x64 | Vulkan | `s2-windows-vulkan` | `s2.exe` |
+| Windows x64 | Vulkan | `s2-windows-vulkan` | `s2-vulkan.exe` |
 | Windows x64 | CUDA | `s2-windows-cuda` | `s2-cuda.exe` |
-| macOS | Metal | `s2-macos-metal` | `s2-metal` |
+| Linux x86_64 | CPU | `s2-linux-x86_64-cpu` | `s2-cpu` |
+| Linux x86_64 | Vulkan | `s2-linux-x86_64-vulkan` | `s2-vulkan` |
+| Linux x86_64 | CUDA | `s2-linux-x86_64-cuda` | `s2-cuda` |
+| macOS arm64 | Metal | `s2-macos-metal` | `s2-metal` |
 
 Only one of `S2_VULKAN`, `S2_CUDA`, or `S2_METAL` should be enabled in a build directory. CPU-only builds leave all three off.
 
-The GitHub Actions workflow is `.github/workflows/build-all-backends.yml` (Windows Server 2025 / VS 2026 for CPU, Vulkan and CUDA; macOS 15 for Metal). Tagged releases are published as `s2-<tag>-windows-cpu.zip`, `s2-<tag>-windows-vulkan.zip`, `s2-<tag>-windows-cuda.zip`, and `s2-<tag>-macos-metal.zip`.
+The GitHub Actions workflow is `.github/workflows/build-all-backends.yml` (Windows Server 2025 / VS 2026 for Windows CPU/Vulkan/CUDA; compatibility-baseline containers on an Ubuntu runner for Linux CPU/Vulkan/CUDA; macOS 15 for Metal). Tagged releases are published as `s2-<tag>-windows-cpu.zip`, `s2-<tag>-windows-vulkan.zip`, `s2-<tag>-windows-cuda.zip`, `s2-<tag>-linux-x86_64-cpu.tar.gz`, `s2-<tag>-linux-x86_64-vulkan.tar.gz`, `s2-<tag>-linux-x86_64-cuda.tar.gz`, and `s2-<tag>-macos-metal.zip`.
 
-Runtime requirements are simple:
+Runtime requirements:
 
-- CPU: Windows x64. OpenMP may require the current Microsoft Visual C++ v14 x64 Redistributable.
-- Vulkan: a Vulkan-capable GPU/driver, plus the same possible OpenMP runtime above. `vulkan-1.dll` comes from the driver.
-- CUDA: an NVIDIA driver. The CUDA runtime/cuBLAS payload is inside `s2-cuda.exe`; `nvcuda.dll` still comes from the driver.
-- Metal: macOS on a Metal-capable Mac.
+- Windows CPU: Windows x64 with AVX2. OpenMP may require the current Microsoft Visual C++ v14 x64 Redistributable.
+- Windows Vulkan: Windows x64 with AVX2 and a Vulkan-capable GPU/driver, plus the same possible OpenMP runtime above. `vulkan-1.dll` comes from the driver.
+- Windows CUDA: Windows x64 with AVX2, a **Turing-generation (compute capability 7.5) or newer** NVIDIA GPU, and a CUDA-13-compatible NVIDIA driver (**580+** under CUDA minor-version compatibility; **R595** or later is recommended for full CUDA 13.2 feature support). CUDA 13.x no longer builds Maxwell/Pascal/Volta targets. The CUDA runtime/cuBLAS payload is inside `s2-cuda.exe`; `nvcuda.dll` still comes from the driver.
+- Linux CPU: x86_64, AVX2, and glibc 2.17 or newer. The release may include `libgomp.so.1` beside the executable so OpenMP does not depend on the distro's GCC runtime package.
+- Linux Vulkan: x86_64, AVX2, glibc 2.17 or newer, and a working Vulkan GPU driver/ICD. The archive carries its own Khronos `libvulkan.so.1` loader plus `libgomp.so.1` when needed; the vendor GPU driver is still supplied by the system.
+- Linux CUDA: x86_64, AVX2, glibc 2.28 or newer, a **Turing-generation (compute capability 7.5) or newer** NVIDIA GPU, and an NVIDIA driver compatible with CUDA 13.x (**580+** under CUDA minor-version compatibility; the CUDA 13.2 release branch is **R595**, recommended for full 13.2 feature support). CUDA 13.x dropped offline compilation/library support for Maxwell, Pascal, and Volta. CUDA runtime/cuBLAS are linked statically in this Linux release; `libcuda.so.1` still comes from the driver.
+- Linux archives also include Crow/Asio and GCC runtime license/notice files; the Vulkan archive includes the Vulkan Loader license, and the CUDA notice links the NVIDIA CUDA 13.2 EULA that governs its statically linked redistributable components.
+- Metal: macOS on an Apple Silicon (arm64) Mac with Metal support. The `macos-15` GitHub-hosted runner used for this artifact is arm64; this is not a universal or Intel x64 binary.
+
+The portable Linux archives target **glibc**, not musl. Alpine Linux is therefore not a native target of these binaries.
 
 ### CUDA release layout
 
@@ -91,9 +100,9 @@ The loader checks model/codec layout before synthesis. Two files loading success
 
 ## Quick start
 
-If you downloaded a release, unzip it first. The examples below assume the two Q4_K_M model files are in the same directory as the executable; full paths work too.
+If you downloaded a release, extract it first (`.zip` on Windows/macOS, `.tar.gz` on Linux). The examples below assume the two Q4_K_M model files are in the same directory as the executable; full paths work too.
 
-You do **not** need a `--server` flag. Server mode is the default: give the executable the model files and do not pass `--output`. All four backends listen on `127.0.0.1:8080` by default.
+You do **not** need a `--server` flag. Server mode is the default: give the executable the model files and do not pass `--output`. All seven release targets listen on `127.0.0.1:8080` by default.
 
 ### Windows CPU
 
@@ -101,16 +110,19 @@ You do **not** need a `--server` flag. Server mode is the default: give the exec
 .\s2-cpu.exe `
   --model s2-pro-q4_k_m-transformer-only.gguf `
   --model-codec s2-pro-q4_k_m-codec-only.gguf `
-  -v -1
+  -v -1 `
+  --port 8080
 ```
 
 ### Windows Vulkan
 
 ```powershell
-.\s2.exe `
+.\s2-vulkan.exe `
   --model s2-pro-q4_k_m-transformer-only.gguf `
   --model-codec s2-pro-q4_k_m-codec-only.gguf `
-  -v 0
+  -v 0 `
+  --codec-vulkan 0 `
+  --port 8080
 ```
 
 ### Windows CUDA
@@ -119,7 +131,41 @@ You do **not** need a `--server` flag. Server mode is the default: give the exec
 .\s2-cuda.exe `
   --model s2-pro-q4_k_m-transformer-only.gguf `
   --model-codec s2-pro-q4_k_m-codec-only.gguf `
-  -v 0
+  -v 0 `
+  --port 8080
+```
+
+### Linux CPU
+
+Extract the release with `tar -xzf s2-<tag>-linux-x86_64-cpu.tar.gz`, then:
+
+```bash
+./s2-cpu \
+  --model s2-pro-q4_k_m-transformer-only.gguf \
+  --model-codec s2-pro-q4_k_m-codec-only.gguf \
+  -v -1 \
+  --port 8080
+```
+
+### Linux Vulkan
+
+```bash
+./s2-vulkan \
+  --model s2-pro-q4_k_m-transformer-only.gguf \
+  --model-codec s2-pro-q4_k_m-codec-only.gguf \
+  -v 0 \
+  --codec-vulkan 0 \
+  --port 8080
+```
+
+### Linux CUDA
+
+```bash
+./s2-cuda \
+  --model s2-pro-q4_k_m-transformer-only.gguf \
+  --model-codec s2-pro-q4_k_m-codec-only.gguf \
+  -v 0 \
+  --port 8080
 ```
 
 ### macOS Metal
@@ -128,7 +174,8 @@ You do **not** need a `--server` flag. Server mode is the default: give the exec
 ./s2-metal \
   --model s2-pro-q4_k_m-transformer-only.gguf \
   --model-codec s2-pro-q4_k_m-codec-only.gguf \
-  -v 0
+  -v 0 \
+  --port 8080
 ```
 
 `-v -1` means CPU. `-v 0` means GPU 0 for the backend you downloaded. The codec follows the transformer device by default, so you normally do not need another device flag.
@@ -198,7 +245,7 @@ If GPU initialization fails and a CPU fallback is possible, the logs show the ba
 
 ## Voice cloning
 
-To keep the examples below short, `s2` means the executable for your backend: `.\s2-cpu.exe`, `.\s2.exe`, `.\s2-cuda.exe`, or `./s2-metal`. These generic examples leave the default `-v -1`, so they also work with the CPU build. Add `-v 0` when using Vulkan, CUDA, or Metal on the GPU.
+To keep the examples below short, `s2` means the executable for your backend: `.\s2-cpu.exe`, `.\s2-vulkan.exe`, `.\s2-cuda.exe`, `./s2-cpu`, `./s2-vulkan`, `./s2-cuda`, or `./s2-metal`. These generic examples leave the default `-v -1`, so they also work with the CPU build. Add `-v 0` when using Vulkan, CUDA, or Metal on the GPU.
 
 Reference audio needs a transcript. `--prompt-audio` without a non-empty `--prompt-text` is rejected.
 
@@ -556,7 +603,9 @@ The main synthesis routes use these status classes:
 
 JSON bodies/messages above 8 MiB are rejected, and `text`/`prompt_text` are each limited to 1 MiB.
 
-Crow 1.3.3 has already buffered the HTTP body by the time the route-level 8 MiB check runs. If you expose the server outside localhost and need a real pre-buffer HTTP body limit, put a reverse proxy in front of it and enforce the limit there.
+Crow 1.3.4 has already buffered the HTTP body by the time the route-level 8 MiB check runs. If you expose the server outside localhost and need a real pre-buffer HTTP body limit, put a reverse proxy in front of it and enforce the limit there.
+
+For WebSocket, Crow 1.3.4 enforces `websocket_max_payload` against the complete reassembled message, including fragmented messages. The application also checks the delivered JSON message size as defense in depth. Use a trusted reverse proxy/gateway for authentication and any stricter edge-level resource limits.
 
 The server enables `CROW_ENFORCE_WS_SPEC`, so normal RFC 6455 client masking rules are enforced.
 
@@ -771,13 +820,23 @@ If you are using a release artifact, you can skip this section.
 
 You need:
 
-- CMake 3.15+
+- CMake 3.15+ (if you use the Visual Studio 2026 generator, use CMake 4.2+)
 - a C++17 compiler
 - the `ggml` submodule
 - Crow and standalone Asio
 - Vulkan SDK/runtime for Vulkan builds
 - NVIDIA driver + CUDA toolkit for CUDA builds
 - Xcode command-line tools for Metal builds
+
+For Crow, either install a CMake package that provides `Crow::Crow`, or use the same header-only path supported by CI:
+
+```bash
+cmake -S . -B build-cpu \
+  -DS2_CROW_INCLUDE_DIR=/path/to/Crow/include \
+  -DS2_ASIO_INCLUDE_DIR=/path/to/asio/include
+```
+
+The release workflow currently uses Crow 1.3.4 (security-fix release) and standalone Asio 1.30.2.
 
 Clone with submodules:
 
@@ -827,7 +886,9 @@ cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-metal --parallel
 ```
 
-Local CMake builds create `s2` (`s2.exe` on Windows). Release jobs rename/package it for each backend.
+Local CMake builds now use backend-specific names directly: `s2-cpu`, `s2-vulkan`, `s2-cuda`, or `s2-metal` (with `.exe` on Windows). CI packages those same names instead of renaming a generic `s2` after the build.
+
+The Linux release jobs intentionally build against old ABI baselines instead of `ubuntu-latest`: CPU and Vulkan use a manylinux2014/glibc-2.17 baseline, while CUDA uses NVIDIA's CUDA 13.2 Rocky Linux 8 development image (glibc 2.28). CI checks the maximum referenced GLIBC symbol version before publishing. Linux Vulkan builds the pinned Khronos loader from source and bundles it next to `s2-vulkan`; Linux CUDA uses GGML's static CUDA Toolkit linkage so CUDA user-space libraries do not become distro-dependent `.so` requirements.
 
 Windows release builds use `/MT` for the normal MSVC CRT. OpenMP is separate: GGML may still require `VCOMP140.DLL`, so a current Microsoft Visual C++ v14 x64 Redistributable can still be needed. CI checks imports with `dumpbin` instead of assuming `/MT` makes every runtime static.
 
@@ -856,7 +917,7 @@ The source tree used for the V7.5 package was checked locally with:
 - README/`--help` CLI/API/route/cURL synchronization checks
 - clean ZIP re-extraction and byte/hash comparison
 
-These checks are useful, but they are not the same thing as running every native compiler/driver combination. GitHub Actions and real Windows/macOS hardware are still the final check for MSVC, CUDA, Vulkan, Metal, driver behavior, and numerical output.
+These checks are useful, but they are not the same thing as running every native compiler/driver combination. GitHub Actions and real Windows/Linux/macOS hardware are still the final check for MSVC, CUDA, Vulkan, Metal, driver behavior, ABI compatibility, and numerical output.
 
 ## Known limitations
 
@@ -880,6 +941,9 @@ ggml/                            GGML submodule
 .github/workflows/               Multi-backend CI
 patch-cmake.ps1                  Windows CPU/Vulkan CI CMake preparation
 patch-cmake-cuda.ps1             Windows CUDA CI CMake preparation
+tools/ci/prepare-linux-deps.sh       Pinned Linux Crow/Asio/Vulkan build inputs
+tools/ci/build-linux-portable.sh     Portable Linux CPU/Vulkan/CUDA build + ABI checks
+tools/ci/reclaim-linux-runner-space.sh  Frees unused host SDKs before large Docker builds
 CMakeLists.txt                   Root CMake project
 ```
 

@@ -25,6 +25,15 @@ function Invoke-DownloadWithRetry {
     }
 }
 
+function Assert-Sha256 {
+    param([Parameter(Mandatory=$true)][string]$Path,
+          [Parameter(Mandatory=$true)][string]$Expected)
+    $actual = (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
+    if ($actual -ne $Expected.ToLowerInvariant()) {
+        throw "SHA-256 mismatch for $Path: expected $Expected got $actual"
+    }
+}
+
 Write-Host "=== Parcheando CMake files para Windows ==="
 
 $depsDir = "build\_deps"
@@ -34,11 +43,12 @@ New-Item -ItemType Directory -Force -Path $depsDir | Out-Null
 # Usamos el source tarball en vez de crow_all.h porque:
 # - crow_all.h incluye asio::ssl incondicionalmente
 # - Los headers originales tienen #ifdef CROW_ENABLE_SSL
-$crowVersion = "1.3.3"
+$crowVersion = "1.3.4"
+$crowCommit = "ae0fef0ee67eec897e401321b99b6dd7cfbdc155"
 $crowDir  = "$depsDir\crow-include"
 $crowFile = "$crowDir\crow.h"   # el tarball pone crow.h directamente en include/
 $crowMarker = "$crowDir\.s2-crow-version"
-$crowVersionOk = (Test-Path $crowMarker) -and ((Get-Content $crowMarker -Raw).Trim() -eq $crowVersion)
+$crowVersionOk = (Test-Path $crowMarker) -and ((Get-Content $crowMarker -Raw).Trim() -eq $crowCommit)
 if (-Not (Test-Path $crowFile) -or -Not $crowVersionOk) {
     # A local build may reuse build/_deps from an older script revision. Do not
     # silently keep stale Crow headers merely because crow.h exists.
@@ -46,7 +56,7 @@ if (-Not (Test-Path $crowFile) -or -Not $crowVersionOk) {
     Write-Host "Descargando Crow v$($crowVersion) source tarball..."
     $crowTar = "$depsDir\crow.tar.gz"
     Invoke-DownloadWithRetry `
-        -Uri "https://github.com/CrowCpp/Crow/archive/refs/tags/v$crowVersion.tar.gz" `
+        -Uri "https://github.com/CrowCpp/Crow/archive/$crowCommit.tar.gz" `
         -OutFile $crowTar
     # Extraer con tar (disponible en Windows 10+ y en los runners hospedados).
     $crowExtracted = "$depsDir\crow-extracted"
@@ -54,7 +64,7 @@ if (-Not (Test-Path $crowFile) -or -Not $crowVersionOk) {
     New-Item -ItemType Directory -Force -Path $crowExtracted | Out-Null
     tar -xzf $crowTar -C $crowExtracted
     if ($LASTEXITCODE -ne 0) { throw "tar failed while extracting Crow (exit $LASTEXITCODE)" }
-    # El tarball extrae como Crow-1.3.3/include/crow/
+    # El archive del commit extrae bajo Crow-<sha>/include/.
     $crowSrc = "$depsDir\crow-extracted\Crow-$crowVersion\include"
     if (-Not (Test-Path $crowSrc)) {
         # Fallback: buscar include/ en cualquier subdirectorio
@@ -66,7 +76,7 @@ if (-Not (Test-Path $crowFile) -or -Not $crowVersionOk) {
     }
     New-Item -ItemType Directory -Force -Path $crowDir | Out-Null
     Copy-Item "$crowSrc\*" $crowDir -Recurse -Force
-    Set-Content -Path $crowMarker -Value $crowVersion -Encoding ASCII
+    Set-Content -Path $crowMarker -Value $crowCommit -Encoding ASCII
     Remove-Item $crowTar -Force
     Write-Host "OK: Crow headers en $crowDir"
     Write-Host "   crow.h existe: $(Test-Path $crowFile)"
@@ -83,20 +93,24 @@ $asioVersionOk = (Test-Path $asioMarker) -and ((Get-Content $asioMarker -Raw).Tr
 if (-Not (Test-Path $asioFile) -or -Not $asioVersionOk) {
     if (Test-Path $asioDir) { Remove-Item $asioDir -Recurse -Force }
     Write-Host "Descargando Asio $asioVersion..."
-    $asioZip = "$depsDir\asio.zip"
+    $asioTar = "$depsDir\asio.tar.gz"
+    $asioSha256 = "755bd7f85a4b269c67ae0ea254907c078d408cce8e1a352ad2ed664d233780e8"
     Invoke-DownloadWithRetry `
-        -Uri "https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.zip" `
-        -OutFile $asioZip
+        -Uri "https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.tar.gz" `
+        -OutFile $asioTar
+    Assert-Sha256 -Path $asioTar -Expected $asioSha256
     $asioExtracted = "$depsDir\asio-extracted"
     if (Test-Path $asioExtracted) { Remove-Item $asioExtracted -Recurse -Force }
-    Expand-Archive -Path $asioZip -DestinationPath $asioExtracted -Force
+    New-Item -ItemType Directory -Force -Path $asioExtracted | Out-Null
+    tar -xzf $asioTar -C $asioExtracted
+    if ($LASTEXITCODE -ne 0) { throw "tar failed while extracting Asio (exit $LASTEXITCODE)" }
     $asioSrc = "$asioExtracted\asio-asio-1-30-2\asio\include"
     if (-Not (Test-Path (Join-Path $asioSrc "asio.hpp"))) {
         throw "Asio archive layout is invalid: asio/include/asio.hpp was not found"
     }
     New-Item -ItemType Directory -Force -Path $asioDir | Out-Null
     Copy-Item "$asioSrc\*" $asioDir -Recurse -Force
-    Remove-Item $asioZip -Force
+    Remove-Item $asioTar -Force
     Set-Content -Path $asioMarker -Value $asioVersion -Encoding ASCII
     # Reemplazar asio/ssl.hpp y asio/ssl/ con stubs vacíos.
     # Crow puede alcanzar asio/ssl.hpp por el orden de inclusion de algunos headers;
@@ -187,6 +201,7 @@ option(S2_METAL   "Build with Metal backend"   OFF)
 
 set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GGML_NATIVE          OFF CACHE BOOL "" FORCE)
 set(GGML_AVX512         OFF CACHE BOOL "" FORCE)
 set(GGML_AVX2           ON  CACHE BOOL "" FORCE)
 
