@@ -1355,6 +1355,63 @@ jobs:
           Write-Host "HIP_DEVICE_LIB_PATH=$deviceLib"
           Get-PSDrive -Name C | Format-Table Name,Used,Free -AutoSize
 
+      - name: Pin MSVC 14.44 headers and libraries for ROCm HIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # ROCm 7.14.1's bundled Clang/HIP conflicts with VS 2026 MSVC 14.51
+          # <cmath>. Select the x64 14.44 compatibility toolset explicitly.
+          $vsRoot = 'C:\Program Files\Microsoft Visual Studio\18\Enterprise'
+          $vcRoot = Join-Path $vsRoot 'VC\Tools\MSVC'
+          if (-Not (Test-Path $vcRoot)) { throw "MSVC tools root not found: $vcRoot" }
+          $vc = Get-ChildItem $vcRoot -Directory |
+            Where-Object { $_.Name -like '14.44.*' } |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+          if (-Not $vc) { throw "MSVC 14.44 x64 compatibility toolset is not installed on this runner" }
+
+          $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $sdkLibRoot = Join-Path $kitsRoot 'Lib'
+          $sdk = Get-ChildItem $sdkLibRoot -Directory |
+            Where-Object { Test-Path (Join-Path $_.FullName 'ucrt\x64') } |
+            Sort-Object { [version]$_.Name } -Descending |
+            Select-Object -First 1
+          if (-Not $sdk) { throw "No x64 Windows SDK libraries found under $sdkLibRoot" }
+          $sdkVersion = $sdk.Name
+          $sdkInclude = Join-Path $kitsRoot "Include\$sdkVersion"
+          $sdkBin = Join-Path $kitsRoot "bin\$sdkVersion\x64"
+          $vcBin = Join-Path $vc.FullName 'bin\Hostx64\x64'
+          $include = @(
+            (Join-Path $vc.FullName 'include'),
+            (Join-Path $sdkInclude 'ucrt'),
+            (Join-Path $sdkInclude 'shared'),
+            (Join-Path $sdkInclude 'um'),
+            (Join-Path $sdkInclude 'winrt'),
+            (Join-Path $sdkInclude 'cppwinrt')
+          ) -join ';'
+          $lib = @(
+            (Join-Path $vc.FullName 'lib\x64'),
+            (Join-Path $kitsRoot "Lib\$sdkVersion\ucrt\x64"),
+            (Join-Path $kitsRoot "Lib\$sdkVersion\um\x64")
+          ) -join ';'
+
+          foreach ($required in @($vcBin, (Join-Path $vc.FullName 'include'), (Join-Path $vc.FullName 'lib\x64'), (Join-Path $sdkInclude 'ucrt'), (Join-Path $kitsRoot "Lib\$sdkVersion\ucrt\x64"))) {
+            if (-Not (Test-Path $required)) { throw "Required MSVC/SDK path missing: $required" }
+          }
+
+          "S2_MSVC_TOOLSET=$($vc.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCToolsInstallDir=$($vc.FullName)\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCToolsVersion=$($vc.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WindowsSdkDir=$kitsRoot\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WindowsSDKVersion=$sdkVersion\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "INCLUDE=$include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$vcBin;$sdkBin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          Write-Host "Pinned HIP host toolset: MSVC $($vc.Name)"
+          Write-Host "Windows SDK: $sdkVersion"
+          & (Join-Path $vcBin 'cl.exe') 2>&1 | Select-Object -First 4
+
       - name: Probe Windows ROCm HIP compiler
         shell: pwsh
         run: |
@@ -1363,6 +1420,9 @@ jobs:
           @('#include <hip/hip_runtime.h>', '__global__ void s2_probe_kernel(int *p) { if (threadIdx.x == 0) *p = 1; }', 'int main() { return 0; }') | Set-Content -Encoding utf8 ci-probes/hip-smoke.cpp
           $clangxx = Join-Path $env:ROCM_LLVM_BIN 'clang++.exe'
           $env:PATH = "$env:ROCM_BIN;$env:ROCM_LLVM_BIN;$env:PATH"
+          if ($env:S2_MSVC_TOOLSET -notlike '14.44.*') { throw "ROCm HIP must use pinned MSVC 14.44 headers; got '$env:S2_MSVC_TOOLSET'" }
+          Write-Host "HIP host toolset: $env:S2_MSVC_TOOLSET"
+          Write-Host "INCLUDE=$env:INCLUDE"
           python tools/ci/run-with-diagnostics.py --label "Windows ROCm compiler probe" --log ci-logs/windows-rocm-compiler-probe.log -- `
             $clangxx -x hip --offload-arch=gfx1030 --offload-arch=gfx1153 --offload-arch=gfx1201 `
             -c ci-probes/hip-smoke.cpp -o ci-probes/hip-smoke.obj
@@ -1825,7 +1885,7 @@ jobs:
           retention-days: 7
 
   build-macos-intel-cpu:
-    name: macOS 15 Intel - CPU x86_64 (deployment 10.13)
+    name: macOS 15 Intel - CPU x86_64 (deployment 10.15)
     runs-on: macos-15-intel
     needs: preflight
     timeout-minutes: 180
@@ -1873,7 +1933,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/ci/run-with-diagnostics.py --label "macOS Intel CPU configure" --log ci-logs/macos-intel-cpu-configure.log -- cmake -G Ninja -B build-macos-intel-cpu -S . \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
             -DS2_CROW_INCLUDE_DIR="$(realpath build-deps/crow/include)" -DS2_ASIO_INCLUDE_DIR="$(realpath build-deps/asio/asio/include)" \
             -DS2_HIP=OFF -DS2_VULKAN=OFF -DS2_CUDA=OFF -DS2_METAL=OFF \
             -DGGML_HIP=OFF -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_NATIVE=OFF \
@@ -1897,7 +1957,7 @@ jobs:
           if grep -Eqi 'Metal|Vulkan|MoltenVK' <<<"$deps"; then echo '::error::Intel CPU build unexpectedly links a GPU runtime'; exit 1; fi
           minos="$(vtool -show-build "$exe" 2>/dev/null || true)"
           printf '%s\n' "$minos"
-          grep -q 'minos 10.13' <<<"$minos"
+          grep -q 'minos 10.15' <<<"$minos"
 
       - name: Package macOS Intel CPU
         shell: bash

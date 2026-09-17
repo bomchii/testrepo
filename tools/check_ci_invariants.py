@@ -172,12 +172,12 @@ forbid('tar -tzf s2-linux-x86_64-rocm.tar.gz | head', 'pipefail/SIGPIPE-prone RO
 # without modern x86 extensions. These explicit OFF values prevent GGML's
 # defaults from silently raising the CPU baseline on the modern CI runner.
 for token in [
-    '-DCMAKE_OSX_ARCHITECTURES=x86_64', '-DCMAKE_OSX_DEPLOYMENT_TARGET=10.13',
+    '-DCMAKE_OSX_ARCHITECTURES=x86_64', '-DCMAKE_OSX_DEPLOYMENT_TARGET=10.15',
     '-DGGML_SSE42=OFF', '-DGGML_AVX=OFF', '-DGGML_AVX2=OFF', '-DGGML_BMI2=OFF',
     '-DGGML_FMA=OFF', '-DGGML_F16C=OFF', '-DGGML_AVX512=OFF',
 ]:
     req(token, 'old-Intel macOS compatibility baseline')
-req("grep -q 'minos 10.13'", 'macOS Intel deployment-target verification')
+req("grep -q 'minos 10.15'", 'macOS Intel deployment-target verification')
 req("if grep -Eqi 'Metal|Vulkan|MoltenVK'", 'macOS Intel GPU-runtime exclusion')
 
 # PowerShell interpolation: "$name:" is a parser error unless braced. Ignore
