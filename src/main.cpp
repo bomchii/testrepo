@@ -1,7 +1,9 @@
 #include "s2_pipeline.h"
 #include "s2_json.h"
 #include "s2_utf8.h"
-#if defined(GGML_USE_CUDA)
+#if defined(GGML_USE_HIP)
+#  include <hip/hip_runtime.h>
+#elif defined(GGML_USE_CUDA)
 #  include <cuda_runtime.h>
 #endif
 #ifndef CROW_ENFORCE_WS_SPEC
@@ -556,7 +558,7 @@ int main(int argc, char** argv) {
             params.stream_decode_stride_frames = parse_int_arg(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             std::cout <<
-R"S2HELP(s2 -- Fish Speech TTS server + CLI (CPU / Vulkan / CUDA / Metal)
+R"S2HELP(s2 -- Fish Speech TTS server + CLI (CPU / Vulkan / CUDA / AMD / Metal)
 Local Fish Speech synthesis, voice cloning, saved .s2voice profiles, HTTP API,
 and WebSocket PCM streaming. The same CLI is used by every backend-specific build.
 
@@ -567,39 +569,49 @@ USAGE:
   s2 [options] --list-voices           List saved profiles and exit.
   s2 --help                            Show this help and exit.
 
-  Release filenames: Windows CPU = s2-cpu.exe, Vulkan = s2-vulkan.exe,
-  CUDA = s2-cuda.exe; Linux CPU = s2-cpu, Vulkan = s2-vulkan, CUDA = s2-cuda;
-  macOS Metal (Apple Silicon/arm64) = s2-metal. The examples below use `s2` as a placeholder for
-  whichever backend-specific executable you downloaded.
+  Release filenames:
+    Windows: s2-windows-cpu-x86-64.exe, s2-windows-vulkan-x86-64.exe,
+             s2-windows-cuda-x86-64.exe, s2-windows-amd-x86-64.exe
+    Linux:   s2-linux-cpu-x86-64, s2-linux-vulkan-x86-64,
+             s2-linux-cuda-x86-64, s2-linux-amd-x86-64
+    macOS:   s2-macos-metal-arm64, s2-macos-cpu-x86-64
 
 QUICK START - DOWNLOADED RELEASE:
   There is no --server flag. Server mode is the default when --output is absent.
   Replace the model filenames below with the files you downloaded.
 
   Windows CPU:
-    s2-cpu.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080
+    s2-windows-cpu-x86-64.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080
   Windows Vulkan, GPU 0:
-    s2-vulkan.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080
+    s2-windows-vulkan-x86-64.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080
   Windows CUDA, GPU 0:
-    s2-cuda.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
+    s2-windows-cuda-x86-64.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
+  Windows AMD, GPU 0:
+    s2-windows-amd-x86-64.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
   Linux CPU:
-    ./s2-cpu --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080
+    ./s2-linux-cpu-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080
   Linux Vulkan, GPU 0:
-    ./s2-vulkan --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080
+    ./s2-linux-vulkan-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080
   Linux CUDA, GPU 0:
-    ./s2-cuda --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
+    ./s2-linux-cuda-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
+  Linux AMD, GPU 0:
+    ./s2-linux-amd-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
+  macOS Intel CPU:
+    ./s2-macos-cpu-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080
   macOS Metal (Apple Silicon/arm64):
-    ./s2-metal --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
+    ./s2-macos-metal-arm64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080
 
-  All seven release targets listen on http://127.0.0.1:8080 by default. Check the server with:
+  All ten release targets listen on http://127.0.0.1:8080 by default. Check the server with:
     curl http://127.0.0.1:8080/v1/health
   On Windows PowerShell, use curl.exe instead of curl if curl is an alias.
   If one combined GGUF contains both parts, pass that same file to --model and
   --model-codec. The codec follows the transformer device by default.
 
-  Windows CUDA packaged launcher only:
-    s2-cuda.exe --runtime-info        Show embedded CUDA runtime/cache details.
-    s2-cuda.exe --clean-runtime       Remove inactive extracted runtime caches.
+  Packaged runtime launchers:
+    s2-windows-cuda-x86-64.exe --runtime-info   Show embedded CUDA runtime/cache details.
+    s2-windows-cuda-x86-64.exe --clean-runtime  Remove inactive extracted runtime caches.
+    s2-windows-amd-x86-64.exe --runtime-info    Show embedded AMD runtime/cache details.
+    s2-linux-amd-x86-64 --runtime-info           Show embedded AMD runtime/cache details.
 
 COMMAND MODES / FUNCTIONS:
   Server mode (default)
@@ -953,7 +965,31 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     };
 
     // Detectar flags de backend incorrectos y advertir al usuario
-#if defined(GGML_USE_CUDA) && !defined(GGML_USE_VULKAN)
+#if defined(GGML_USE_HIP)
+    // ROCm/HIP uses GGML's CUDA-compatible host API internally, but device
+    // discovery must use HIP -- never NVIDIA's CUDA runtime.
+    {
+        int hip_dev_count = 0;
+        hipError_t hip_err = hipGetDeviceCount(&hip_dev_count);
+        if (hip_err != hipSuccess || hip_dev_count == 0) {
+            if (params.vulkan_device >= 0 || params.codec_vulkan_device >= 0) {
+                std::cerr << "[Warning] No ROCm/HIP devices found. Requested GPU components will run on CPU.\n";
+            }
+            params.vulkan_device = -1;
+            params.codec_vulkan_device = -1;
+        } else {
+            auto clamp_hip_device = [&](int32_t & device, const char * component) {
+                if (device >= hip_dev_count) {
+                    std::cerr << "[Warning] ROCm/HIP device " << device << " requested for " << component
+                              << " is unavailable (" << hip_dev_count << " device(s)); using device 0.\n";
+                    device = 0;
+                }
+            };
+            clamp_hip_device(params.vulkan_device, "model");
+            clamp_hip_device(params.codec_vulkan_device, "codec");
+        }
+    }
+#elif defined(GGML_USE_CUDA) && !defined(GGML_USE_VULKAN)
     // CUDA and Vulkan builds use the same generic device fields internally.
     // Keep transformer and codec selection independent: model CPU + codec GPU
     // and model GPU + codec CPU are both valid configurations.

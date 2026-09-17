@@ -35,7 +35,23 @@ namespace {
 constexpr char kIndexMagic[8]  = {'S','2','C','I','D','X','0','1'};
 constexpr char kFooterMagic[8] = {'S','2','C','E','N','D','0','1'};
 constexpr uint32_t kVersion = 1;
-constexpr uint32_t kMaxEntries = 256;
+constexpr uint32_t kMaxEntries = 16384;
+
+#ifdef S2_RUNTIME_AMD
+constexpr wchar_t kRuntimeCoreW[] = L"s2-amd-core.exe";
+constexpr char kRuntimeCoreA[] = "s2-amd-core.exe";
+constexpr wchar_t kRuntimePrefixW[] = L"amd-";
+constexpr wchar_t kRuntimeMutexPrefixW[] = L"Local\\s2.cpp-amd-";
+constexpr char kRuntimeLabel[] = "AMD";
+constexpr char kLauncherLabel[] = "s2-amd";
+#else
+constexpr wchar_t kRuntimeCoreW[] = L"s2-cuda-core.exe";
+constexpr char kRuntimeCoreA[] = "s2-cuda-core.exe";
+constexpr wchar_t kRuntimePrefixW[] = L"cuda-";
+constexpr wchar_t kRuntimeMutexPrefixW[] = L"Local\\s2.cpp-cuda-";
+constexpr char kRuntimeLabel[] = "CUDA";
+constexpr char kLauncherLabel[] = "s2-cuda";
+#endif
 
 struct Handle {
     HANDLE h = INVALID_HANDLE_VALUE;
@@ -195,17 +211,20 @@ uint64_t rd64(const uint8_t*& p,const uint8_t* e){if(e-p<8)throw std::runtime_er
 
 std::string lower_ascii(std::string s){for(char&c:s)c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));return s;}
 bool valid_name(const std::string& n){
-    if(n.empty()||n.size()>240||n.back()=='.'||n.back()==' ')return false;
-    if(n=="."||n=="..")return false;
-    static constexpr const char * kInvalid="<>:\"/\\|?*";
-    for(unsigned char c:n){
-        if(c<0x20||c>0x7e||std::strchr(kInvalid,static_cast<int>(c))!=nullptr)return false;
-    }
-    auto dot=n.find('.'); auto stem=n.substr(0,dot);
-    while(!stem.empty()&&(stem.back()=='.'||stem.back()==' '))stem.pop_back();
-    stem=lower_ascii(std::move(stem));
+    if(n.empty()||n.size()>1024||n.front()=='/'||n.back()=='/')return false;
+    static constexpr const char * kInvalid="<>:\"\\|?*";
     static const std::set<std::string> dev={"con","prn","aux","nul","clock$","com1","com2","com3","com4","com5","com6","com7","com8","com9","lpt1","lpt2","lpt3","lpt4","lpt5","lpt6","lpt7","lpt8","lpt9"};
-    return dev.find(stem)==dev.end();
+    size_t pos=0;
+    while(pos<n.size()){
+        size_t slash=n.find('/',pos);
+        std::string part=n.substr(pos,slash==std::string::npos?std::string::npos:slash-pos);
+        if(part.empty()||part=="."||part==".."||part.size()>240||part.back()=='.'||part.back()==' ')return false;
+        for(unsigned char c:part){if(c<0x20||c>0x7e||std::strchr(kInvalid,static_cast<int>(c))!=nullptr)return false;}
+        auto dot=part.find('.');auto stem=part.substr(0,dot);while(!stem.empty()&&(stem.back()=='.'||stem.back()==' '))stem.pop_back();
+        stem=lower_ascii(std::move(stem));if(dev.find(stem)!=dev.end())return false;
+        if(slash==std::string::npos)break;pos=slash+1;
+    }
+    return true;
 }
 
 Bundle parse_bundle() {
@@ -238,11 +257,11 @@ Bundle parse_bundle() {
     std::set<std::string> names; bool core=false;
     for(uint32_t i=0;i<count;++i){
         uint16_t nl=rd16(p,e), flags=rd16(p,e); uint64_t off=rd64(p,e), sz=rd64(p,e);
-        if(flags!=0||nl==0||nl>240||e-p<32+nl)throw std::runtime_error("invalid CUDA bundle entry");
+        if(flags!=0||nl==0||nl>1024||e-p<32+nl)throw std::runtime_error("invalid CUDA bundle entry");
         Entry x; x.offset=off;x.size=sz;std::copy(p,p+32,x.sha.begin());p+=32;x.name.assign(reinterpret_cast<const char*>(p),nl);p+=nl;
         if(!valid_name(x.name))throw std::runtime_error("unsafe CUDA bundle filename");
         auto key=lower_ascii(x.name);if(!names.insert(key).second)throw std::runtime_error("duplicate CUDA bundle filename");
-        if(key=="s2-cuda-core.exe")core=true;
+        if(key==lower_ascii(kRuntimeCoreA))core=true;
         if(off<b.payload_start||off>b.payload_end||sz>b.payload_end-off)throw std::runtime_error("CUDA bundle entry range is out of bounds");
         auto actual=sha256_bytes(m.data+off,static_cast<size_t>(sz));if(actual!=x.sha)throw std::runtime_error("CUDA bundle payload hash mismatch: "+x.name);
         b.entries.push_back(std::move(x));
@@ -259,10 +278,10 @@ fs::path runtime_root(){
     std::vector<wchar_t>b(n);if(!GetEnvironmentVariableW(L"LOCALAPPDATA",b.data(),n))win_fail("cannot read LOCALAPPDATA");
     return fs::path(b.data())/L"s2.cpp"/L"runtime";
 }
-fs::path cache_path(const Bundle&b){return runtime_root()/(L"cuda-"+whex32(b.id));}
+fs::path cache_path(const Bundle&b){return runtime_root()/(std::wstring(kRuntimePrefixW)+whex32(b.id));}
 
 Handle lock_mutex_for(const std::wstring& id){
-    std::wstring name=L"Local\\s2.cpp-cuda-"+id;Handle h(CreateMutexW(nullptr,FALSE,name.c_str()));if(!h)win_fail("CreateMutexW failed");
+    std::wstring name=std::wstring(kRuntimeMutexPrefixW)+id;Handle h(CreateMutexW(nullptr,FALSE,name.c_str()));if(!h)win_fail("CreateMutexW failed");
     DWORD r=WaitForSingleObject(h.get(),INFINITE);if(r!=WAIT_OBJECT_0&&r!=WAIT_ABANDONED)win_fail("WaitForSingleObject failed");return h;
 }
 void unlock_mutex(Handle&h){if(h&& !ReleaseMutex(h.get()))win_fail("ReleaseMutex failed");}
@@ -303,20 +322,22 @@ bool verify_cache(const Bundle&b,const fs::path& cache){
         // beside the core. Require exact directory contents and reject reparse
         // points so the verified cache is also the cache that is executed.
         std::set<std::wstring> allowed={L".complete",L".active.lock"};
-        for(const auto&x:b.entries)allowed.insert(lower_ascii_w(std::wstring(x.name.begin(),x.name.end())));
+        for(const auto&x:b.entries){std::wstring wn(x.name.begin(),x.name.end());std::replace(wn.begin(),wn.end(),L'/',fs::path::preferred_separator);allowed.insert(lower_ascii_w(wn));}
         std::error_code ec;
-        for(const auto&de:fs::directory_iterator(cache,ec)){
+        for(const auto&de:fs::recursive_directory_iterator(cache,fs::directory_options::none,ec)){
             if(ec)return false;
             const fs::path p=de.path();
+            if(de.is_directory(ec)){if(ec||!plain_directory(p))return false;continue;}
             if(!plain_file(p))return false;
-            if(allowed.find(lower_ascii_w(p.filename().wstring()))==allowed.end())return false;
+            fs::path rel=fs::relative(p,cache,ec);if(ec)return false;
+            if(allowed.find(lower_ascii_w(rel.wstring()))==allowed.end())return false;
         }
         if(ec)return false;
 
         const fs::path complete=cache/L".complete";
         if(!plain_file(complete)||!read_complete(complete,hex32(b.id)))return false;
         for(const auto&x:b.entries){
-            fs::path p=cache/fs::path(std::wstring(x.name.begin(),x.name.end()));
+            std::wstring wn(x.name.begin(),x.name.end());std::replace(wn.begin(),wn.end(),L'/',fs::path::preferred_separator);fs::path p=cache/fs::path(wn);
             if(!plain_file(p))return false;
             auto sz=fs::file_size(p,ec);if(ec||sz!=x.size)return false;if(sha256_file(p)!=x.sha)return false;
         }
@@ -341,24 +362,24 @@ void ensure_cache(const Bundle&b,const fs::path&cache){
     fs::create_directories(runtime_root());
     if(verify_cache(b,cache))return;
     if(fs::exists(cache)){
-        if(cache_active(cache))throw std::runtime_error("CUDA runtime cache is active but corrupt; refusing to modify it");
-        std::error_code ec;fs::remove_all(cache,ec);if(ec)throw std::runtime_error("cannot remove corrupt CUDA runtime cache");
+        if(cache_active(cache))throw std::runtime_error("runtime cache is active but corrupt; refusing to modify it");
+        std::error_code ec;fs::remove_all(cache,ec);if(ec)throw std::runtime_error("cannot remove corrupt runtime cache");
     }
     fs::path tmp=fs::path(cache.wstring()+L".tmp-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
-    std::error_code ec;fs::remove_all(tmp,ec);ec.clear();fs::create_directories(tmp,ec);if(ec)throw std::runtime_error("cannot create temporary CUDA runtime directory");
+    std::error_code ec;fs::remove_all(tmp,ec);ec.clear();fs::create_directories(tmp,ec);if(ec)throw std::runtime_error("cannot create temporary runtime directory");
     try{
         Handle self(CreateFileW(b.self_path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr));if(!self)win_fail("cannot reopen launcher payload");
-        for(const auto&x:b.entries){fs::path d=tmp/fs::path(std::wstring(x.name.begin(),x.name.end()));copy_payload_file(self.get(),x,d);if(sha256_file(d)!=x.sha)throw std::runtime_error("extracted CUDA runtime hash mismatch: "+x.name);}
-        {std::ofstream f(tmp/L".complete",std::ios::binary|std::ios::trunc);if(!f)throw std::runtime_error("cannot write CUDA runtime completion marker");f<<hex32(b.id)<<"\n";f.flush();if(!f)throw std::runtime_error("cannot flush CUDA runtime completion marker");}
-        if(!MoveFileExW(tmp.c_str(),cache.c_str(),MOVEFILE_WRITE_THROUGH))win_fail("atomic CUDA runtime cache rename failed");
+        for(const auto&x:b.entries){std::wstring wn(x.name.begin(),x.name.end());std::replace(wn.begin(),wn.end(),L'/',fs::path::preferred_separator);fs::path d=tmp/fs::path(wn);std::error_code dec;fs::create_directories(d.parent_path(),dec);if(dec)throw std::runtime_error("cannot create runtime payload directory");copy_payload_file(self.get(),x,d);if(sha256_file(d)!=x.sha)throw std::runtime_error("extracted runtime hash mismatch: "+x.name);}
+        {std::ofstream f(tmp/L".complete",std::ios::binary|std::ios::trunc);if(!f)throw std::runtime_error("cannot write runtime completion marker");f<<hex32(b.id)<<"\n";f.flush();if(!f)throw std::runtime_error("cannot flush runtime completion marker");}
+        if(!MoveFileExW(tmp.c_str(),cache.c_str(),MOVEFILE_WRITE_THROUGH))win_fail("atomic runtime cache rename failed");
     }catch(...){std::error_code ignored;fs::remove_all(tmp,ignored);throw;}
-    if(!verify_cache(b,cache))throw std::runtime_error("CUDA runtime cache verification failed after extraction");
+    if(!verify_cache(b,cache))throw std::runtime_error("runtime cache verification failed after extraction");
 }
 
 Handle active_marker(const fs::path&cache){
     SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};
-    Handle h(CreateFileW((cache/L".active.lock").c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,&sa,OPEN_ALWAYS,FILE_ATTRIBUTE_HIDDEN,nullptr));if(!h)win_fail("cannot create CUDA runtime active marker");
-    DWORD flags=0;if(!GetHandleInformation(h.get(),&flags)||!(flags&HANDLE_FLAG_INHERIT))throw std::runtime_error("CUDA runtime active marker is not inheritable");return h;
+    Handle h(CreateFileW((cache/L".active.lock").c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,&sa,OPEN_ALWAYS,FILE_ATTRIBUTE_HIDDEN,nullptr));if(!h)win_fail("cannot create runtime active marker");
+    DWORD flags=0;if(!GetHandleInformation(h.get(),&flags)||!(flags&HANDLE_FLAG_INHERIT))throw std::runtime_error("runtime active marker is not inheritable");return h;
 }
 
 std::wstring quote_arg(const std::wstring&s){if(s.empty())return L"\"\"";if(s.find_first_of(L" \t\"")==std::wstring::npos)return s;std::wstring o=L"\"";size_t sl=0;for(wchar_t c:s){if(c==L'\\'){++sl;continue;}if(c==L'\"'){o.append(sl*2+1,L'\\');o+=L'\"';sl=0;continue;}o.append(sl,L'\\');sl=0;o+=c;}o.append(sl*2,L'\\');o+=L'\"';return o;}
@@ -386,14 +407,14 @@ DWORD launch_core(const fs::path&core,int argc,wchar_t**argv,HANDLE active){
     struct Attr{LPPROC_THREAD_ATTRIBUTE_LIST p;~Attr(){if(p)DeleteProcThreadAttributeList(p);}}attr{sx.lpAttributeList};
     if(!UpdateProcThreadAttribute(sx.lpAttributeList,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,inherit.data(),inherit.size()*sizeof(HANDLE),nullptr,nullptr))win_fail("UpdateProcThreadAttribute(handle list) failed");
     PROCESS_INFORMATION pi{};std::vector<wchar_t>mutable_cmd(cmd.begin(),cmd.end());mutable_cmd.push_back(L'\0');
-    if(!CreateProcessW(core.c_str(),mutable_cmd.data(),nullptr,nullptr,TRUE,EXTENDED_STARTUPINFO_PRESENT,nullptr,nullptr,&sx.StartupInfo,&pi))win_fail("CreateProcessW(s2-cuda-core.exe) failed");
+    if(!CreateProcessW(core.c_str(),mutable_cmd.data(),nullptr,nullptr,TRUE,EXTENDED_STARTUPINFO_PRESENT,nullptr,nullptr,&sx.StartupInfo,&pi))win_fail("CreateProcessW(runtime core) failed");
     Handle ph(pi.hProcess),th(pi.hThread);DWORD w=WaitForSingleObject(ph.get(),INFINITE);if(w!=WAIT_OBJECT_0)win_fail("waiting for CUDA core failed");DWORD ec=1;if(!GetExitCodeProcess(ph.get(),&ec))win_fail("GetExitCodeProcess failed");return ec;
 }
 
 int runtime_info(const Bundle&b){auto c=cache_path(b);std::wcout<<L"bundle_sha256: "<<whex32(b.id)<<L"\ncache: "<<c.wstring()<<L"\n";std::cout<<"payload_files: "<<b.entries.size()<<"\n";for(const auto&x:b.entries)std::cout<<"  "<<x.name<<" size="<<x.size<<" sha256="<<hex32(x.sha)<<"\n";std::cout<<"cache_valid: "<<(verify_cache(b,c)?"yes":"no")<<"\ncache_active: "<<(cache_active(c)?"yes":"no")<<"\n";return 0;}
 
-bool hash_suffix(const std::wstring&name,std::wstring&out){if(name.rfind(L"cuda-",0)!=0||name.size()<5+64)return false;out=name.substr(5,64);if(out.size()!=64)return false;for(auto c:out)if(!((c>=L'0'&&c<=L'9')||(c>=L'a'&&c<=L'f')||(c>=L'A'&&c<=L'F')))return false;std::transform(out.begin(),out.end(),out.begin(),::towlower);return true;}
-int clean_runtime(){fs::path root=runtime_root();if(!fs::exists(root)){std::cout<<"runtime cache is already empty\n";return 0;}Handle global=lock_mutex_for(L"clean-runtime");size_t removed=0,skipped=0;for(const auto&de:fs::directory_iterator(root)){if(!de.is_directory())continue;std::wstring id;if(!hash_suffix(de.path().filename().wstring(),id))continue;Handle m=lock_mutex_for(id);fs::path cache=root/(L"cuda-"+id);if(cache_active(cache)){++skipped;unlock_mutex(m);continue;}std::error_code ec;fs::remove_all(de.path(),ec);if(ec){unlock_mutex(m);unlock_mutex(global);throw std::runtime_error("failed to remove CUDA runtime cache");}++removed;unlock_mutex(m);}unlock_mutex(global);std::cout<<"removed="<<removed<<" active_skipped="<<skipped<<"\n";return 0;}
+bool hash_suffix(const std::wstring&name,std::wstring&out){const std::wstring prefix(kRuntimePrefixW);if(name.rfind(prefix,0)!=0||name.size()<prefix.size()+64)return false;out=name.substr(prefix.size(),64);if(out.size()!=64)return false;for(auto c:out)if(!((c>=L'0'&&c<=L'9')||(c>=L'a'&&c<=L'f')||(c>=L'A'&&c<=L'F')))return false;std::transform(out.begin(),out.end(),out.begin(),::towlower);return true;}
+int clean_runtime(){fs::path root=runtime_root();if(!fs::exists(root)){std::cout<<"runtime cache is already empty\n";return 0;}Handle global=lock_mutex_for(L"clean-runtime");size_t removed=0,skipped=0;for(const auto&de:fs::directory_iterator(root)){if(!de.is_directory())continue;std::wstring id;if(!hash_suffix(de.path().filename().wstring(),id))continue;Handle m=lock_mutex_for(id);fs::path cache=root/(std::wstring(kRuntimePrefixW)+id);if(cache_active(cache)){++skipped;unlock_mutex(m);continue;}std::error_code ec;fs::remove_all(de.path(),ec);if(ec){unlock_mutex(m);unlock_mutex(global);throw std::runtime_error("failed to remove CUDA runtime cache");}++removed;unlock_mutex(m);}unlock_mutex(global);std::cout<<"removed="<<removed<<" active_skipped="<<skipped<<"\n";return 0;}
 } // namespace
 
 int wmain(int argc,wchar_t**argv){
@@ -401,8 +422,8 @@ int wmain(int argc,wchar_t**argv){
         Bundle b=parse_bundle();
         if(argc==2&&std::wcscmp(argv[1],L"--runtime-info")==0)return runtime_info(b);
         if(argc==2&&std::wcscmp(argv[1],L"--clean-runtime")==0)return clean_runtime();
-        fs::path cache=cache_path(b);Handle mutex=lock_mutex_for(whex32(b.id));ensure_cache(b,cache);Handle active=active_marker(cache);unlock_mutex(mutex);fs::path core=cache/L"s2-cuda-core.exe";DWORD ec=launch_core(core,argc,argv,active.get());return static_cast<int>(ec);
-    }catch(const std::exception&e){std::cerr<<"s2-cuda launcher: "<<e.what()<<"\n";return 111;}
+        fs::path cache=cache_path(b);Handle mutex=lock_mutex_for(whex32(b.id));ensure_cache(b,cache);Handle active=active_marker(cache);unlock_mutex(mutex);fs::path core=cache/fs::path(kRuntimeCoreW);DWORD ec=launch_core(core,argc,argv,active.get());return static_cast<int>(ec);
+    }catch(const std::exception&e){std::cerr<<kLauncherLabel<<" launcher: "<<e.what()<<"\n";return 111;}
 }
 #else
 int main(){return 1;}

@@ -34,12 +34,21 @@ with tempfile.TemporaryDirectory() as td0:
     imagic,iver,count,ips=struct.unpack_from('<8sIIQ',index,0)
     assert imagic==cb.INDEX_MAGIC and iver==1 and count==2 and ips==pstart
 
+assert cb.MAX_ENTRIES == 16384
+
 with tempfile.TemporaryDirectory() as td0:
     td=Path(td0); payload=td/'payload'; payload.mkdir()
-    (payload/'s2-cuda-core.exe').write_bytes(b'x')
-    for i in range(cb.MAX_ENTRIES): (payload/f'x{i:03d}.dll').write_bytes(b'x')
-    r=run(payload,td/'out.exe')
-    assert r.returncode!=0 and 'too many payload files' in (r.stderr+r.stdout)
+    (payload/'s2-amd-core.exe').write_bytes(b'amd-core')
+    nested=payload/'rocblas'/'library'/'gfx1100'; nested.mkdir(parents=True)
+    (nested/'kernel.dat').write_bytes(b'kernel')
+    launcher=td/'launcher.exe'; launcher.write_bytes(b'MZ'+b'launcher-stub'*11)
+    out=td/'s2-amd.exe'
+    r=subprocess.run([sys.executable,str(SCRIPT),'--launcher',str(launcher),'--payload-dir',str(payload),'--output',str(out),'--core-name','s2-amd-core.exe'],text=True,capture_output=True)
+    assert r.returncode==0, r.stderr+r.stdout
+    data=out.read_bytes(); footer=data[-80:]
+    _,_,_,index_off,index_size,_,_,_=struct.unpack('<8sIIQQQQ32s',footer)
+    index=data[index_off:index_off+index_size]
+    assert b'rocblas/library/gfx1100/kernel.dat' in index
 
 with tempfile.TemporaryDirectory() as td0:
     td=Path(td0); payload=td/'payload'; payload.mkdir()

@@ -2,6 +2,8 @@
 # Parchea los CMake files para compilar s2.cpp en Windows con MSVC.
 # Crow se compila sin CROW_ENABLE_SSL; este build no depende de OpenSSL.
 
+param([switch]$SkipVulkanPortabilityPatch)
+
 $ErrorActionPreference = "Stop"
 
 function Invoke-DownloadWithRetry {
@@ -29,7 +31,7 @@ function Assert-Sha256 {
           [Parameter(Mandatory=$true)][string]$Expected)
     $actual = (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
     if ($actual -ne $Expected.ToLowerInvariant()) {
-        throw "SHA-256 mismatch for $Path: expected $Expected got $actual"
+        throw "SHA-256 mismatch for ${Path}: expected $Expected got $actual"
     }
 }
 
@@ -165,198 +167,45 @@ if (-Not (Test-Path $crowHeader.Replace('/', '\'))) {
 }
 Write-Host "OK: crow.h verificado"
 
-# ── 3. Parchear ggml-vulkan/CMakeLists.txt ────────────────────────────────────
-$vkPath  = "ggml\src\ggml-vulkan\CMakeLists.txt"
-$vkCmake = Get-Content $vkPath -Raw
+# ── 3. Optional ggml-vulkan portability patch ─────────────────────────────────
+# CUDA/CPU builds do not need to mutate the Vulkan CMake. The root CMakeLists.txt
+# is authoritative; this script only prepares pinned Crow/Asio headers and, for
+# the Vulkan build, disables shader capability probes that are not portable on CI.
+if (-Not $SkipVulkanPortabilityPatch) {
+    $vkPath  = "ggml\src\ggml-vulkan\CMakeLists.txt"
+    $vkCmake = Get-Content $vkPath -Raw
+    $vkPattern = '(?s)function\(test_shader_extension_support.*?endfunction\(\)'
+    $vkMatches = [regex]::Matches($vkCmake, $vkPattern)
+    if ($vkMatches.Count -ne 1) {
+        throw "Expected exactly one test_shader_extension_support() function in ${vkPath}; found $($vkMatches.Count)"
+    }
 
-if ($vkCmake -match "execute_process") {
-    $vkCmake = $vkCmake -replace '(?s)function\(test_shader_extension_support.*?endfunction\(\)', @'
+    $vkFunction = $vkMatches[0].Value
+    if ($vkFunction -match 'execute_process') {
+        $vkReplacement = @'
 function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
     message(STATUS "${EXTENSION_NAME} disabled (portability build)")
     set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
 endfunction()
 '@
-    [System.IO.File]::WriteAllText(
-        (Resolve-Path $vkPath).Path,
-        $vkCmake,
-        [System.Text.UTF8Encoding]::new($false)
-    )
-    Write-Host "OK: ggml-vulkan CMakeLists.txt parcheado (coopmat OFF)"
+        $vkCmake = [regex]::Replace($vkCmake, $vkPattern, $vkReplacement)
+        $verifyMatches = [regex]::Matches($vkCmake, $vkPattern)
+        if ($verifyMatches.Count -ne 1 -or $verifyMatches[0].Value -match 'execute_process') {
+            throw "Vulkan portability patch postcondition failed for ${vkPath}"
+        }
+        [System.IO.File]::WriteAllText(
+            (Resolve-Path $vkPath).Path,
+            $vkCmake,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Write-Host "OK: ggml-vulkan CMakeLists.txt parcheado (coopmat OFF)"
+    } elseif ($vkFunction -match 'disabled \(portability build\)') {
+        Write-Host "OK: ggml-vulkan CMakeLists.txt ya parcheado"
+    } else {
+        throw "Unknown test_shader_extension_support() shape in ${vkPath}; refusing a blind patch"
+    }
 } else {
-    Write-Host "OK: ggml-vulkan CMakeLists.txt ya parcheado"
+    Write-Host "Vulkan portability patch skipped for this backend."
 }
 
-# ── 4. Reescribir CMakeLists.txt raiz ────────────────────────────────────────
-# main.cpp hace #include <crow.h> — con el include dir apuntando a
-# crow-include/crow/, el compilador encuentra crow-include/crow/crow.h. OK.
-# Crow usa #ifdef CROW_ENABLE_SSL para activar SSL. La forma correcta de
-# desactivarlo es NO definir la macro — definirla con valor 0 la activa igualmente.
-
-# Sin CROW_ENABLE_SSL definido, Crow/Asio no generan referencias a OpenSSL.
-# No se necesita linkar contra libssl ni libcrypto.
-$opensslLinkBlock = ""
-
-$newCmake = @"
-cmake_minimum_required(VERSION 3.15)
-if(POLICY CMP0091)
-    cmake_policy(SET CMP0091 NEW)
-endif()
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded" CACHE STRING "MSVC runtime library" FORCE)
-project(s2cpp LANGUAGES C CXX)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-option(S2_VULKAN  "Build with Vulkan backend"  OFF)
-option(S2_CUDA    "Build with CUDA backend"    OFF)
-option(S2_METAL   "Build with Metal backend"   OFF)
-
-set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GGML_NATIVE          OFF CACHE BOOL "" FORCE)
-set(GGML_AVX512         OFF CACHE BOOL "" FORCE)
-
-if((S2_VULKAN AND S2_CUDA) OR (S2_VULKAN AND S2_METAL) OR (S2_CUDA AND S2_METAL))
-    message(FATAL_ERROR "Choose only one GPU backend per executable")
-endif()
-
-set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA   OFF CACHE BOOL "" FORCE)
-set(GGML_METAL  OFF CACHE BOOL "" FORCE)
-if(S2_VULKAN)
-    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
-elseif(S2_CUDA)
-    set(GGML_CUDA ON CACHE BOOL "" FORCE)
-elseif(S2_METAL)
-    set(GGML_METAL ON CACHE BOOL "" FORCE)
-endif()
-
-add_subdirectory(ggml)
-
-# ---------------------------------------------------------------------------
-# Crow: headers originales del source tarball (NO crow_all.h).
-# Los headers originales tienen #ifdef CROW_ENABLE_SSL, por lo que
-# NO definir CROW_ENABLE_SSL evita completamente asio::ssl y OpenSSL.
-# include_directories apunta a crow-include/ para que #include <crow/crow.h>
-# funcione, y tambien a crow-include/crow/ para que #include <crow.h> funcione.
-# ---------------------------------------------------------------------------
-set(CROW_INCLUDE_DIR "$crowAbs")
-
-# ---------------------------------------------------------------------------
-# Asio standalone
-# ---------------------------------------------------------------------------
-set(ASIO_INCLUDE_DIR "$asioAbs")
-
-add_library(asio_iface INTERFACE)
-target_include_directories(asio_iface INTERFACE `${ASIO_INCLUDE_DIR})
-target_compile_definitions(asio_iface INTERFACE ASIO_STANDALONE)
-
-# ---------------------------------------------------------------------------
-# s2 executable
-# ---------------------------------------------------------------------------
-set(S2_SOURCES
-    src/s2_audio.cpp
-    src/s2_json.cpp
-    src/s2_text.cpp
-    src/s2_tokenizer.cpp
-    src/s2_sampler.cpp
-    src/s2_model.cpp
-    src/s2_codec.cpp
-    src/s2_prompt.cpp
-    src/s2_generate.cpp
-    src/s2_pipeline.cpp
-    src/s2_voice.cpp
-    src/main.cpp
-)
-
-# tokenizer_data.{h,cpp} son un par generado por CI. main.cpp activa el
-# tokenizer embebido al ver el header, por lo que aceptar solo uno de los dos
-# produciria un link roto o una configuracion ambigua.
-set(S2_TOKENIZER_HEADER "`${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer_data.h")
-set(S2_TOKENIZER_SOURCE "`${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer_data.cpp")
-if(EXISTS "`${S2_TOKENIZER_HEADER}" AND EXISTS "`${S2_TOKENIZER_SOURCE}")
-    list(APPEND S2_SOURCES src/tokenizer_data.cpp)
-    message(STATUS "tokenizer embebido: src/tokenizer_data.cpp incluido")
-elseif(EXISTS "`${S2_TOKENIZER_HEADER}" OR EXISTS "`${S2_TOKENIZER_SOURCE}")
-    message(FATAL_ERROR "Incomplete embedded tokenizer pair: both src/tokenizer_data.h and src/tokenizer_data.cpp are required")
-else()
-    message(STATUS "tokenizer: se usara tokenizer.json en disco (build local)")
-endif()
-
-add_executable(s2 `${S2_SOURCES})
-
-if(S2_VULKAN)
-    set_target_properties(s2 PROPERTIES OUTPUT_NAME "s2-vulkan")
-elseif(S2_CUDA)
-    set_target_properties(s2 PROPERTIES OUTPUT_NAME "s2-cuda")
-elseif(S2_METAL)
-    set_target_properties(s2 PROPERTIES OUTPUT_NAME "s2-metal")
-else()
-    set_target_properties(s2 PROPERTIES OUTPUT_NAME "s2-cpu")
-endif()
-
-# Suprimir warnings C4838/C4309/C4365 solo para tokenizer_data.cpp
-# (narrowing/truncation en el array de bytes — son inofensivos con unsigned char)
-if(MSVC AND EXISTS "`${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer_data.cpp")
-    set_source_files_properties(src/tokenizer_data.cpp PROPERTIES
-        COMPILE_FLAGS "/wd4838 /wd4309 /wd4365 /wd4267")
-endif()
-
-target_include_directories(s2 PRIVATE
-    `${CMAKE_CURRENT_SOURCE_DIR}/include
-    `${CMAKE_CURRENT_SOURCE_DIR}/third_party
-    `${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
-    `${CMAKE_CURRENT_SOURCE_DIR}/ggml/src
-    `${CROW_INCLUDE_DIR}
-)
-
-target_link_libraries(s2 PRIVATE
-    ggml
-    asio_iface
-)
-
-if(S2_VULKAN)
-    target_compile_definitions(s2 PRIVATE GGML_USE_VULKAN)
-elseif(S2_CUDA)
-    target_compile_definitions(s2 PRIVATE GGML_USE_CUDA)
-elseif(S2_METAL)
-    target_compile_definitions(s2 PRIVATE GGML_USE_METAL)
-endif()
-
-if(WIN32)
-    target_link_libraries(s2 PRIVATE ws2_32 mswsock crypt32)
-$opensslLinkBlock
-    target_compile_definitions(s2 PRIVATE
-        WIN32_LEAN_AND_MEAN
-        NOMINMAX
-        _WIN32_WINNT=0x0A00
-        ASIO_STANDALONE)
-    if(MSVC)
-        # /FI fuerza un include al inicio de cada TU — garantiza que
-        # ASIO_STANDALONE se define ANTES de cualquier #include en el codigo fuente.
-        # CROW_ENABLE_SSL no se define — con #ifdef, definirlo con valor 0
-        # activa el bloque SSL igualmente. La ausencia de la macro lo desactiva.
-        target_compile_options(s2 PRIVATE
-            /W3 /wd4996 /wd4267 /wd4244 /wd4566 /MP /utf-8 /EHsc
-            /DASIO_STANDALONE
-            /DNOMINMAX
-            /DWIN32_LEAN_AND_MEAN
-            /arch:AVX2
-        )
-    endif()
-elseif(UNIX AND NOT APPLE)
-    target_link_libraries(s2 PRIVATE pthread m)
-endif()
-
-install(TARGETS s2 RUNTIME DESTINATION bin)
-"@
-
-[System.IO.File]::WriteAllText(
-    (Join-Path (Get-Location) "CMakeLists.txt"),
-    $newCmake,
-    [System.Text.UTF8Encoding]::new($false)
-)
-Write-Host "OK: CMakeLists.txt raiz reescrito."
-Write-Host "=== Parche completado ==="
+Write-Host "=== Preparacion de dependencias Windows completada ==="

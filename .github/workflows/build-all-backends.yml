@@ -1,4 +1,4 @@
-name: Build s2.cpp - Windows/Linux CPU + Vulkan + CUDA + macOS Metal
+name: Build s2.cpp - Windows/Linux CPU + Vulkan + CUDA + ROCm + macOS CPU/Metal
 
 on:
   push:
@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 # Force JavaScript actions to Node 24, including nested/composite actions that still declare Node 20.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
@@ -18,11 +22,82 @@ env:
   VULKAN_SHA256: '81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d'
 
 jobs:
+  preflight:
+    name: Workflow preflight - actionlint + shell parsers + repository guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Validate workflow with pinned actionlint 1.7.12
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          archive="actionlint_${version}_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${version}/${archive}"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 -o "$RUNNER_TEMP/$archive" "$url"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint" actionlint
+          "$RUNNER_TEMP/actionlint/actionlint" -shellcheck= -pyflakes= .github/workflows/build-all-backends.yml
+
+      - name: Extract every workflow run command
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .ci-run-blocks
+          python3 tools/ci/extract-workflow-run-blocks.py .github/workflows/build-all-backends.yml .ci-run-blocks
+          find .ci-run-blocks -maxdepth 1 -type f -print | LC_ALL=C sort
+
+      - name: Parse PowerShell scripts and every pwsh run block
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $targets = @('patch-cmake.ps1', 'patch-cmake-cuda.ps1')
+          $targets += @(Get-ChildItem .ci-run-blocks -Filter 'pwsh-run-*.ps1' -File | Sort-Object Name | ForEach-Object FullName)
+          foreach ($file in $targets) {
+              $tokens = $null
+              $parseErrors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file).Path, [ref]$tokens, [ref]$parseErrors) | Out-Null
+              if ($parseErrors.Count -ne 0) {
+                  $parseErrors | ForEach-Object { Write-Error "${file}: $($_.Message) at $($_.Extent.StartLineNumber):$($_.Extent.StartColumnNumber)" }
+                  throw "PowerShell parser rejected ${file}"
+              }
+          }
+          Write-Host "POWERSHELL_PARSE_PASS files=$($targets.Count)"
+
+      - name: Parse Bash scripts and every bash run block
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            bash -n "$file"
+          done < <(find tools/ci -type f -name '*.sh' -print0)
+          while IFS= read -r -d '' file; do
+            bash -n "$file"
+          done < <(find .ci-run-blocks -maxdepth 1 -type f -name 'bash-run-*.sh' -print0)
+          echo BASH_PARSE_PASS
+
+      - name: Run workflow/repository consistency guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/check_cli_parser_sync.py
+          python3 tools/check_docs_api_sync.py
+          python3 tools/check_ci_invariants.py
+
   build:
     name: Windows Server 2025 - VS 2026 - Vulkan
     # Pin the current Windows image explicitly instead of relying on a moving
     # windows-latest alias. The image provides Windows Server 2025 + VS 2026/v145.
     runs-on: windows-2025-vs2026
+    needs: preflight
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -121,8 +196,12 @@ jobs:
       - name: CMake Configure
         shell: pwsh
         run: |
-          cmake -G "Visual Studio 18 2026" -A x64 -B build -S . `
+          $crow = (Resolve-Path 'build\_deps\crow-include').Path
+          $asio = (Resolve-Path 'build\_deps\asio-include').Path
+          python tools/ci/run-with-diagnostics.py --label "Windows Vulkan configure" --log ci-logs/windows-vulkan-configure.log -- cmake -G "Visual Studio 18 2026" -A x64 -B build -S . `
             -DCMAKE_BUILD_TYPE=Release `
+            -DS2_CROW_INCLUDE_DIR="$crow" `
+            -DS2_ASIO_INCLUDE_DIR="$asio" `
             -DS2_VULKAN=ON `
             -DGGML_VULKAN=ON `
             -DS2_CUDA=OFF `
@@ -139,7 +218,7 @@ jobs:
 
       - name: CMake Build
         shell: pwsh
-        run: cmake --build build --config Release --parallel
+        run: python tools/ci/run-with-diagnostics.py --label "Windows Vulkan build" --log ci-logs/windows-vulkan-build.log -- cmake --build build --config Release --parallel 4
 
       - name: Verificar ejecutable
         shell: pwsh
@@ -262,7 +341,7 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path release | Out-Null
 
-          Copy-Item build\Release\s2-vulkan.exe release\
+          Copy-Item build\Release\s2-vulkan.exe release\s2-windows-vulkan-x86-64.exe
 
           # tokenizer.json ya esta embebido en s2-vulkan.exe — no se distribuye por separado.
           # Solo se incluye si el build fallo en embeber (fallback de seguridad).
@@ -274,27 +353,49 @@ jobs:
           }
 
           $files = @(Get-ChildItem release -File)
-          if ($files.Count -ne 1 -or $files[0].Name -ne 's2-vulkan.exe') {
-              throw "Vulkan artifact must contain exactly one s2-vulkan.exe"
+          if ($files.Count -ne 1 -or $files[0].Name -ne 's2-windows-vulkan-x86-64.exe') {
+              throw "Vulkan artifact must contain exactly one s2-windows-vulkan-x86-64.exe"
           }
-          $sizeMB = [math]::Round((Get-Item release\s2-vulkan.exe).Length / 1MB, 1)
+          $sizeMB = [math]::Round((Get-Item release\s2-windows-vulkan-x86-64.exe).Length / 1MB, 1)
           Write-Host "`nContenido del release:"
           Get-ChildItem release\ | Format-Table Name, Length -AutoSize
           Write-Host "Tamanio de s2-vulkan.exe: $sizeMB MB (incluye tokenizer embebido)"
 
+      - name: Verify non-empty direct artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $f = Get-Item 'release/s2-windows-vulkan-x86-64.exe'
+          if ($f.Length -le 0) { throw "Direct artifact is empty: $($f.FullName)" }
+
       - name: Subir artifact
         uses: actions/upload-artifact@v7
         with:
-          name: s2-windows-vulkan
-          path: release/
+          name: s2-windows-vulkan-x86-64.exe
+          path: release/s2-windows-vulkan-x86-64.exe
           if-no-files-found: error
-          retention-days: 30
+          archive: false
+
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: pwsh
+        run: python tools/ci/collect-crash-report.py --label "Windows Vulkan" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-vulkan-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   build-cuda:
-    name: Windows Server 2025 - VS 2026 - CUDA 13.2
-    # CUDA 13.2 officially supports MSVC 195x / Visual Studio 2026 and
-    # Windows Server 2025, so use the current v145 toolchain directly.
+    name: Windows Server 2025 - VS 2026 - CUDA 13.2 - Ninja
     runs-on: windows-2025-vs2026
+    needs: preflight
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -302,70 +403,122 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Instalar CUDA Toolkit 13.2
-        uses: Jimver/cuda-toolkit@v0.2.36
-        with:
-          cuda: '13.2.0'
-          method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
-
-      - name: Verify CUDA 13.2 and VS 2026 integration
+      - name: Assemble pinned CUDA 13.2 toolkit from NVIDIA redistributable archives
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
-          cmake --version
-          if ($LASTEXITCODE -ne 0) { throw "cmake --version failed with exit $LASTEXITCODE" }
-          $cmakeHelp = cmake --help | Out-String
-          if ($LASTEXITCODE -ne 0 -or $cmakeHelp -notmatch [regex]::Escape("Visual Studio 18 2026")) {
-              throw 'Installed CMake does not expose generator "Visual Studio 18 2026" (requires CMake >= 4.2).'
+          Set-StrictMode -Version Latest
+
+          $redistBase = 'https://developer.download.nvidia.com/compute/cuda/redist'
+          $manifestPath = Join-Path $env:RUNNER_TEMP 'redistrib_13.2.0.json'
+          curl.exe -fL --retry 3 --retry-delay 2 -o $manifestPath "$redistBase/redistrib_13.2.0.json"
+          if ($LASTEXITCODE -ne 0) { throw "CUDA redistrib manifest download failed" }
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+
+          $components = @(
+            @{ Key='cuda_cccl';        Version='13.2.27'; Sha='fb61bbca384ea9e5722f3b77cfdd635c916f33593d187562510ce14831aa629a' },
+            @{ Key='cuda_crt';         Version='13.2.51'; Sha='02892bd6bc7ec832c5fc6fc794491803166ee8455bd87d52976c4b195b76c8e7' },
+            @{ Key='cuda_cudart';      Version='13.2.51'; Sha='906b430b53e6396f7cbaa6874fbe7f9307a184e830b119a4ad3f58dc6e0165c6' },
+            @{ Key='cuda_nvcc';        Version='13.2.51'; Sha='a6bacac79adb923e310eb39f2b86d4d9e756c896d035dfead50c69403eca4661' },
+            @{ Key='libnvvm';          Version='13.2.51'; Sha='ef2a24cf40f9394e2f13df5a8a7315c65325103006a53692cd12b8c48431e372' },
+            @{ Key='libnvptxcompiler'; Version='13.2.51'; Sha='19c12ad13d8d0a7ee2ad9f9896f18be3052684aa0b3e199ba57f344482dce45b' },
+            @{ Key='libcublas';        Version='13.3.0.5'; Sha='438a88f07af3721eda15ed1f4d2b957ea810e29061b2a6292837f35520dbd212' },
+            @{ Key='libnvjitlink';     Version='13.2.51'; Sha='b192c79a449efc6a6593be46bc56928281789a4bb0b8714321c8a1b1684ff74f' }
+          )
+
+          $cudaRoot = Join-Path $env:RUNNER_TEMP 'cuda-13.2-redist'
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'cuda-13.2-downloads'
+          Remove-Item $cudaRoot, $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $cudaRoot, $downloadDir | Out-Null
+
+          foreach ($component in $components) {
+              $property = $manifest.PSObject.Properties[$component.Key]
+              if ($null -eq $property) { throw "CUDA manifest missing component $($component.Key)" }
+              $entry = $property.Value
+              if ([string]$entry.version -ne $component.Version) {
+                  throw "CUDA manifest version mismatch for $($component.Key): expected $($component.Version), got $($entry.version)"
+              }
+              $platformProperty = $entry.PSObject.Properties['windows-x86_64']
+              if ($null -eq $platformProperty) { throw "CUDA manifest missing windows-x86_64 for $($component.Key)" }
+              $platform = $platformProperty.Value
+              $manifestSha = ([string]$platform.sha256).ToLowerInvariant()
+              if ($manifestSha -ne $component.Sha) {
+                  throw "CUDA manifest SHA mismatch for $($component.Key): expected $($component.Sha), got $manifestSha"
+              }
+              $relative = [string]$platform.relative_path
+              if ($relative -notlike "$($component.Key)/windows-x86_64/*.zip") {
+                  throw "Unexpected CUDA archive path for $($component.Key): $relative"
+              }
+              $archive = Join-Path $downloadDir ([IO.Path]::GetFileName($relative))
+              curl.exe -fL --retry 3 --retry-delay 2 -o $archive "$redistBase/$relative"
+              if ($LASTEXITCODE -ne 0) { throw "CUDA component download failed: $($component.Key)" }
+              $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+              if ($actual -ne $component.Sha) {
+                  throw "CUDA archive SHA mismatch for $($component.Key): expected $($component.Sha), got $actual"
+              }
+
+              $extract = Join-Path $downloadDir ("extract-" + $component.Key)
+              New-Item -ItemType Directory -Force $extract | Out-Null
+              Expand-Archive -Path $archive -DestinationPath $extract -Force
+              $children = @(Get-ChildItem $extract -Force)
+              $source = $extract
+              if ($children.Count -eq 1 -and $children[0].PSIsContainer) { $source = $children[0].FullName }
+              Get-ChildItem $source -Recurse -File -Force | ForEach-Object {
+                  $relativeFile = [IO.Path]::GetRelativePath($source, $_.FullName)
+                  $destination = Join-Path $cudaRoot $relativeFile
+                  New-Item -ItemType Directory -Force (Split-Path -Parent $destination) | Out-Null
+                  Copy-Item $_.FullName $destination -Force
+              }
+              Write-Host "CUDA_COMPONENT_PASS key=$($component.Key) version=$($component.Version)"
           }
 
-          nvcc --version
-          if ($LASTEXITCODE -ne 0) { throw "nvcc --version failed with exit $LASTEXITCODE" }
-          $cudaPath = $env:CUDA_PATH
-          if (-Not $cudaPath -or -Not (Test-Path (Join-Path $cudaPath 'bin\nvcc.exe'))) {
-              throw "CUDA_PATH is missing or invalid: $cudaPath"
+          $required = @(
+            'bin\nvcc.exe', 'include\cuda_runtime.h', 'include\cub', 'include\thrust',
+            'include\cublas_v2.h', 'lib\x64\cudart_static.lib', 'lib\x64\cudadevrt.lib',
+            'lib\x64\cuda.lib', 'lib\x64\cublas.lib', 'lib\x64\cublasLt.lib',
+            'nvvm\libdevice\libdevice.10.bc', 'bin\cicc.exe', 'bin\ptxas.exe',
+            'bin\nvlink.exe', 'bin\fatbinary.exe'
+          )
+          foreach ($relative in $required) {
+              if (-Not (Test-Path (Join-Path $cudaRoot $relative))) { throw "Assembled CUDA toolkit missing $relative" }
+          }
+          foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll', 'nvJitLink*.dll')) {
+              if (-Not (Get-ChildItem (Join-Path $cudaRoot 'bin') -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+                  throw "Assembled CUDA toolkit missing runtime DLL pattern $pattern"
+              }
+          }
+          if (Get-ChildItem $cudaRoot -Recurse -Filter 'nvcuda.dll' -File -ErrorAction SilentlyContinue) {
+              throw 'nvcuda.dll is driver-owned and must not be present in the assembled toolkit'
           }
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (-Not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
           $vsRoot = & $vswhere -latest -products * -version '[18.0,19.0)' -property installationPath
           if ($LASTEXITCODE -ne 0 -or -Not $vsRoot) { throw "Visual Studio 2026 not found" }
-          $cl = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction Stop |
-                Sort-Object FullName -Descending | Select-Object -First 1
-          if (-Not $cl) { throw "VS 2026 x64 cl.exe not found" }
+          $devShell = Join-Path $vsRoot 'Common7\Tools\Launch-VsDevShell.ps1'
+          if (-Not (Test-Path $devShell)) { throw "Launch-VsDevShell.ps1 not found: $devShell" }
+          if (-Not (Get-Command ninja.exe -ErrorAction SilentlyContinue)) { throw "ninja.exe not found on runner" }
 
-          # CMake's `-T cuda=<path>` standalone-toolkit mode reads the CUDA
-          # MSBuild extensions directly from CUDA_PATH. Do not mutate the hosted
-          # Visual Studio installation; just prove the required integration exists.
-          $cudaMsbuild = Join-Path $cudaPath 'extras\visual_studio_integration\MSBuildExtensions'
-          if (-Not (Test-Path $cudaMsbuild)) {
-              throw "CUDA Visual Studio integration files are missing: $cudaMsbuild"
-          }
-          foreach ($name in @('CUDA 13.2.props', 'CUDA 13.2.targets', 'CUDA 13.2.xml', 'Nvda.Build.CudaTasks.v13.2.dll')) {
-              $candidate = Join-Path $cudaMsbuild $name
-              if (-Not (Test-Path $candidate)) { throw "CUDA MSBuild integration file missing: $candidate" }
-          }
+          "CUDA_PATH=$cudaRoot" >> $env:GITHUB_ENV
+          "CUDAToolkit_ROOT=$cudaRoot" >> $env:GITHUB_ENV
+          "VS2026_PATH=$vsRoot" >> $env:GITHUB_ENV
+          (Join-Path $cudaRoot 'bin') >> $env:GITHUB_PATH
+          Write-Host "CUDA_PATH=$cudaRoot"
+          Write-Host "VS2026_PATH=$vsRoot"
 
-          # CMake 4.x / VS generators also consult this MSBuild property during
-          # compiler identification. Persist it for every later PowerShell step.
-          $env:CudaToolkitDir = $cudaPath
-          "CUDA_PATH=$cudaPath"         >> $env:GITHUB_ENV
-          "CudaToolkitDir=$cudaPath"    >> $env:GITHUB_ENV
-          "VS2026_PATH=$vsRoot"         >> $env:GITHUB_ENV
-
-          Write-Host "CUDA_PATH        = $cudaPath"
-          Write-Host "CudaToolkitDir   = $env:CudaToolkitDir"
-          Write-Host "VS2026           = $vsRoot"
-          Write-Host "cl.exe           = $($cl.FullName)"
-          Write-Host "cl file version  = $($cl.VersionInfo.FileVersion)"
-          Write-Host "MSBuild CUDA dir = $cudaMsbuild"
-
-      - name: Probe CMake CUDA compiler before project build
+      - name: Probe CUDA compiler with Ninja + VS 2026 host compiler
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          & "$env:VS2026_PATH\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          if ($LASTEXITCODE -ne 0) { throw "Launch-VsDevShell failed" }
+          $cl = (Get-Command cl.exe -ErrorAction Stop).Source
+          $nvcc = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
+          ninja --version
+          cl.exe 2>&1 | Select-Object -First 8 | ForEach-Object { Write-Host $_ }
+          & $nvcc --version
+          if ($LASTEXITCODE -ne 0) { throw "nvcc --version failed" }
+
           $probe = Join-Path $env:RUNNER_TEMP 's2-cuda-cmake-probe'
           Remove-Item $probe -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force $probe | Out-Null
@@ -379,22 +532,22 @@ jobs:
           @'
           #include <cuda_runtime.h>
           __global__ void probe_kernel() {}
-          int main() { return 0; }
+          int main() { probe_kernel<<<1,1>>>(); return 0; }
           '@ | Set-Content -Encoding UTF8 (Join-Path $probe 'main.cu')
-
           $build = Join-Path $probe 'build'
-          cmake -G "Visual Studio 18 2026" -A x64 -T "cuda=$env:CUDA_PATH" -S $probe -B $build
-          if ($LASTEXITCODE -ne 0) {
-              $log = Join-Path $build 'CMakeFiles\CMakeConfigureLog.yaml'
-              if (Test-Path $log) { Get-Content $log -Tail 240 }
-              throw "CUDA CMake compiler probe configure failed"
-          }
-          cmake --build $build --config Release --parallel --verbose
-          if ($LASTEXITCODE -ne 0) { throw "CUDA CMake compiler probe build failed" }
-          if (-Not (Test-Path (Join-Path $build 'Release\cuda_probe.exe'))) {
-              throw "CUDA CMake compiler probe did not produce cuda_probe.exe"
-          }
-          Write-Host "OK: CMake + VS 2026 + CUDA 13.2 compiler probe passed."
+          python tools/ci/run-with-diagnostics.py --label "Windows CUDA compiler probe configure" --log ci-logs/windows-cuda-probe-configure.log -- cmake -G Ninja -S $probe -B $build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl.exe `
+            -DCMAKE_CXX_COMPILER=cl.exe `
+            -DCMAKE_CUDA_COMPILER="$nvcc" `
+            -DCMAKE_CUDA_HOST_COMPILER="$cl" `
+            -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/ci/run-with-diagnostics.py --label "Windows CUDA compiler probe build" --log ci-logs/windows-cuda-probe-build.log -- cmake --build $build --parallel 2 --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-Not (Test-Path (Join-Path $build 'cuda_probe.exe'))) { throw "CUDA probe did not produce cuda_probe.exe" }
+          Write-Host "CUDA_NINJA_PROBE_PASS host=$cl nvcc=$nvcc"
 
       - name: Cache Crow/Asio headers
         uses: actions/cache@v6
@@ -404,7 +557,7 @@ jobs:
             build/_deps/asio-include
           key: crow-asio-${{ runner.os }}-crow1.3.4-ae0fef0-asio1.30.2
 
-      - name: Parchear CMakeLists.txt para CUDA
+      - name: Prepare Crow/Asio for CUDA
         shell: pwsh
         run: pwsh -File patch-cmake-cuda.ps1
 
@@ -412,17 +565,29 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python --version
-          if ($LASTEXITCODE -ne 0) { throw "Python not available" }
           python tools/embed_tokenizer.py tokenizer.json src/tokenizer_data.cpp src/tokenizer_data.h
           if ($LASTEXITCODE -ne 0) { throw "tokenizer embedding failed" }
-          Write-Host "Embedded tokenizer source size: $([math]::Round((Get-Item src/tokenizer_data.cpp).Length/1MB,2)) MB"
-      - name: CMake Configure (CUDA)
+
+      - name: CMake Configure (CUDA, Ninja)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          cmake -G "Visual Studio 18 2026" -A x64 -T "cuda=$env:CUDA_PATH" -B build -S . `
+          & "$env:VS2026_PATH\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          if ($LASTEXITCODE -ne 0) { throw "Launch-VsDevShell failed" }
+          $cl = (Get-Command cl.exe -ErrorAction Stop).Source
+          $nvcc = Join-Path $env:CUDA_PATH 'bin\nvcc.exe'
+          $crow = (Resolve-Path 'build\_deps\crow-include').Path
+          $asio = (Resolve-Path 'build\_deps\asio-include').Path
+          python tools/ci/run-with-diagnostics.py --label "Windows CUDA configure" --log ci-logs/windows-cuda-configure.log -- cmake -G Ninja -B build-cuda -S . `
             -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl.exe `
+            -DCMAKE_CXX_COMPILER=cl.exe `
+            -DCMAKE_CUDA_COMPILER="$nvcc" `
+            -DCMAKE_CUDA_HOST_COMPILER="$cl" `
+            -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static `
+            -DS2_CROW_INCLUDE_DIR="$crow" `
+            -DS2_ASIO_INCLUDE_DIR="$asio" `
             -DS2_CUDA=ON `
             -DGGML_CUDA=ON `
             -DS2_VULKAN=OFF `
@@ -430,42 +595,29 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF `
             -DGGML_AVX2=ON `
             -DGGML_STATIC=ON `
-            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static `
             -DGGML_NATIVE=OFF `
             -DGGML_AVX512=OFF `
             -DGGML_VULKAN_FLASH_ATTENTION=OFF
-          if ($LASTEXITCODE -ne 0) {
-              $log = 'build\CMakeFiles\CMakeConfigureLog.yaml'
-              if (Test-Path $log) {
-                  Write-Host "--- tail of CMakeConfigureLog.yaml ---"
-                  Get-Content $log -Tail 300
-              }
-              Get-ChildItem 'build\CMakeFiles' -Recurse -File -ErrorAction SilentlyContinue |
-                  Where-Object { $_.FullName -match 'CompilerIdCUDA|\.tlog$|CUDA' } |
-                  Select-Object -First 80 -ExpandProperty FullName |
-                  ForEach-Object { Write-Host $_ }
-              throw "CMake CUDA configure failed"
-          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: CMake Build (CUDA)
+      - name: CMake Build (CUDA, Ninja)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          cmake --build build --config Release --parallel --verbose
-          if ($LASTEXITCODE -ne 0) { throw "CUDA build failed" }
+          & "$env:VS2026_PATH\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          if ($LASTEXITCODE -ne 0) { throw "Launch-VsDevShell failed" }
+          python tools/ci/run-with-diagnostics.py --label "Windows CUDA build" --log ci-logs/windows-cuda-build.log -- cmake --build build-cuda --parallel 2 --verbose
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify CUDA core and native launcher
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $core = "build\Release\s2-cuda-core.exe"
-          $launcher = "build\Release\s2-cuda-launcher.exe"
+          $core = "build-cuda\s2-cuda-core.exe"
+          $launcher = "build-cuda\s2-cuda-launcher.exe"
           if (-Not (Test-Path $core)) { throw "s2-cuda-core.exe was not generated" }
           if (-Not (Test-Path $launcher)) { throw "s2-cuda-launcher.exe was not generated" }
-
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot = & $vswhere -latest -products * -version '[18.0,19.0)' -property installationPath
-          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop |
+          $dumpbin = Get-ChildItem "$env:VS2026_PATH\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop |
                      Sort-Object FullName -Descending | Select-Object -First 1
           function Get-Deps([string]$file) {
             @(& $dumpbin.FullName /dependents $file | Select-String -Pattern '^\s+\S+\.dll\s*$' | ForEach-Object { $_.ToString().Trim().ToLowerInvariant() })
@@ -475,33 +627,20 @@ jobs:
           Write-Host "--- CUDA core imports ---"; $coreDeps | ForEach-Object { Write-Host "  $_" }
           Write-Host "--- launcher imports ---"; $launcherDeps | ForEach-Object { Write-Host "  $_" }
           if ($coreDeps -contains 'vulkan-1.dll') { throw "CUDA core unexpectedly imports vulkan-1.dll" }
-          if ($coreDeps | Where-Object { $_ -match '^(vcruntime|msvcp|concrt)' }) {
-            throw "CUDA core unexpectedly depends on a dynamic MSVC CRT: $($coreDeps -join ', ')"
-          }
-          if ($coreDeps | Where-Object { $_ -like 'vcomp*.dll' }) {
-            Write-Host "INFO: CUDA core uses MSVC OpenMP; VCOMP will be embedded in the outer single-file payload."
-          }
-          if (-Not ($coreDeps | Where-Object { $_ -eq 'nvcuda.dll' -or $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' })) {
-            throw "CUDA core has no CUDA import evidence"
-          }
-          if ($launcherDeps | Where-Object { $_ -eq 'nvcuda.dll' -or $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' -or $_ -like 'nvrtc*.dll' }) {
-            throw "Outer launcher must not import CUDA libraries: $($launcherDeps -join ', ')"
-          }
-          if ($launcherDeps | Where-Object { $_ -match '^(vcruntime|msvcp|vcomp)' }) {
-            throw "Outer launcher is not CRT-single-file: $($launcherDeps -join ', ')"
-          }
+          if ($coreDeps | Where-Object { $_ -match '^(vcruntime|msvcp|concrt)' }) { throw "CUDA core unexpectedly depends on dynamic MSVC CRT: $($coreDeps -join ', ')" }
+          if (-Not ($coreDeps | Where-Object { $_ -eq 'nvcuda.dll' -or $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' })) { throw "CUDA core has no CUDA import evidence" }
+          if ($launcherDeps | Where-Object { $_ -eq 'nvcuda.dll' -or $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' -or $_ -like 'nvrtc*.dll' }) { throw "Outer launcher must not import CUDA libraries: $($launcherDeps -join ', ')" }
+          if ($launcherDeps | Where-Object { $_ -match '^(vcruntime|msvcp|vcomp)' }) { throw "Outer launcher is not CRT-single-file: $($launcherDeps -join ', ')" }
+
       - name: Build single-file CUDA container
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $core = (Resolve-Path "build\Release\s2-cuda-core.exe").Path
-          $launcher = (Resolve-Path "build\Release\s2-cuda-launcher.exe").Path
+          $core = (Resolve-Path "build-cuda\s2-cuda-core.exe").Path
+          $launcher = (Resolve-Path "build-cuda\s2-cuda-launcher.exe").Path
           $cudaBin = Join-Path $env:CUDA_PATH 'bin'
           if (-Not (Test-Path $cudaBin)) { throw "CUDA bin does not exist: $cudaBin" }
-
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot = & $vswhere -latest -products * -version '[18.0,19.0)' -property installationPath
-          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop |
+          $dumpbin = Get-ChildItem "$env:VS2026_PATH\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop |
                      Sort-Object FullName -Descending | Select-Object -First 1
           function Get-PeDependencies([string]$file) {
             @(& $dumpbin.FullName /dependents $file | Select-String -Pattern '^\s+\S+\.dll\s*$' | ForEach-Object { $_.ToString().Trim() })
@@ -516,7 +655,8 @@ jobs:
           $copied = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
           $missing = [System.Collections.Generic.List[string]]::new()
 
-          # cuBLAS may load cuBLASLt dynamically; seed the transitive closure.
+          # cuBLAS may load cuBLASLt dynamically, so seed it explicitly and then
+          # walk imports recursively. Toolkit DLLs win over polluted System32.
           Get-ChildItem $cudaBin -Filter 'cublasLt64_*.dll' -ErrorAction SilentlyContinue | ForEach-Object {
             if ($copied.Add($_.Name)) { Copy-Item $_.FullName (Join-Path cuda-payload $_.Name); $queue.Enqueue($_.FullName) }
           }
@@ -524,12 +664,10 @@ jobs:
             $current = $queue.Dequeue(); if (-Not $seen.Add($current)) { continue }
             foreach ($dep in (Get-PeDependencies $current)) {
               $low = $dep.ToLowerInvariant()
-              if ($low -eq 'nvcuda.dll') { continue } # driver-owned; never redistribute
+              if ($low -eq 'nvcuda.dll') { continue }
               if ($low -like 'api-ms-win-*' -or $low -like 'ext-ms-win-*') { continue }
               if ($low -like 'vcomp*.dll') {
-                # /MT does not make MSVC OpenMP static. Microsoft documents VCOMP
-                # as redistributable from VC\Redist; embed it beside the extracted core.
-                $vcDll = Get-ChildItem (Join-Path $vsRoot 'VC\Redist\MSVC') -Recurse -File -Filter $dep -ErrorAction SilentlyContinue |
+                $vcDll = Get-ChildItem (Join-Path $env:VS2026_PATH 'VC\Redist\MSVC') -Recurse -File -Filter $dep -ErrorAction SilentlyContinue |
                          Where-Object { $_.FullName -match '\\x64\\' -and $_.FullName -notmatch 'debug_nonredist|onecore' } |
                          Sort-Object FullName -Descending | Select-Object -First 1
                 if ($vcDll) {
@@ -539,10 +677,6 @@ jobs:
                 $missing.Add("$dep (MSVC OpenMP runtime required by $([IO.Path]::GetFileName($current)))")
                 continue
               }
-              # Prefer Toolkit redistributables over anything coincidentally present
-              # in this runner's System32. Otherwise a polluted CI image could make
-              # the bundle omit cuBLAS/nvrtc/etc. and produce an artifact that only
-              # works on the runner that built it. nvcuda.dll was excluded above.
               $cudaDll = Join-Path $cudaBin $dep
               if (Test-Path $cudaDll) {
                 if ($copied.Add($dep)) { Copy-Item $cudaDll (Join-Path cuda-payload $dep); $queue.Enqueue($cudaDll) }
@@ -555,27 +689,61 @@ jobs:
           if ($missing.Count) { throw "Unresolved non-system dependencies: $((($missing | Sort-Object -Unique) -join ', '))" }
           if (Test-Path cuda-payload\nvcuda.dll) { throw "nvcuda.dll must never be bundled" }
 
-          python tools/cuda_bundle.py --launcher $launcher --payload-dir cuda-payload --output release-cuda\s2-cuda.exe
+          python tools/cuda_bundle.py --launcher $launcher --payload-dir cuda-payload --output release-cuda\s2-windows-cuda-x86-64.exe
           if ($LASTEXITCODE -ne 0) { throw "CUDA bundler failed" }
-          $outer = (Resolve-Path release-cuda\s2-cuda.exe).Path
+          $outer = (Resolve-Path release-cuda\s2-windows-cuda-x86-64.exe).Path
           $outerDeps = Get-PeDependencies $outer | ForEach-Object { $_.ToLowerInvariant() }
-          if ($outerDeps | Where-Object { $_ -eq 'nvcuda.dll' -or $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' -or $_ -like 'nvrtc*.dll' }) {
-            throw "Final outer s2-cuda.exe imports CUDA: $($outerDeps -join ', ')"
-          }
+          if ($outerDeps | Where-Object { $_ -eq 'nvcuda.dll' -or $_ -like 'cublas*.dll' -or $_ -like 'cudart*.dll' -or $_ -like 'nvrtc*.dll' }) { throw "Final outer s2-windows-cuda-x86-64.exe imports CUDA: $($outerDeps -join ', ')" }
+
+          # Exercise the final container parser before upload. This path does not
+          # require a GPU: it validates the appended manifest/payload and reports it.
+          $runtimeInfo = @(& $outer --runtime-info 2>&1 | ForEach-Object { $_.ToString() })
+          if ($LASTEXITCODE -ne 0) { throw "Final s2-windows-cuda-x86-64.exe --runtime-info validation failed" }
+          $runtimeText = $runtimeInfo -join "`n"
+          Write-Host $runtimeText
+          if ($runtimeText -notmatch '(?m)^payload_files:\s+[1-9][0-9]*\s*$') { throw "CUDA runtime-info did not report a non-empty payload" }
+          if ($runtimeText -notmatch '(?m)^\s+s2-cuda-core\.exe\s+') { throw "CUDA runtime-info is missing s2-cuda-core.exe" }
+          if ($runtimeText -match '(?im)^\s+nvcuda\.dll\s+') { throw "CUDA runtime-info reports forbidden nvcuda.dll payload" }
+
           $files = @(Get-ChildItem release-cuda -File)
-          if ($files.Count -ne 1 -or $files[0].Name -ne 's2-cuda.exe') { throw "CUDA artifact must contain exactly one s2-cuda.exe" }
-          Write-Host "OK: single-file CUDA artifact built; nvcuda.dll is supplied by the NVIDIA driver."
-      - name: Subir artifact CUDA
+          if ($files.Count -ne 1 -or $files[0].Name -ne 's2-windows-cuda-x86-64.exe') { throw "CUDA artifact must contain exactly one s2-windows-cuda-x86-64.exe" }
+          Write-Host "OK: single-file CUDA artifact built and self-validated; nvcuda.dll is supplied by the NVIDIA driver."
+
+      - name: Verify non-empty direct artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $f = Get-Item 'release-cuda/s2-windows-cuda-x86-64.exe'
+          if ($f.Length -le 0) { throw "Direct artifact is empty: $($f.FullName)" }
+
+      - name: Upload CUDA artifact
         uses: actions/upload-artifact@v7
         with:
-          name: s2-windows-cuda
-          path: release-cuda/
+          name: s2-windows-cuda-x86-64.exe
+          path: release-cuda/s2-windows-cuda-x86-64.exe
           if-no-files-found: error
-          retention-days: 30
+          archive: false
+
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: pwsh
+        run: python tools/ci/collect-crash-report.py --label "Windows CUDA" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-cuda-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   build-cpu:
     name: Windows Server 2025 - VS 2026 - CPU only
     runs-on: windows-2025-vs2026
+    needs: preflight
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -615,7 +783,7 @@ jobs:
 
       - name: Prepare portable CMake/Crow
         shell: pwsh
-        run: pwsh -File patch-cmake.ps1
+        run: pwsh -File patch-cmake.ps1 -SkipVulkanPortabilityPatch
 
       - name: Generate byte-exact embedded tokenizer
         shell: pwsh
@@ -630,8 +798,12 @@ jobs:
       - name: CMake Configure (CPU only)
         shell: pwsh
         run: |
-          cmake -G "Visual Studio 18 2026" -A x64 -B build-cpu -S . `
+          $crow = (Resolve-Path 'build\_deps\crow-include').Path
+          $asio = (Resolve-Path 'build\_deps\asio-include').Path
+          python tools/ci/run-with-diagnostics.py --label "Windows CPU configure" --log ci-logs/windows-cpu-configure.log -- cmake -G "Visual Studio 18 2026" -A x64 -B build-cpu -S . `
             -DCMAKE_BUILD_TYPE=Release `
+            -DS2_CROW_INCLUDE_DIR="$crow" `
+            -DS2_ASIO_INCLUDE_DIR="$asio" `
             -DS2_VULKAN=OFF `
             -DS2_CUDA=OFF `
             -DS2_METAL=OFF `
@@ -644,7 +816,7 @@ jobs:
 
       - name: CMake Build (CPU only)
         shell: pwsh
-        run: cmake --build build-cpu --config Release --parallel
+        run: python tools/ci/run-with-diagnostics.py --label "Windows CPU build" --log ci-logs/windows-cpu-build.log -- cmake --build build-cpu --config Release --parallel 4
 
       - name: Verify CPU-only executable
         shell: pwsh
@@ -681,29 +853,53 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release-cpu | Out-Null
-          Copy-Item build-cpu\Release\s2-cpu.exe release-cpu\s2-cpu.exe
+          Copy-Item build-cpu\Release\s2-cpu.exe release-cpu\s2-windows-cpu-x86-64.exe
           if (Test-Path release-cpu\tokenizer.json) { Remove-Item release-cpu\tokenizer.json -Force }
           $files = @(Get-ChildItem release-cpu -File)
-          if ($files.Count -ne 1 -or $files[0].Name -ne 's2-cpu.exe') {
-              throw "CPU artifact must contain exactly one s2-cpu.exe"
+          if ($files.Count -ne 1 -or $files[0].Name -ne 's2-windows-cpu-x86-64.exe') {
+              throw "CPU artifact must contain exactly one s2-windows-cpu-x86-64.exe"
           }
           Write-Host "OK: tokenizer is embedded; CPU artifact contains only s2-cpu.exe"
+
+      - name: Verify non-empty direct artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $f = Get-Item 'release-cpu/s2-windows-cpu-x86-64.exe'
+          if ($f.Length -le 0) { throw "Direct artifact is empty: $($f.FullName)" }
 
       - name: Upload CPU artifact
         uses: actions/upload-artifact@v7
         with:
-          name: s2-windows-cpu
-          path: release-cpu/
+          name: s2-windows-cpu-x86-64.exe
+          path: release-cpu/s2-windows-cpu-x86-64.exe
           if-no-files-found: error
-          retention-days: 30
+          archive: false
 
 
   # Keep JavaScript Actions on the modern Ubuntu host and run only native
   # compilation inside old-glibc containers. Making the whole job use a
   # glibc-2.17 container could break Node 24 Actions before compilation starts.
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: pwsh
+        run: python tools/ci/collect-crash-report.py --label "Windows CPU" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-cpu-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
   build-linux-cpu:
     name: Linux x86_64 - portable CPU (glibc 2.17)
     runs-on: ubuntu-24.04
+    needs: preflight
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -726,29 +922,55 @@ jobs:
           image=quay.io/pypa/manylinux2014_x86_64
           docker pull "$image"
           docker image inspect "$image" --format 'RepoDigests={{json .RepoDigests}}'
-          docker run --rm --platform linux/amd64 \
-            -v "$PWD:/src" -w /src \
-            "$image" \
-            /bin/bash -lc 'cat /etc/os-release; ldd --version | sed -n '1p'; gcc --version | sed -n '1p'; tar --version | sed -n '1p'; bash tools/ci/build-linux-portable.sh cpu'
+          python3 tools/ci/run-with-diagnostics.py --label "Linux CPU portable build" --log ci-logs/linux-cpu-build.log -- \
+            docker run --rm --platform linux/amd64 \
+              -e S2_BUILD_JOBS=3 \
+              -v "$PWD:/src" -w /src \
+              "$image" \
+              /bin/bash -lc 'cat /etc/os-release; ldd --version | sed -n '1p'; gcc --version | sed -n '1p'; tar --version | sed -n '1p'; bash tools/ci/build-linux-portable.sh cpu'
 
       - name: Inspect CPU release
         shell: bash
         run: |
           set -euo pipefail
-          tar -tzvf s2-linux-x86_64-cpu.tar.gz
-          test -x release-linux-cpu/s2-cpu
+          test -x s2-linux-cpu-x86-64
+          test "$(find . -maxdepth 1 -type f -name 's2-linux-cpu-x86-64' | wc -l | tr -d ' ')" = 1
+          ./s2-linux-cpu-x86-64 --runtime-info
+
+      - name: Verify non-empty direct artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s s2-linux-cpu-x86-64
 
       - name: Upload Linux CPU artifact
         uses: actions/upload-artifact@v7
         with:
-          name: s2-linux-x86_64-cpu
-          path: s2-linux-x86_64-cpu.tar.gz
+          name: s2-linux-cpu-x86-64
+          path: s2-linux-cpu-x86-64
           if-no-files-found: error
-          retention-days: 30
+          archive: false
+
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: bash
+        run: python3 tools/ci/collect-crash-report.py --label "Linux CPU" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-cpu-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   build-linux-vulkan:
     name: Linux x86_64 - portable Vulkan (glibc 2.17)
     runs-on: ubuntu-24.04
+    needs: preflight
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -771,37 +993,61 @@ jobs:
           image=quay.io/pypa/manylinux2014_x86_64
           docker pull "$image"
           docker image inspect "$image" --format 'RepoDigests={{json .RepoDigests}}'
-          docker run --rm --platform linux/amd64 \
-            -v "$PWD:/src" -w /src \
-            "$image" \
-            /bin/bash -lc '
-              set -euo pipefail
-              cat /etc/os-release
-              ldd --version | sed -n '1p'
-              gcc --version | sed -n '1p'
-              tar --version | sed -n '1p'
-              bash tools/ci/build-linux-portable.sh vulkan
-            '
+          python3 tools/ci/run-with-diagnostics.py --label "Linux Vulkan portable build" --log ci-logs/linux-vulkan-build.log -- \
+            docker run --rm --platform linux/amd64 \
+              -e S2_BUILD_JOBS=3 \
+              -v "$PWD:/src" -w /src \
+              "$image" \
+              /bin/bash -lc '
+                set -euo pipefail
+                cat /etc/os-release
+                ldd --version | sed -n '1p'
+                gcc --version | sed -n '1p'
+                tar --version | sed -n '1p'
+                bash tools/ci/build-linux-portable.sh vulkan
+              '
 
       - name: Inspect Vulkan release
         shell: bash
         run: |
           set -euo pipefail
-          tar -tzvf s2-linux-x86_64-vulkan.tar.gz
-          test -x release-linux-vulkan/s2-vulkan
-          test -f release-linux-vulkan/libvulkan.so.1
+          test -x s2-linux-vulkan-x86-64
+          ./s2-linux-vulkan-x86-64 --runtime-info
+
+      - name: Verify non-empty direct artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s s2-linux-vulkan-x86-64
 
       - name: Upload Linux Vulkan artifact
         uses: actions/upload-artifact@v7
         with:
-          name: s2-linux-x86_64-vulkan
-          path: s2-linux-x86_64-vulkan.tar.gz
+          name: s2-linux-vulkan-x86-64
+          path: s2-linux-vulkan-x86-64
           if-no-files-found: error
-          retention-days: 30
+          archive: false
+
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: bash
+        run: python3 tools/ci/collect-crash-report.py --label "Linux Vulkan" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-vulkan-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   build-linux-cuda:
     name: Linux x86_64 - CUDA 13.2 / Rocky 8 baseline (glibc 2.28)
     runs-on: ubuntu-24.04
+    needs: preflight
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -824,50 +1070,86 @@ jobs:
           image=nvidia/cuda:13.2.0-devel-rockylinux8
           docker pull "$image"
           docker image inspect "$image" --format 'RepoDigests={{json .RepoDigests}}'
-          docker run --rm --platform linux/amd64 \
-            -v "$PWD:/src" -w /src \
-            "$image" /bin/bash -lc '
-              set -euo pipefail
-              cat /etc/os-release
-              ldd --version | sed -n '1p'
-              dnf -y install python39 python39-pip make file binutils gcc gcc-c++ >/dev/null
-              python3.9 -m pip install --no-cache-dir "cmake==4.4.3" >/dev/null
-              export PATH="/usr/local/bin:$PATH"
-              gcc --version | sed -n '1p'
-              nvcc --version
-              cmake --version
-              bash tools/ci/build-linux-portable.sh cuda
-            '
+          python3 tools/ci/run-with-diagnostics.py --label "Linux CUDA portable build" --log ci-logs/linux-cuda-build.log -- \
+            docker run --rm --platform linux/amd64 \
+              -e S2_BUILD_JOBS=2 \
+              -v "$PWD:/src" -w /src \
+              "$image" /bin/bash -lc '
+                set -euo pipefail
+                cat /etc/os-release
+                ldd --version | sed -n '1p'
+                dnf -y install python39 python39-pip make file binutils gcc gcc-c++ >/dev/null
+                python3.9 -m pip install --no-cache-dir "cmake==4.4.3" >/dev/null
+                export PATH="/usr/local/bin:$PATH"
+                gcc --version | sed -n '1p'
+                nvcc --version
+                cmake --version
+                bash tools/ci/build-linux-portable.sh cuda
+              '
 
       - name: Inspect CUDA release
         shell: bash
         run: |
           set -euo pipefail
-          tar -tzvf s2-linux-x86_64-cuda.tar.gz
-          test -x release-linux-cuda/s2-cuda
+          test -x s2-linux-cuda-x86-64
+          ./s2-linux-cuda-x86-64 --runtime-info
           cuda_dynamic="$(readelf -d release-linux-cuda/s2-cuda)"
-          if grep -Eq 'lib(cudart|cublas|cublasLt|nvJitLink)\\.so' <<<"$cuda_dynamic"; then
+          if grep -Eq 'lib(cudart|cublas|cublasLt|nvJitLink)\.so' <<<"$cuda_dynamic"; then
             echo 'CUDA Toolkit shared library unexpectedly leaked into Linux release' >&2
             exit 1
           fi
 
+      - name: Verify non-empty direct artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s s2-linux-cuda-x86-64
+
       - name: Upload Linux CUDA artifact
         uses: actions/upload-artifact@v7
         with:
-          name: s2-linux-x86_64-cuda
-          path: s2-linux-x86_64-cuda.tar.gz
+          name: s2-linux-cuda-x86-64
+          path: s2-linux-cuda-x86-64
           if-no-files-found: error
-          retention-days: 30
+          archive: false
+
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: bash
+        run: python3 tools/ci/collect-crash-report.py --label "Linux CUDA" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-cuda-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   build-metal:
     name: macOS arm64 - Clang - Metal
     runs-on: macos-15
+    needs: preflight
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      - name: Pin Xcode 16.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d /Applications/Xcode_16.4.app/Contents/Developer
+          test "$(uname -m)" = "arm64"
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+          xcrun --show-sdk-path
+          xcrun --sdk macosx --show-sdk-version
 
       - name: Verificar toolchain Metal
         shell: bash
@@ -916,7 +1198,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmake -B build-metal -S . \
+          python3 tools/ci/run-with-diagnostics.py --label "macOS Metal configure" --log ci-logs/macos-metal-configure.log -- cmake -B build-metal -S . \
             -DCMAKE_BUILD_TYPE=Release \
             -DS2_VULKAN=OFF \
             -DS2_CUDA=OFF \
@@ -932,7 +1214,7 @@ jobs:
 
       - name: CMake Build (Metal)
         shell: bash
-        run: cmake --build build-metal --parallel
+        run: python3 tools/ci/run-with-diagnostics.py --label "macOS Metal build" --log ci-logs/macos-metal-build.log -- cmake --build build-metal --parallel 2
 
       - name: Verify Metal executable
         shell: bash
@@ -959,126 +1241,809 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          rm -rf release-metal
           mkdir -p release-metal
-          cp build-metal/s2-metal release-metal/s2-metal
-          chmod +x release-metal/s2-metal
-          test "$(find release-metal -maxdepth 1 -type f | wc -l | tr -d ' ')" = "1"
-          # Run ditto from inside the staging directory. --keepParent then keeps
-          # only the basename s2-metal (not release-metal/) and preserves mode bits.
-          (cd release-metal && ditto -c -k --norsrc --keepParent s2-metal ../s2-macos-metal.zip)
-          echo "--- Metal ZIP contents ---"
-          unzip -l s2-macos-metal.zip
-          zip_entries="$(unzip -Z1 s2-macos-metal.zip | sed '/^$/d')"
-          test "$zip_entries" = "s2-metal"
-          rm -rf verify-metal-zip
-          mkdir verify-metal-zip
-          ditto -x -k s2-macos-metal.zip verify-metal-zip
-          echo "--- Extracted Metal ZIP ---"
-          find verify-metal-zip -maxdepth 2 -print
-          test -f verify-metal-zip/s2-metal
-          test -x verify-metal-zip/s2-metal
-          test "$(find verify-metal-zip -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = "1"
+          cp build-metal/s2-metal release-metal/s2-macos-metal-arm64
+          chmod +x release-metal/s2-macos-metal-arm64
+          test "$(find release-metal -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = "1"
+          test -x release-metal/s2-macos-metal-arm64
+
+      - name: Verify non-empty direct artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s release-metal/s2-macos-metal-arm64
 
       - name: Upload Metal artifact
         uses: actions/upload-artifact@v7
         with:
-          name: s2-macos-metal
-          path: s2-macos-metal.zip
+          name: s2-macos-metal-arm64
+          path: release-metal/s2-macos-metal-arm64
           if-no-files-found: error
-          retention-days: 30
+          archive: false
+
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: bash
+        run: python3 tools/ci/collect-crash-report.py --label "macOS Metal" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-metal-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build-windows-amd:
+    name: Windows Server 2025 - AMD (ROCm/HIP 7.14.1)
+    runs-on: windows-2025-vs2026
+    needs: preflight
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Verify Windows ROCm runner image
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion"
+          Write-Host "RUNNER_ARCH=$env:RUNNER_ARCH RUNNER_NAME=$env:RUNNER_NAME"
+          if ($env:RUNNER_ARCH -ne 'X64') { throw "Windows ROCm build requires an x64 runner, got $env:RUNNER_ARCH" }
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw "cmake --version failed" }
+          ninja --version
+          if ($LASTEXITCODE -ne 0) { throw "ninja --version failed" }
+
+      - name: Setup Python 3.12 for ROCm wheels
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          check-latest: false
+
+      - name: Prepare Crow/Asio
+        shell: pwsh
+        run: pwsh -File patch-cmake.ps1 -SkipVulkanPortabilityPatch
+
+      - name: Generate embedded tokenizer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python tools/embed_tokenizer.py tokenizer.json src/tokenizer_data.cpp src/tokenizer_data.h
+          if ($LASTEXITCODE -ne 0) { throw "tokenizer embedding failed" }
+
+      - name: Install ROCm SDK 7.14.1 build dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --disable-pip-version-check --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel,device-gfx1030,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103,device-gfx1150,device-gfx1151,device-gfx1152,device-gfx1153,device-gfx1200,device-gfx1201]==7.14.1"
+          if ($LASTEXITCODE -ne 0) { throw "ROCm pip SDK install failed" }
+          $scripts = python -c "import sysconfig; print(sysconfig.get_path('scripts'))"
+          if ($LASTEXITCODE -ne 0 -or -Not $scripts) { throw "Unable to resolve Python scripts directory" }
+          $env:PATH = "$scripts;$env:PATH"
+          rocm-sdk init
+          if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed" }
+          rocm-sdk targets
+          if ($LASTEXITCODE -ne 0) { throw "rocm-sdk targets failed" }
+          $rocm = (& rocm-sdk path --root).Trim()
+          $cmakePrefix = (& rocm-sdk path --cmake).Trim()
+          $rocmBin = (& rocm-sdk path --bin).Trim()
+          if ($LASTEXITCODE -ne 0 -or -Not $rocm -or -Not (Test-Path $rocm)) { throw "rocm-sdk path --root failed" }
+          if (-Not $cmakePrefix -or -Not (Test-Path $cmakePrefix)) { throw "rocm-sdk path --cmake failed: $cmakePrefix" }
+          if (-Not $rocmBin -or -Not (Test-Path $rocmBin)) { throw "rocm-sdk path --bin failed: $rocmBin" }
+          $llvmBin = Join-Path $rocm 'lib\llvm\bin'
+          $clang = Join-Path $llvmBin 'clang++.exe'
+          if (-Not (Test-Path $clang)) { throw "ROCm clang++.exe not found: $clang" }
+          $deviceLib = Join-Path $rocm 'lib\llvm\amdgcn\bitcode'
+          if (-Not (Test-Path (Join-Path $deviceLib 'oclc_abi_version_400.bc'))) { throw "ROCm device bitcode missing: $deviceLib" }
+          "ROCM_PATH=$rocm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HIP_PATH=$rocm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HIP_PLATFORM=amd" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HIP_DEVICE_LIB_PATH=$deviceLib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ROCM_LLVM_BIN=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ROCM_BIN=$rocmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ROCM_CMAKE_PREFIX=$cmakePrefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "ROCM_PATH=$rocm"
+          Write-Host "ROCM_BIN=$rocmBin"
+          Write-Host "CMAKE_PREFIX_PATH=$cmakePrefix"
+          Write-Host "HIP_DEVICE_LIB_PATH=$deviceLib"
+          Get-PSDrive -Name C | Format-Table Name,Used,Free -AutoSize
+
+      - name: Probe Windows ROCm HIP compiler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force ci-probes | Out-Null
+          @('#include <hip/hip_runtime.h>', '__global__ void s2_probe_kernel(int *p) { if (threadIdx.x == 0) *p = 1; }', 'int main() { return 0; }') | Set-Content -Encoding utf8 ci-probes/hip-smoke.cpp
+          $clangxx = Join-Path $env:ROCM_LLVM_BIN 'clang++.exe'
+          $env:PATH = "$env:ROCM_BIN;$env:ROCM_LLVM_BIN;$env:PATH"
+          python tools/ci/run-with-diagnostics.py --label "Windows ROCm compiler probe" --log ci-logs/windows-rocm-compiler-probe.log -- `
+            $clangxx -x hip --offload-arch=gfx1030 --offload-arch=gfx1153 --offload-arch=gfx1201 `
+            -c ci-probes/hip-smoke.cpp -o ci-probes/hip-smoke.obj
+          if (-Not (Test-Path ci-probes/hip-smoke.obj -PathType Leaf)) { throw "Windows ROCm compiler probe did not produce an object" }
+
+      - name: Configure Windows ROCm
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $crow = (Resolve-Path 'build\_deps\crow-include').Path
+          $asio = (Resolve-Path 'build\_deps\asio-include').Path
+          $clang = Join-Path $env:ROCM_LLVM_BIN 'clang.exe'
+          $clangxx = Join-Path $env:ROCM_LLVM_BIN 'clang++.exe'
+          if (-Not (Test-Path $clang) -or -Not (Test-Path $clangxx)) { throw "ROCm clang toolchain missing under $env:ROCM_LLVM_BIN" }
+          $env:PATH = "$env:ROCM_BIN;$env:ROCM_LLVM_BIN;$env:PATH"
+          python tools/ci/run-with-diagnostics.py --label "Windows ROCm configure" --log ci-logs/windows-rocm-configure.log -- cmake -G Ninja -B build-rocm -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$clang" `
+            -DCMAKE_CXX_COMPILER="$clangxx" `
+            -DCMAKE_HIP_COMPILER="$clang" `
+            -DCMAKE_PREFIX_PATH="$env:ROCM_CMAKE_PREFIX" `
+            -DS2_CROW_INCLUDE_DIR="$crow" `
+            -DS2_ASIO_INCLUDE_DIR="$asio" `
+            -DS2_HIP=ON -DS2_VULKAN=OFF -DS2_CUDA=OFF -DS2_METAL=OFF `
+            -DGGML_HIP=ON -DGGML_STATIC=OFF -DGGML_NATIVE=OFF -DGGML_AVX512=OFF `
+            "-DGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
+
+      - name: Build Windows ROCm
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:PATH = "$env:ROCM_BIN;$env:ROCM_LLVM_BIN;$env:PATH"
+          python tools/ci/run-with-diagnostics.py --label "Windows ROCm build" --log ci-logs/windows-rocm-build.log -- cmake --build build-rocm --parallel 2 --verbose
+
+      - name: Package and audit Windows ROCm runtime closure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = 'build-rocm\s2-amd-core.exe'
+          $launcher = 'build-rocm\s2-amd-launcher.exe'
+          if (-Not (Test-Path $exe)) { throw "s2-amd-core.exe not generated" }
+          if (-Not (Test-Path $launcher)) { throw "s2-amd-launcher.exe not generated" }
+          Remove-Item release-rocm -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force release-rocm | Out-Null
+          Copy-Item $exe release-rocm\s2-amd-core.exe
+
+          # HIP cannot be linked fully static in current GGML. Ship every GGML
+          # DLL produced by this build, then resolve its ROCm DLL imports recursively.
+          $ggmlDlls = @(Get-ChildItem build-rocm -Recurse -File -Filter '*.dll' | Where-Object { $_.Name -match '^ggml.*\.dll$' })
+          if (-Not ($ggmlDlls | Where-Object { $_.Name -match '^ggml-hip.*\.dll$' })) { throw "GGML HIP DLL was not produced" }
+          foreach ($dll in $ggmlDlls) { Copy-Item $dll.FullName (Join-Path release-rocm $dll.Name) -Force }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-Not $vsRoot) { throw "Visual Studio C++ tools not found while auditing ROCm package" }
+          $dumpbin = Get-ChildItem "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop |
+                     Sort-Object FullName -Descending | Select-Object -First 1
+          function Get-Deps([string]$file) {
+            @(& $dumpbin.FullName /dependents $file | Select-String -Pattern '^\s+\S+\.dll\s*$' | ForEach-Object { $_.ToString().Trim() })
+          }
+          $system = Join-Path $env:WINDIR 'System32'
+          # Prefer the canonical merged ROCm bin tree. Fall back to the SDK root
+          # only for DLLs that are not exposed there.
+          $rocmDlls = @()
+          $rocmDlls += @(Get-ChildItem $env:ROCM_BIN -Recurse -File -Filter '*.dll' -ErrorAction Stop)
+          $rocmDlls += @(Get-ChildItem $env:ROCM_PATH -Recurse -File -Filter '*.dll' -ErrorAction Stop)
+          $rocmByName = @{}
+          foreach ($dll in $rocmDlls) {
+            $key = $dll.Name.ToLowerInvariant()
+            if (-Not $rocmByName.ContainsKey($key)) { $rocmByName[$key] = $dll.FullName }
+          }
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          Get-ChildItem release-rocm -File -Filter '*.exe' | ForEach-Object { $queue.Enqueue($_.FullName) }
+          Get-ChildItem release-rocm -File -Filter '*.dll' | ForEach-Object { $queue.Enqueue($_.FullName) }
+          $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+          $missing = [System.Collections.Generic.List[string]]::new()
+          while ($queue.Count -gt 0) {
+            $current = $queue.Dequeue()
+            if (-Not $seen.Add($current)) { continue }
+            foreach ($dep in (Get-Deps $current)) {
+              $low = $dep.ToLowerInvariant()
+              $local = Join-Path release-rocm $dep
+              if (Test-Path $local) { $queue.Enqueue((Resolve-Path $local).Path); continue }
+              if ($low -like 'api-ms-win-*' -or $low -like 'ext-ms-win-*' -or (Test-Path (Join-Path $system $dep))) { continue }
+              if ($rocmByName.ContainsKey($low)) {
+                Copy-Item $rocmByName[$low] $local -Force
+                $queue.Enqueue((Resolve-Path $local).Path)
+                continue
+              }
+              $missing.Add("$dep <- $([IO.Path]::GetFileName($current))")
+            }
+          }
+          if ($missing.Count) { throw "Unresolved Windows ROCm dependency closure: $((($missing | Sort-Object -Unique) -join ', '))" }
+
+          # rocBLAS/hipBLASLt load architecture-specific kernel blobs at runtime.
+          # The multi-arch wheels may expose these below the merged bin tree or
+          # deeper in the SDK root, so discover them instead of assuming one path.
+          foreach ($tree in @('rocblas','hipblaslt')) {
+            $direct = Join-Path $env:ROCM_BIN "$tree\library"
+            if (Test-Path $direct -PathType Container) {
+              $candidates = @((Get-Item $direct))
+            } else {
+              $candidates = @(Get-ChildItem $env:ROCM_PATH -Recurse -Directory -Filter 'library' -ErrorAction Stop |
+                               Where-Object { $_.Parent.Name -ieq $tree } |
+                               Sort-Object FullName -Unique)
+            }
+            if ($candidates.Count -gt 1) {
+              throw "Ambiguous $tree kernel-library layout: $($candidates.FullName -join ', ')"
+            }
+            if ($candidates.Count -eq 1) {
+              $dst = Join-Path release-rocm "$tree\library"
+              New-Item -ItemType Directory -Force $dst | Out-Null
+              Copy-Item (Join-Path $candidates[0].FullName '*') $dst -Recurse -Force
+            }
+          }
+          if (-Not (Test-Path 'release-rocm\rocblas\library')) { throw "rocBLAS kernel library directory is missing" }
+
+          # Some ROCm components are loaded dynamically rather than appearing in
+          # the PE import table. Copy/check the known runtime anchors explicitly.
+          foreach ($need in @('amdhip64_7.dll','amd_comgr.dll','hipblas.dll','libhipblaslt.dll','rocblas.dll','rocsolver.dll','rocm_kpack.dll')) {
+            $dst = Join-Path 'release-rocm' $need
+            if (-Not (Test-Path $dst)) {
+              $key = $need.ToLowerInvariant()
+              if ($rocmByName.ContainsKey($key)) { Copy-Item $rocmByName[$key] $dst -Force }
+            }
+            if (-Not (Test-Path $dst)) { throw "Required ROCm runtime DLL missing: $need" }
+          }
+          Set-Content release-rocm\ROCM_RUNTIME.txt "ROCm 7.14.1 multi-arch runtime. AMD Adrenalin display driver is still required. Vulkan is the compatibility fallback."
+          Write-Host "--- Windows AMD runtime payload ---"
+          Get-ChildItem release-rocm -Recurse | Select-Object FullName,Length
+          Remove-Item release-amd -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force release-amd | Out-Null
+          python tools/cuda_bundle.py --launcher $launcher --payload-dir release-rocm --core-name s2-amd-core.exe --output release-amd\s2-windows-amd-x86-64.exe
+          if ($LASTEXITCODE -ne 0) { throw "AMD runtime bundler failed" }
+          $outer = (Resolve-Path release-amd\s2-windows-amd-x86-64.exe).Path
+          $runtimeInfo = @(& $outer --runtime-info 2>&1 | ForEach-Object { $_.ToString() })
+          if ($LASTEXITCODE -ne 0) { throw "Final AMD executable --runtime-info validation failed" }
+          $runtimeText = $runtimeInfo -join "`n"
+          Write-Host $runtimeText
+          if ($runtimeText -notmatch '(?m)^payload_files:\s+[1-9][0-9]*\s*$') { throw "AMD runtime-info did not report a non-empty payload" }
+          if ($runtimeText -notmatch '(?m)^\s+s2-amd-core\.exe\s+') { throw "AMD runtime-info is missing s2-amd-core.exe" }
+          $files = @(Get-ChildItem release-amd -File)
+          if ($files.Count -ne 1 -or $files[0].Name -ne 's2-windows-amd-x86-64.exe') { throw "AMD artifact must contain exactly one s2-windows-amd-x86-64.exe" }
+          $bytes = (Get-Item $outer).Length
+          $mb = [math]::Round($bytes / 1MB, 1)
+          Write-Host "Windows AMD single-file size: $mb MB"
+          if ($bytes -ge 1900MB) { throw "Windows AMD executable is too close to GitHub Release 2 GiB per-asset limit; split runtime by GPU family" }
+          Get-PSDrive -Name C | Format-Table Name,Used,Free -AutoSize
+
+      - name: Verify non-empty direct artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $f = Get-Item 'release-amd/s2-windows-amd-x86-64.exe'
+          if ($f.Length -le 0) { throw "Direct artifact is empty: $($f.FullName)" }
+
+      - name: Upload Windows AMD artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: s2-windows-amd-x86-64.exe
+          path: release-amd/s2-windows-amd-x86-64.exe
+          if-no-files-found: error
+          archive: false
+
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: pwsh
+        run: python tools/ci/collect-crash-report.py --label "Windows AMD" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-amd-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build-linux-amd:
+    name: Linux x86_64 - AMD (ROCm/HIP 7.14.1, Ubuntu 22.04 ABI container)
+    # Keep the hosted runner current while preserving the older userspace ABI.
+    # GitHub is deprecating the ubuntu-22.04 hosted label; the job itself runs
+    # in a pinned Ubuntu 22.04 container on the ubuntu-24.04 host.
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:22.04
+    needs: preflight
+    timeout-minutes: 180
+
+    steps:
+      - name: Bootstrap Ubuntu 22.04 ROCm build container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git tar gzip xz-utils build-essential libgfortran5 libnuma1
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Python 3.12 for ROCm wheels
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          check-latest: false
+
+      - name: Prepare pinned Linux Crow/Asio dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/ci/prepare-linux-deps.sh common
+
+      - name: Install ROCm SDK 7.14.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/rocm-venv"
+          "$RUNNER_TEMP/rocm-venv/bin/python" -m pip install --disable-pip-version-check --no-cache-dir 'cmake==4.4.3' ninja
+          "$RUNNER_TEMP/rocm-venv/bin/python" -m pip install --disable-pip-version-check --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ 'rocm[libraries,devel,device-gfx1030,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1103,device-gfx1150,device-gfx1151,device-gfx1152,device-gfx1153,device-gfx1200,device-gfx1201]==7.14.1'
+          export PATH="$RUNNER_TEMP/rocm-venv/bin:$PATH"
+          rocm-sdk init
+          rocm-sdk targets
+          rocm_root="$(rocm-sdk path --root)"
+          cmake_prefix="$(rocm-sdk path --cmake)"
+          rocm_bin="$(rocm-sdk path --bin)"
+          test -d "$rocm_root" && test -d "$cmake_prefix" && test -d "$rocm_bin"
+          llvm_bin="$rocm_root/lib/llvm/bin"
+          device_lib="$rocm_root/lib/llvm/amdgcn/bitcode"
+          test -x "$llvm_bin/clang++"
+          test -f "$device_lib/oclc_abi_version_400.bc"
+          echo "ROCM_PATH=$rocm_root" >> "$GITHUB_ENV"
+          echo "ROCM_CMAKE_PREFIX=$cmake_prefix" >> "$GITHUB_ENV"
+          echo "ROCM_BIN=$rocm_bin" >> "$GITHUB_ENV"
+          echo "ROCM_LLVM_BIN=$llvm_bin" >> "$GITHUB_ENV"
+          echo "HIP_DEVICE_LIB_PATH=$device_lib" >> "$GITHUB_ENV"
+          echo "HIP_PATH=$rocm_root" >> "$GITHUB_ENV"
+          echo "HIP_PLATFORM=amd" >> "$GITHUB_ENV"
+          echo "ROCM_VENV=$RUNNER_TEMP/rocm-venv" >> "$GITHUB_ENV"
+          df -h . "$RUNNER_TEMP"
+
+      - name: Probe Linux ROCm HIP compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-probes
+          printf '%s\n' '#include <hip/hip_runtime.h>' '__global__ void s2_probe_kernel(int *p) { if (threadIdx.x == 0) *p = 1; }' 'int main() { return 0; }' > ci-probes/hip-smoke.cpp
+          export PATH="$ROCM_VENV/bin:$ROCM_BIN:$ROCM_LLVM_BIN:$PATH"
+          export LD_LIBRARY_PATH="$ROCM_PATH/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          python3 tools/ci/run-with-diagnostics.py --label "Linux ROCm compiler probe" --log ci-logs/linux-rocm-compiler-probe.log -- \
+            "$ROCM_LLVM_BIN/clang++" -x hip --offload-arch=gfx1030 --offload-arch=gfx1153 --offload-arch=gfx1201 \
+            -c ci-probes/hip-smoke.cpp -o ci-probes/hip-smoke.o
+          test -s ci-probes/hip-smoke.o
+
+      - name: Configure Linux ROCm
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$ROCM_VENV/bin:$ROCM_BIN:$ROCM_LLVM_BIN:$PATH"
+          export LD_LIBRARY_PATH="$ROCM_PATH/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          crow="$(realpath build-linux-deps/crow/include)"
+          asio="$(realpath build-linux-deps/asio/include)"
+          cxx="$ROCM_LLVM_BIN/clang++"
+          cc="$ROCM_LLVM_BIN/clang"
+          test -x "$cxx" && test -x "$cc"
+          python3 tools/ci/run-with-diagnostics.py --label "Linux ROCm configure" --log ci-logs/linux-rocm-configure.log -- cmake -G Ninja -B build-rocm -S . \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="$cc" -DCMAKE_CXX_COMPILER="$cxx" -DCMAKE_HIP_COMPILER="$cc" \
+            '-DCMAKE_BUILD_RPATH=$ORIGIN' '-DCMAKE_INSTALL_RPATH=$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_PREFIX_PATH="$ROCM_CMAKE_PREFIX" -DS2_CROW_INCLUDE_DIR="$crow" -DS2_ASIO_INCLUDE_DIR="$asio" \
+            -DS2_HIP=ON -DS2_VULKAN=OFF -DS2_CUDA=OFF -DS2_METAL=OFF \
+            -DGGML_HIP=ON -DGGML_STATIC=OFF -DGGML_NATIVE=OFF -DGGML_AVX512=OFF \
+            '-DGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201'
+
+      - name: Build Linux ROCm
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$ROCM_VENV/bin:$ROCM_BIN:$ROCM_LLVM_BIN:$PATH"
+          export LD_LIBRARY_PATH="$ROCM_PATH/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          python3 tools/ci/run-with-diagnostics.py --label "Linux ROCm build" --log ci-logs/linux-rocm-build.log -- cmake --build build-rocm --parallel 2 --verbose
+
+      - name: Package and audit Linux ROCm runtime closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x build-rocm/s2-amd-core
+          rm -rf release-rocm
+          mkdir -p release-rocm/rocm/lib
+          cp build-rocm/s2-amd-core release-rocm/s2-amd-core
+
+          # HIP builds GGML shared. Do not publish an executable without its own
+          # ggml-hip/base/cpu shared libraries.
+          while IFS= read -r -d '' so; do cp -a "$so" release-rocm/; done < <(find build-rocm \( -type f -o -type l \) -name 'libggml*.so*' -print0)
+          hip_so="$(find release-rocm -maxdepth 1 -name 'libggml-hip.so*' -print -quit)"
+          test -n "$hip_so" || { echo '::error::libggml-hip was not packaged'; exit 1; }
+
+          # Do NOT copy the complete ROCm SDK: it is very large and GitHub-hosted
+          # runners only provide 14 GB of SSD. Build a fail-closed ELF dependency
+          # closure instead, then add libraries/data that rocBLAS/hipBLASLt load
+          # dynamically and therefore do not necessarily appear in DT_NEEDED.
+          rocm_lib="$ROCM_PATH/lib"
+          test -d "$rocm_lib"
+
+          copy_rocm_lib() {
+            local src="$1" name dst existing_hash new_hash
+            src="$(readlink -f "$src")"
+            test -f "$src" || { echo "::error::ROCm library target missing: $1"; return 1; }
+            case "$src" in
+              "$ROCM_PATH"/*) ;;
+              *) echo "::error::Refusing ROCm dependency outside SDK root: $src"; return 1 ;;
+            esac
+            name="$(basename "$1")"
+            dst="release-rocm/rocm/lib/$name"
+            if test -e "$dst"; then
+              existing_hash="$(sha256sum "$dst" | awk '{print $1}')"
+              new_hash="$(sha256sum "$src" | awk '{print $1}')"
+              test "$existing_hash" = "$new_hash" || { echo "::error::Conflicting ROCm libraries share basename $name"; return 1; }
+              return 0
+            fi
+            cp -L "$src" "$dst"
+          }
+
+          # Seed the closure with all ROCm dependencies visible from the executable
+          # and GGML shared libraries. ldd resolves them against the initialized SDK.
+          collect_rocm_needed() {
+            local obj="$1" dep
+            while IFS= read -r dep; do
+              test -n "$dep" || continue
+              case "$dep" in
+                "$ROCM_PATH"/*) copy_rocm_lib "$dep" ;;
+              esac
+            done < <(ldd "$obj" | awk '/=> \// { print $3 } /^\// { print $1 }')
+          }
+          collect_rocm_needed release-rocm/s2-amd-core
+          for so in release-rocm/libggml*.so*; do test -e "$so" && collect_rocm_needed "$so"; done
+
+          # Add known dlopen/runtime anchors. These may be absent from DT_NEEDED but
+          # are required by current GGML HIP + rocBLAS/hipBLASLt execution paths.
+          for pattern in 'libamdhip64.so*' 'libamd_comgr.so*' 'libhipblas.so*' 'libhipblaslt.so*' 'librocblas.so*' 'librocsolver.so*' 'librocm_kpack.so*'; do
+            found=0
+            while IFS= read -r -d '' candidate; do
+              found=1
+              copy_rocm_lib "$candidate"
+            done < <(find "$rocm_lib" -maxdepth 2 \( -type f -o -type l \) -name "$pattern" -print0)
+            test "$found" -eq 1 || { echo "::error::Required ROCm runtime pattern not found: $pattern"; exit 1; }
+          done
+
+          # Resolve transitive ROCm dependencies until the closure stops growing.
+          previous=-1
+          while :; do
+            current="$(find release-rocm/rocm/lib -maxdepth 1 -type f | wc -l | tr -d ' ')"
+            test "$current" != "$previous" || break
+            previous="$current"
+            while IFS= read -r -d '' so; do collect_rocm_needed "$so"; done < <(find release-rocm/rocm/lib -maxdepth 1 -type f -name '*.so*' -print0)
+          done
+
+          # rocBLAS and hipBLASLt use architecture-specific data files at runtime.
+          # Copy only those data trees, not the compiler, headers, static archives, etc.
+          for tree in rocblas hipblaslt; do
+            mapfile -d '' candidates < <(find "$rocm_lib" -type d -path "*/$tree/library" -print0)
+            if test "${#candidates[@]}" -ne 1; then
+              printf '::error::Expected exactly one %s kernel data directory, found %s\n' "$tree" "${#candidates[@]}"
+              printf '  %s\n' "${candidates[@]:-<none>}"
+              exit 1
+            fi
+            mkdir -p "release-rocm/rocm/lib/$tree"
+            cp -a "${candidates[0]}" "release-rocm/rocm/lib/$tree/library"
+          done
+
+          printf '%s\n' 'ROCm 7.14.1 multi-arch runtime. AMD amdgpu driver is still required. Vulkan is the compatibility fallback.' > release-rocm/ROCM_RUNTIME.txt
+
+          export LD_LIBRARY_PATH="$PWD/release-rocm:$PWD/release-rocm/rocm/lib"
+          ldd release-rocm/s2-amd-core | tee ci-logs/linux-rocm-ldd.txt
+          if grep -q 'not found' ci-logs/linux-rocm-ldd.txt; then echo '::error::Linux ROCm package has unresolved ELF dependencies'; exit 1; fi
+          for so in release-rocm/libggml*.so*; do
+            test -e "$so" || continue
+            ldd "$so" | tee -a ci-logs/linux-rocm-ldd.txt
+          done
+          if grep -q 'not found' ci-logs/linux-rocm-ldd.txt; then echo '::error::Linux ROCm GGML shared library has unresolved dependencies'; exit 1; fi
+
+          # The artifact advertises an Ubuntu 22.04/glibc 2.35 userspace baseline.
+          # Audit every ELF we ship, including ROCm sidecars, so a future wheel
+          # refresh cannot silently raise that requirement.
+          check_glibc_ceiling() {
+            local file="$1" ceiling=2.35 max
+            max="$(readelf --version-info "$file" 2>/dev/null | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -V | tail -n1 || true)"
+            test -z "$max" && return 0
+            if test "$(printf '%s\n%s\n' "$max" "$ceiling" | sort -V | tail -n1)" != "$ceiling"; then
+              echo "::error::$file requires GLIBC_$max, above ROCm artifact ceiling GLIBC_$ceiling"
+              return 1
+            fi
+            echo "GLIBC_BASELINE_OK file=$file max=$max ceiling=$ceiling"
+          }
+          while IFS= read -r -d '' elf; do
+            readelf -h "$elf" >/dev/null 2>&1 || continue
+            check_glibc_ceiling "$elf"
+          done < <(find release-rocm -type f -print0)
+
+          rocblas_tree="$(find release-rocm/rocm/lib -type d -path '*/rocblas/library' -print -quit)"
+          test -n "$rocblas_tree" || { echo '::error::rocBLAS kernel library directory missing from Linux ROCm runtime'; exit 1; }
+
+          # Preserve ROCm's soname symlinks, but never publish links that point
+          # outside the archive or back into the ephemeral runner/venv.
+          bad_link=0
+          while IFS= read -r -d '' link; do
+            target="$(readlink "$link")"
+            case "$target" in
+              /*) echo "::error::Absolute ROCm runtime symlink: $link -> $target"; bad_link=1; continue ;;
+            esac
+            resolved="$(readlink -f "$link" || true)"
+            case "$resolved" in
+              "$PWD/release-rocm/"*) ;;
+              *) echo "::error::ROCm runtime symlink escapes package: $link -> $target"; bad_link=1 ;;
+            esac
+            test -e "$link" || { echo "::error::Broken ROCm runtime symlink: $link -> $target"; bad_link=1; }
+          done < <(find release-rocm -type l -print0)
+          test "$bad_link" -eq 0
+
+          rm -f s2-linux-amd-x86-64
+          bash tools/ci/make-linux-singlefile.sh release-rocm s2-amd-core "$PWD/s2-linux-amd-x86-64" linux-amd-x86-64
+          test -x s2-linux-amd-x86-64
+          ./s2-linux-amd-x86-64 --runtime-info | tee ci-logs/linux-amd-runtime-info.txt
+          amd_bytes="$(stat -c %s s2-linux-amd-x86-64)"
+          amd_mb=$((amd_bytes / 1024 / 1024))
+          echo "Linux AMD single-file size: ${amd_mb} MB"
+          if test "$amd_bytes" -ge $((1900 * 1024 * 1024)); then echo '::error::Linux AMD executable is too close to GitHub Release 2 GiB per-asset limit; split runtime by GPU family'; exit 1; fi
+          df -h . "$RUNNER_TEMP"
+
+      - name: Verify non-empty direct artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s s2-linux-amd-x86-64
+
+      - name: Upload Linux AMD artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: s2-linux-amd-x86-64
+          path: s2-linux-amd-x86-64
+          if-no-files-found: error
+          archive: false
+
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: bash
+        run: python3 tools/ci/collect-crash-report.py --label "Linux AMD" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-amd-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build-macos-intel-cpu:
+    name: macOS 15 Intel - CPU x86_64 (deployment 10.13)
+    runs-on: macos-15-intel
+    needs: preflight
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Pin Xcode 16.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d /Applications/Xcode_16.4.app/Contents/Developer
+          test "$(uname -m)" = "x86_64"
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+          xcrun --show-sdk-path
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Fetch pinned header-only Crow and Asio
+        shell: bash
+        run: |
+          set -euo pipefail
+          crow_commit=ae0fef0ee67eec897e401321b99b6dd7cfbdc155
+          asio_sha256=755bd7f85a4b269c67ae0ea254907c078d408cce8e1a352ad2ed664d233780e8
+          rm -rf build-deps
+          mkdir -p build-deps/crow build-deps/asio
+          curl -fL --retry 3 "https://github.com/CrowCpp/Crow/archive/${crow_commit}.tar.gz" -o build-deps/crow.tar.gz
+          tar -xzf build-deps/crow.tar.gz -C build-deps/crow --strip-components=1
+          grep -Eq 'VERSION[[:space:]]+1\.3\.4' build-deps/crow/CMakeLists.txt
+          curl -fL --retry 3 https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-30-2.tar.gz -o build-deps/asio.tar.gz
+          printf '%s  %s\n' "$asio_sha256" build-deps/asio.tar.gz | shasum -a 256 -c -
+          tar -xzf build-deps/asio.tar.gz -C build-deps/asio --strip-components=1
+          test -f build-deps/crow/include/crow.h
+          test -f build-deps/asio/asio/include/asio.hpp
+
+      - name: Generate embedded tokenizer
+        shell: bash
+        run: python3 tools/embed_tokenizer.py tokenizer.json src/tokenizer_data.cpp src/tokenizer_data.h
+
+      - name: Configure macOS Intel CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/ci/run-with-diagnostics.py --label "macOS Intel CPU configure" --log ci-logs/macos-intel-cpu-configure.log -- cmake -G Ninja -B build-macos-intel-cpu -S . \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DS2_CROW_INCLUDE_DIR="$(realpath build-deps/crow/include)" -DS2_ASIO_INCLUDE_DIR="$(realpath build-deps/asio/asio/include)" \
+            -DS2_HIP=OFF -DS2_VULKAN=OFF -DS2_CUDA=OFF -DS2_METAL=OFF \
+            -DGGML_HIP=OFF -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_NATIVE=OFF \
+            -DGGML_SSE42=OFF -DGGML_AVX=OFF -DGGML_AVX_VNNI=OFF -DGGML_AVX2=OFF -DGGML_BMI2=OFF \
+            -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF
+
+      - name: Build macOS Intel CPU
+        shell: bash
+        run: python3 tools/ci/run-with-diagnostics.py --label "macOS Intel CPU build" --log ci-logs/macos-intel-cpu-build.log -- cmake --build build-macos-intel-cpu --parallel 3
+
+      - name: Verify macOS Intel CPU binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=build-macos-intel-cpu/s2-cpu
+          test -x "$exe"
+          file "$exe" | tee /tmp/file.txt
+          grep -q 'x86_64' /tmp/file.txt
+          deps="$(otool -L "$exe")"
+          printf '%s\n' "$deps"
+          if grep -Eqi 'Metal|Vulkan|MoltenVK' <<<"$deps"; then echo '::error::Intel CPU build unexpectedly links a GPU runtime'; exit 1; fi
+          minos="$(vtool -show-build "$exe" 2>/dev/null || true)"
+          printf '%s\n' "$minos"
+          grep -q 'minos 10.13' <<<"$minos"
+
+      - name: Package macOS Intel CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf release-macos-intel-cpu
+          mkdir release-macos-intel-cpu
+          cp build-macos-intel-cpu/s2-cpu release-macos-intel-cpu/s2-macos-cpu-x86-64
+          chmod +x release-macos-intel-cpu/s2-macos-cpu-x86-64
+          test "$(find release-macos-intel-cpu -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = '1'
+          test -x release-macos-intel-cpu/s2-macos-cpu-x86-64
+
+      - name: Verify non-empty direct artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s release-macos-intel-cpu/s2-macos-cpu-x86-64
+
+      - name: Upload macOS Intel CPU artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: s2-macos-cpu-x86-64
+          path: release-macos-intel-cpu/s2-macos-cpu-x86-64
+          if-no-files-found: error
+          archive: false
+
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: bash
+        run: python3 tools/ci/collect-crash-report.py --label "macOS Intel CPU" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-intel-cpu-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   release:
     name: Publish all backend release assets
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, build-cuda, build-cpu, build-linux-cpu, build-linux-vulkan, build-linux-cuda, build-metal]
+    needs: [build, build-cuda, build-cpu, build-windows-amd, build-linux-cpu, build-linux-vulkan, build-linux-cuda, build-linux-amd, build-metal, build-macos-intel-cpu]
     runs-on: windows-2025-vs2026
     permissions:
       contents: write
+    timeout-minutes: 45
 
     steps:
-      - name: Download Vulkan artifact
+      - name: Download Windows Vulkan artifact
         uses: actions/download-artifact@v8
         with:
-          name: s2-windows-vulkan
-          path: artifacts/vulkan
+          name: s2-windows-vulkan-x86-64.exe
+          path: artifacts/windows-vulkan
 
-      - name: Download CUDA artifact
+      - name: Download Windows CUDA artifact
         uses: actions/download-artifact@v8
         with:
-          name: s2-windows-cuda
-          path: artifacts/cuda
+          name: s2-windows-cuda-x86-64.exe
+          path: artifacts/windows-cuda
 
-      - name: Download CPU artifact
+      - name: Download Windows CPU artifact
         uses: actions/download-artifact@v8
         with:
-          name: s2-windows-cpu
-          path: artifacts/cpu
+          name: s2-windows-cpu-x86-64.exe
+          path: artifacts/windows-cpu
+
+      - name: Download Windows AMD artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: s2-windows-amd-x86-64.exe
+          path: artifacts/windows-amd
 
       - name: Download Linux CPU artifact
         uses: actions/download-artifact@v8
         with:
-          name: s2-linux-x86_64-cpu
+          name: s2-linux-cpu-x86-64
           path: artifacts/linux-cpu
 
       - name: Download Linux Vulkan artifact
         uses: actions/download-artifact@v8
         with:
-          name: s2-linux-x86_64-vulkan
+          name: s2-linux-vulkan-x86-64
           path: artifacts/linux-vulkan
 
       - name: Download Linux CUDA artifact
         uses: actions/download-artifact@v8
         with:
-          name: s2-linux-x86_64-cuda
+          name: s2-linux-cuda-x86-64
           path: artifacts/linux-cuda
 
-      - name: Download Metal artifact
+      - name: Download Linux AMD artifact
         uses: actions/download-artifact@v8
         with:
-          name: s2-macos-metal
-          path: artifacts/metal
+          name: s2-linux-amd-x86-64
+          path: artifacts/linux-amd
 
-      - name: Create release ZIPs
+      - name: Download macOS Metal artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: s2-macos-metal-arm64
+          path: artifacts/macos-metal
+
+      - name: Download macOS Intel CPU artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: s2-macos-cpu-x86-64
+          path: artifacts/macos-cpu
+
+      - name: Verify exact release assets
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $tag = $env:GITHUB_REF -replace 'refs/tags/', ''
-          if ($tag -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
-              throw "Release tag contains characters unsafe for asset filenames: $tag"
+          $expected = @(
+            'artifacts\windows-vulkan\s2-windows-vulkan-x86-64.exe',
+            'artifacts\windows-cuda\s2-windows-cuda-x86-64.exe',
+            'artifacts\windows-cpu\s2-windows-cpu-x86-64.exe',
+            'artifacts\windows-amd\s2-windows-amd-x86-64.exe',
+            'artifacts\linux-cpu\s2-linux-cpu-x86-64',
+            'artifacts\linux-vulkan\s2-linux-vulkan-x86-64',
+            'artifacts\linux-cuda\s2-linux-cuda-x86-64',
+            'artifacts\linux-amd\s2-linux-amd-x86-64',
+            'artifacts\macos-metal\s2-macos-metal-arm64',
+            'artifacts\macos-cpu\s2-macos-cpu-x86-64'
+          )
+          foreach ($path in $expected) {
+            if (-Not (Test-Path $path -PathType Leaf)) { throw "Release input missing: $path" }
+            $dir = Split-Path $path -Parent
+            $entries = @(Get-ChildItem $dir -File)
+            if ($entries.Count -ne 1) { throw "Artifact must contain exactly one executable: ${dir}: $($entries.Name -join ', ')" }
           }
-
-          $vulkan     = 'artifacts\vulkan\s2-vulkan.exe'
-          $cuda      = 'artifacts\cuda\s2-cuda.exe'
-          $cpu       = 'artifacts\cpu\s2-cpu.exe'
-          $linuxCpu    = 'artifacts\linux-cpu\s2-linux-x86_64-cpu.tar.gz'
-          $linuxVulkan = 'artifacts\linux-vulkan\s2-linux-x86_64-vulkan.tar.gz'
-          $linuxCuda   = 'artifacts\linux-cuda\s2-linux-x86_64-cuda.tar.gz'
-          $metal       = 'artifacts\metal\s2-macos-metal.zip'
-          foreach ($required in @($vulkan, $cuda, $cpu, $linuxCpu, $linuxVulkan, $linuxCuda, $metal)) {
-              if (-Not (Test-Path $required -PathType Leaf)) { throw "Release input missing: $required" }
-          }
-          foreach ($dir in @('artifacts\vulkan', 'artifacts\cuda', 'artifacts\cpu', 'artifacts\linux-cpu', 'artifacts\linux-vulkan', 'artifacts\linux-cuda', 'artifacts\metal')) {
-              $entries = @(Get-ChildItem $dir -File)
-              if ($entries.Count -ne 1) { throw "Unexpected release input contents in $dir: $($entries.Name -join ', ')" }
-          }
-
-          Compress-Archive -Path $vulkan -DestinationPath "s2-$tag-windows-vulkan.zip"
-          Compress-Archive -Path $cuda   -DestinationPath "s2-$tag-windows-cuda.zip"
-          Compress-Archive -Path $cpu    -DestinationPath "s2-$tag-windows-cpu.zip"
-          Copy-Item $linuxCpu    "s2-$tag-linux-x86_64-cpu.tar.gz"
-          Copy-Item $linuxVulkan "s2-$tag-linux-x86_64-vulkan.tar.gz"
-          Copy-Item $linuxCuda   "s2-$tag-linux-x86_64-cuda.tar.gz"
-          Copy-Item $metal       "s2-$tag-macos-metal.zip"
-
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v3.0.3
         with:
+          fail_on_unmatched_files: true
           files: |
-            s2-*-windows-vulkan.zip
-            s2-*-windows-cuda.zip
-            s2-*-windows-cpu.zip
-            s2-*-linux-x86_64-cpu.tar.gz
-            s2-*-linux-x86_64-vulkan.tar.gz
-            s2-*-linux-x86_64-cuda.tar.gz
-            s2-*-macos-metal.zip
+            artifacts/windows-vulkan/s2-windows-vulkan-x86-64.exe
+            artifacts/windows-cuda/s2-windows-cuda-x86-64.exe
+            artifacts/windows-cpu/s2-windows-cpu-x86-64.exe
+            artifacts/windows-amd/s2-windows-amd-x86-64.exe
+            artifacts/linux-cpu/s2-linux-cpu-x86-64
+            artifacts/linux-vulkan/s2-linux-vulkan-x86-64
+            artifacts/linux-cuda/s2-linux-cuda-x86-64
+            artifacts/linux-amd/s2-linux-amd-x86-64
+            artifacts/macos-metal/s2-macos-metal-arm64
+            artifacts/macos-cpu/s2-macos-cpu-x86-64
           generate_release_notes: true

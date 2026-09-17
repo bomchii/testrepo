@@ -950,11 +950,16 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
 #if defined(GGML_USE_CUDA)
     if (vulkan_device >= 0) {
         impl_->backend = ggml_backend_cuda_init(vulkan_device);
+#if defined(GGML_USE_HIP)
+        const char * gpu_backend_name = "ROCm/HIP";
+#else
+        const char * gpu_backend_name = "CUDA";
+#endif
         if (!impl_->backend) {
-            std::cerr << "[Codec] CUDA init failed on device " << vulkan_device
+            std::cerr << "[Codec] " << gpu_backend_name << " init failed on device " << vulkan_device
                       << ", falling back to CPU." << std::endl;
         } else {
-            std::cout << "[Codec] CUDA backend on device " << vulkan_device << std::endl;
+            std::cout << "[Codec] " << gpu_backend_name << " backend on device " << vulkan_device << std::endl;
         }
     }
 #elif defined(GGML_USE_VULKAN)

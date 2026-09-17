@@ -27,7 +27,7 @@ static std::FILE * open_binary_input_utf8(const std::string & path) {
     return path.empty() ? nullptr : ggml_fopen(path.c_str(), "rb");
 }
 
-#if defined(GGML_USE_CUDA)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
 static bool cuda_problem_embedding_type(enum ggml_type type) {
     return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K ||
            type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
@@ -233,12 +233,20 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
 #if defined(GGML_USE_CUDA)
     if (vulkan_device >= 0) {
         backend_ = ggml_backend_cuda_init(vulkan_device);
+#if defined(GGML_USE_HIP)
+        const char * gpu_backend_name = "ROCm/HIP";
+#else
+        const char * gpu_backend_name = "CUDA";
+#endif
         if (!backend_) {
-            std::cerr << "[Model] CUDA init failed on device " << vulkan_device
+            std::cerr << "[Model] " << gpu_backend_name << " init failed on device " << vulkan_device
                       << ", falling back to CPU." << std::endl;
         } else {
-            std::cout << "[Model] CUDA backend on device " << vulkan_device << std::endl;
+            std::cout << "[Model] " << gpu_backend_name << " backend on device " << vulkan_device << std::endl;
+#if !defined(GGML_USE_HIP)
+            // NVIDIA-only workarounds below must not leak into the HIP backend.
             cuda_mode_ = true;
+#endif
         }
     }
 #elif defined(GGML_USE_VULKAN)
@@ -625,8 +633,8 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
         return false;
     }
 
-#if defined(GGML_USE_CUDA)
-    // K-quant get_rows has historically been problematic on CUDA, including
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
+    // K-quant get_rows has historically been problematic on NVIDIA CUDA, including
     // Q2_K/Q3_K and voice-prefill paths.  Keep the tensors in their original
     // quantized layout and retain a host-side copy only for the embedding tables
     // that need the workaround.  During inference we dequantize just the rows
@@ -707,7 +715,7 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
             if (file_type != t->type || file_size != ggml_nbytes(t))
                 throw std::runtime_error(std::string("GGUF/backend tensor byte-size mismatch: ") + tname);
 
-#if defined(GGML_USE_CUDA)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
             HostEmbeddingTable * host_table = nullptr;
             if (cuda_host_embeddings_ && t == weights_.embeddings) {
                 host_table = &host_embeddings_;
@@ -722,7 +730,7 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
             // storage. Moving the reusable scratch vector would also transfer its
             // potentially much larger capacity from a previously-read tensor.
             uint8_t * tensor_bytes = nullptr;
-#if defined(GGML_USE_CUDA)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
             if (host_table) {
                 host_table->data.resize(file_size);
                 tensor_bytes = host_table->data.data();
@@ -745,7 +753,7 @@ bool SlowARModel::load(const std::string & gguf_path, int32_t vulkan_device) {
 
             ggml_backend_tensor_set(t, tensor_bytes, 0, file_size);
 
-#if defined(GGML_USE_CUDA)
+#if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
             if (host_table) {
                 const int64_t rows = ggml_nrows(t);
                 if (t->ne[0] <= 0 || rows <= 0)

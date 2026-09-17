@@ -7,7 +7,7 @@ from pathlib import Path
 INDEX_MAGIC=b'S2CIDX01'
 FOOTER_MAGIC=b'S2CEND01'
 VERSION=1
-MAX_ENTRIES=256
+MAX_ENTRIES=16384
 DEVICE={"con","prn","aux","nul","clock$",*(f"com{i}" for i in range(1,10)),*(f"lpt{i}" for i in range(1,10))}
 
 def valid_name(name:str)->bool:
@@ -15,14 +15,20 @@ def valid_name(name:str)->bool:
         raw=name.encode('ascii')
     except UnicodeEncodeError:
         return False
-    if not raw or len(raw)>240 or name[-1] in '. ':
+    if not raw or len(raw)>1024 or name.startswith('/') or name.endswith('/'):
         return False
-    if name in ('.','..'):
+    if '\\' in name:
         return False
-    if any(ord(c)<0x20 or ord(c)>0x7e or c in '<>:"/\\|?*' for c in name):
+    parts=name.split('/')
+    if any(not part or part in ('.','..') or len(part)>240 or part[-1] in '. ' for part in parts):
         return False
-    stem=name.split('.',1)[0].rstrip(' .').casefold()
-    return stem not in DEVICE
+    for part in parts:
+        if any(ord(c)<0x20 or ord(c)>0x7e or c in '<>:"\\|?*' for c in part):
+            return False
+        stem=part.split('.',1)[0].rstrip(' .').casefold()
+        if stem in DEVICE:
+            return False
+    return True
 
 def hfile(path:Path)->bytes:
     h=hashlib.sha256()
@@ -35,16 +41,19 @@ def main()->int:
     ap.add_argument('--launcher',required=True,type=Path)
     ap.add_argument('--payload-dir',required=True,type=Path)
     ap.add_argument('--output',required=True,type=Path)
+    ap.add_argument('--core-name',default='s2-cuda-core.exe')
     args=ap.parse_args()
-    files=sorted((p for p in args.payload_dir.iterdir() if p.is_file()),key=lambda p:p.name.casefold())
+    files=sorted((p for p in args.payload_dir.rglob('*') if p.is_file()),key=lambda p:p.relative_to(args.payload_dir).as_posix().casefold())
     if not files: raise SystemExit('empty payload')
     if len(files)>MAX_ENTRIES: raise SystemExit(f'too many payload files: {len(files)} > {MAX_ENTRIES}')
-    if not any(p.name.casefold()=='s2-cuda-core.exe' for p in files):
-        raise SystemExit('payload must contain s2-cuda-core.exe')
+    if not valid_name(args.core_name): raise SystemExit(f'unsafe core name: {args.core_name!r}')
+    if not any(p.relative_to(args.payload_dir).as_posix().casefold()==args.core_name.casefold() for p in files):
+        raise SystemExit(f'payload must contain {args.core_name}')
     seen=set()
     for p in files:
-        if not valid_name(p.name): raise SystemExit(f'unsafe payload filename: {p.name!r}')
-        k=p.name.casefold()
+        rel=p.relative_to(args.payload_dir).as_posix()
+        if not valid_name(rel): raise SystemExit(f'unsafe payload filename: {rel!r}')
+        k=rel.casefold()
         if k in seen: raise SystemExit(f'case-insensitive duplicate: {p.name}')
         seen.add(k)
 
@@ -64,7 +73,7 @@ def main()->int:
                         b=f.read(1<<20)
                         if not b: break
                         out.write(b); h.update(b); size+=len(b)
-                entries.append((p.name,off,size,h.digest()))
+                entries.append((p.relative_to(args.payload_dir).as_posix(),off,size,h.digest()))
             payload_end=out.tell()
             index=bytearray(struct.pack('<8sIIQ',INDEX_MAGIC,VERSION,len(entries),payload_start))
             for name,off,size,digest in entries:
@@ -78,9 +87,9 @@ def main()->int:
         os.replace(tmp,args.output)
     finally:
         if tmp.exists(): tmp.unlink()
-    print(f'CUDA_BUNDLE_ID={index_hash.hex()}')
-    print(f'CUDA_BUNDLE_FILES={len(entries)}')
-    print(f'CUDA_BUNDLE_SIZE={args.output.stat().st_size}')
+    print(f'RUNTIME_BUNDLE_ID={index_hash.hex()}')
+    print(f'RUNTIME_BUNDLE_FILES={len(entries)}')
+    print(f'RUNTIME_BUNDLE_SIZE={args.output.stat().st_size}')
     for name,off,size,digest in entries:
         print(f'  {name} size={size} sha256={digest.hex()} offset={off}')
     return 0

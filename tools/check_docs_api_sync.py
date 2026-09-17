@@ -129,20 +129,26 @@ for label, text in (("README", readme), ("--help", help_text)):
             must(known_route(path), f"{label} curl example uses unregistered route {path}")
 
 # Check the practical startup/cURL paths the README is meant to teach.
-for token in ('s2-cpu.exe', 's2-vulkan.exe', 's2-cuda.exe', './s2-cpu', './s2-vulkan', './s2-cuda', 's2-metal'):
+release_names = (
+    's2-windows-cpu-x86-64.exe','s2-windows-vulkan-x86-64.exe','s2-windows-cuda-x86-64.exe','s2-windows-amd-x86-64.exe',
+    's2-linux-cpu-x86-64','s2-linux-vulkan-x86-64','s2-linux-cuda-x86-64','s2-linux-amd-x86-64',
+    's2-macos-metal-arm64','s2-macos-cpu-x86-64',
+)
+for token in release_names:
     must(token in readme, f"README is missing release executable {token}")
     must(token in help_text, f"--help is missing release executable {token}")
 
-# A new user should be able to start every downloaded backend without guessing
-# whether a separate --server mode exists or which -v value to use.
 startup_pairs = (
-    ('s2-cpu.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080', 'CPU'),
-    ('s2-vulkan.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080', 'Windows Vulkan'),
-    ('s2-cuda.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Windows CUDA'),
-    ('./s2-cpu --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080', 'Linux CPU'),
-    ('./s2-vulkan --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080', 'Linux Vulkan'),
-    ('./s2-cuda --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Linux CUDA'),
-    ('./s2-metal --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Metal'),
+    ('s2-windows-cpu-x86-64.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080', 'Windows CPU'),
+    ('s2-windows-vulkan-x86-64.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080', 'Windows Vulkan'),
+    ('s2-windows-cuda-x86-64.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Windows CUDA'),
+    ('s2-windows-amd-x86-64.exe --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Windows AMD'),
+    ('./s2-linux-cpu-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080', 'Linux CPU'),
+    ('./s2-linux-vulkan-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --codec-vulkan 0 --port 8080', 'Linux Vulkan'),
+    ('./s2-linux-cuda-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Linux CUDA'),
+    ('./s2-linux-amd-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'Linux AMD'),
+    ('./s2-macos-cpu-x86-64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v -1 --port 8080', 'macOS CPU'),
+    ('./s2-macos-metal-arm64 --model s2-pro-q4_k_m-transformer-only.gguf --model-codec s2-pro-q4_k_m-codec-only.gguf -v 0 --port 8080', 'macOS Metal'),
 )
 for command, backend in startup_pairs:
     must(command in help_text, f"--help is missing copy-paste {backend} server start")
@@ -171,19 +177,17 @@ for token in (
 ):
     must(token in readme, f"README is missing Linux portability note {token}")
 for token in (
-    's2-linux-x86_64-cpu.tar.gz', 's2-linux-x86_64-vulkan.tar.gz',
-    's2-linux-x86_64-cuda.tar.gz', 'quay.io/pypa/manylinux2014_x86_64',
-    'nvidia/cuda:13.2.0-devel-rockylinux8',
+    's2-linux-cpu-x86-64', 's2-linux-vulkan-x86-64', 's2-linux-cuda-x86-64', 's2-linux-amd-x86-64',
+    'quay.io/pypa/manylinux2014_x86_64', 'nvidia/cuda:13.2.0-devel-rockylinux8',
 ):
     must(token in workflow, f"workflow is missing Linux release token {token}")
-must('(cd release-metal && ditto -c -k --norsrc --keepParent s2-metal ../s2-macos-metal.zip)' in workflow,
-     'Metal release ZIP must run ditto inside staging so only s2-metal is kept at the root')
-must('test "$zip_entries" = "s2-metal"' in workflow,
-     'Metal release ZIP must verify an exact one-file root manifest')
-must('--keepParent release-metal/s2-metal' not in workflow,
-     'Metal packaging must never pass the parent directory path to --keepParent')
-must('test -f verify-metal-zip/s2-metal' in workflow and 'test -x verify-metal-zip/s2-metal' in workflow,
-     'Metal packaging must verify root path and executable mode')
+must('cp build-metal/s2-metal release-metal/s2-macos-metal-arm64' in workflow,
+     'Metal release must publish the canonical single executable')
+must('test -x release-metal/s2-macos-metal-arm64' in workflow,
+     'Metal release must verify executable mode')
+active_workflow_lines = '\n'.join(line for line in workflow.splitlines() if not line.lstrip().startswith('#'))
+must('--keepParent' not in active_workflow_lines and 's2-macos-metal.zip' not in active_workflow_lines,
+     'Metal packaging must not wrap the one-file release in a ZIP')
 print(
     f"DOCS_API_SYNC_PASS options={len(options)} routes={len(routes)} "
     f"json_fields={len(common_fields)+3}"

@@ -68,10 +68,28 @@ release="release-linux-$backend"
 rm -rf "$build" "$release"
 mkdir -p "$release"
 
-# Portable release policy: do not tune code for the CI host, do not emit
-# AVX-512, keep normal glibc dynamic, but make libstdc++/libgcc independent of
-# the end-user distro. AVX2 remains the x86_64 performance baseline used by
-# the existing Windows build as well.
+# Portable release policy: do not tune code for the CI host and do not emit
+# AVX-512. Keep glibc dynamic and bundle the GCC C++/support runtimes beside
+# the executable. AVX2 remains the x86_64 performance baseline used by Windows.
+probe_dir="$root/.ci-linux-toolchain-probe"
+rm -rf "$probe_dir"
+mkdir -p "$probe_dir"
+cat > "$probe_dir/probe.cpp" <<'EOF'
+#include <omp.h>
+#include <iostream>
+int main() {
+    int n = 0;
+    #pragma omp parallel reduction(+:n)
+    n += 1;
+    std::cout << n << "\n";
+    return n > 0 ? 0 : 1;
+}
+EOF
+g++ -std=c++17 -fopenmp "$probe_dir/probe.cpp" -o "$probe_dir/probe"
+"$probe_dir/probe" >/dev/null
+echo "LINUX_CXX_TOOLCHAIN_PROBE_PASS compiler=$(g++ -dumpfullversion -dumpversion)"
+rm -rf "$probe_dir"
+
 common=(
   -DCMAKE_BUILD_TYPE=Release
   -DS2_CROW_INCLUDE_DIR="$deps/crow/include"
@@ -80,7 +98,7 @@ common=(
   -DGGML_STATIC=ON
   -DGGML_NATIVE=OFF
   -DGGML_AVX512=OFF
-  -DCMAKE_EXE_LINKER_FLAGS=-static-libgcc\ -static-libstdc++
+  -DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags
   -DCMAKE_BUILD_RPATH=\$ORIGIN
   -DCMAKE_INSTALL_RPATH=\$ORIGIN
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
@@ -149,17 +167,22 @@ test -x "$exe"
 cp "$exe" "$release/s2-$backend"
 chmod +x "$release/s2-$backend"
 
-# Linux releases statically include GCC runtime code (libstdc++/libgcc) and may
-# also carry libgomp.so.1. Ship the GPLv3 + GCC Runtime Library Exception texts
-# alongside the binaries instead of relying on a distro package to provide them.
+# Bundle the GCC C++/support runtimes beside the executable. Rocky Linux 8's
+# development image does not guarantee libstdc++.a, so forcing
+# -static-libstdc++/-static-libgcc makes CMake's compiler probe fail before the
+# project can configure. Sidecars plus an exact $ORIGIN RPATH are portable and
+# testable on both the manylinux2014 and Rocky 8 baselines.
 cp "$root/tools/ci/LICENSE-GPL-3.0.txt" "$release/LICENSE-GPL-3.0.txt"
 cp "$root/tools/ci/LICENSE-GCC-Runtime-Library-Exception-3.1.txt" \
    "$release/LICENSE-GCC-Runtime-Library-Exception-3.1.txt"
 
-# OpenMP remains enabled for performance. Bundle libgomp beside the executable
-# so users do not depend on the exact GCC runtime package installed by a distro.
-# Capture readelf output first: an early quiet-grep exit under pipefail can
-# otherwise SIGPIPE the producer and turn a successful check into exit 141.
+libstdcpp="$(g++ -print-file-name=libstdc++.so.6)"
+libgcc="$(gcc -print-file-name=libgcc_s.so.1)"
+test -f "$libstdcpp"
+test -f "$libgcc"
+cp -L "$libstdcpp" "$release/libstdc++.so.6"
+cp -L "$libgcc" "$release/libgcc_s.so.1"
+
 exe_dynamic="$(readelf -d "$exe")"
 if grep -q 'Shared library: \[libgomp.so.1\]' <<<"$exe_dynamic"; then
   libgomp="$(gcc -print-file-name=libgomp.so.1)"
@@ -209,15 +232,11 @@ The NVIDIA display/compute driver and libcuda.so.1 are not redistributed here.
 EOF
 fi
 
-# Static libstdc++ / libgcc are deliberate; dynamic glibc and system driver
-# libraries remain external. CUDA Toolkit libraries must be static in the
+# GCC runtimes are intentionally dynamic but bundled locally. glibc and driver
+# libraries remain external. CUDA Toolkit libraries must remain static in the
 # Linux CUDA release; libcuda.so.1 is supplied by the NVIDIA driver.
 needed="$(readelf -d "$exe" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p')"
 printf '%s\n' "$needed" | sort -u
-if grep -Eq '^(libstdc\+\+\.so|libgcc_s\.so)' <<<"$needed"; then
-  echo "portable release unexpectedly depends on dynamic libstdc++/libgcc" >&2
-  exit 1
-fi
 if [[ "$backend" == "cpu" ]] && grep -Eq '^(libvulkan|libcuda|libcudart|libcublas)' <<<"$needed"; then
   echo "CPU release unexpectedly links a GPU runtime" >&2
   exit 1
@@ -243,7 +262,7 @@ check_dynamic_deps() {
   while IFS= read -r soname; do
     [[ -n "$soname" ]] || continue
     case "$soname" in
-      libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libgomp.so.1) ;;
+      libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libgomp.so.1|libstdc++.so.6|libgcc_s.so.1|ld-linux-x86-64.so.2) ;;
       libvulkan.so.1) [[ "$backend" == "vulkan" ]] || { echo "unexpected $soname for $backend in $file" >&2; exit 1; } ;;
       libcuda.so|libcuda.so.1) [[ "$backend" == "cuda" ]] || { echo "unexpected $soname for $backend in $file" >&2; exit 1; } ;;
       *) echo "unexpected dynamic dependency in $backend release ($file): $soname" >&2; exit 1 ;;
@@ -305,7 +324,7 @@ fi
 mapfile -t release_names < <(find "$release" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
 for name in "${release_names[@]}"; do
   case "$name" in
-    "s2-$backend"|libgomp.so.1|LICENSE-GPL-3.0.txt|LICENSE-GCC-Runtime-Library-Exception-3.1.txt|LICENSE-Crow-BSD-3-Clause.txt|LICENSE-Asio-Boost-1.0.txt|THIRD_PARTY_NOTICES.txt) ;;
+    "s2-$backend"|libstdc++.so.6|libgcc_s.so.1|libgomp.so.1|LICENSE-GPL-3.0.txt|LICENSE-GCC-Runtime-Library-Exception-3.1.txt|LICENSE-Crow-BSD-3-Clause.txt|LICENSE-Asio-Boost-1.0.txt|THIRD_PARTY_NOTICES.txt) ;;
     libvulkan.so.1|LICENSE-Vulkan-Loader.txt) [[ "$backend" == "vulkan" ]] || { echo "unexpected $name in $backend release" >&2; exit 1; } ;;
     *) echo "unexpected file in $backend release: $name" >&2; exit 1 ;;
   esac
@@ -315,22 +334,15 @@ if [[ "$backend" == "vulkan" ]]; then
   [[ -f "$release/libvulkan.so.1" ]] || { echo "missing bundled libvulkan.so.1" >&2; exit 1; }
 fi
 
-archive="s2-linux-x86_64-$backend.tar.gz"
-tar_plain="${archive%.gz}"
-rm -f "$archive" "$tar_plain"
-# manylinux2014 is CentOS 7 based and may provide GNU tar 1.26, which does
-# not support the newer directory-sorting option. release_names is already LC_ALL=C sorted above,
-# so pass the files explicitly in that order and normalize metadata. gzip -n
-# removes filename/timestamp metadata from the gzip header.
-(
-  cd "$release"
-  tar --owner=0 --group=0 --numeric-owner --mtime='1970-01-01 00:00:00 UTC' \
-      -cf "$root/$tar_plain" -- "${release_names[@]}"
-)
-gzip -n -9 "$tar_plain"
-rm -rf "verify-linux-$backend"
-mkdir "verify-linux-$backend"
-tar -xzf "$archive" -C "verify-linux-$backend"
-test -x "verify-linux-$backend/s2-$backend"
+public_backend="$backend"
+public_name="s2-linux-${public_backend}-x86-64"
+rm -f "$public_name"
+"$root/tools/ci/make-linux-singlefile.sh" "$release" "s2-$backend" "$root/$public_name" "linux-$backend-x86-64"
+test -x "$public_name"
+file "$public_name" || true
+"$public_name" --runtime-info | tee "$root/ci-logs-linux-${backend}-runtime-info.txt"
+# The published payload is exactly one executable. Sidecars/licenses remain
+# embedded inside its verified runtime payload and are extracted only to cache.
+test "$(find "$root" -maxdepth 1 -type f -name "$public_name" | wc -l | tr -d ' ')" = 1
 
-echo "LINUX_RELEASE_PASS backend=$backend glibc_ceiling=$ceiling archive=$archive"
+echo "LINUX_RELEASE_PASS backend=$backend glibc_ceiling=$ceiling executable=$public_name"
