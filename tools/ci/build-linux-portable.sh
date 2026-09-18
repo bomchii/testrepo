@@ -142,7 +142,12 @@ if [[ "$backend" == "vulkan" ]]; then
   cmake --build "$root/build-linux-shaderc" --target glslc --parallel "$jobs"
   glslc="$(find "$root/build-linux-shaderc" -type f -name glslc -perm -111 -print -quit)"
   test -n "$glslc" && test -x "$glslc"
-
+  # CMake 4.4 FindVulkan treats glslc as a required component when Vulkan is
+  # enabled. Put our pinned, freshly-built glslc on PATH as well as passing
+  # Vulkan_GLSLC_EXECUTABLE explicitly so both discovery paths agree.
+  glslc_dir="$(dirname "$glslc")"
+  export PATH="$glslc_dir:$PATH"
+  "$glslc" --version | sed -n '1p'
 
   libvulkan="$(find "$vkprefix" -type f \( -name 'libvulkan.so.1' -o -name 'libvulkan.so.1.*' \) -print -quit)"
   test -n "$libvulkan" && test -f "$libvulkan"

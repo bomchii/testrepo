@@ -166,6 +166,16 @@ target_include_directories(s2 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/ggml/src
 )
 
+# On Windows ROCm, GGML's HIP targets inherit HIP include directories from
+# hip::host/hip::device, but the top-level s2 target includes hip_runtime.h
+# directly for runtime device queries. Make that include root explicit.
+if(S2_HIP AND DEFINED S2_HIP_INCLUDE_DIR AND NOT S2_HIP_INCLUDE_DIR STREQUAL "")
+    if(NOT EXISTS "${S2_HIP_INCLUDE_DIR}/hip/hip_runtime.h")
+        message(FATAL_ERROR "S2_HIP_INCLUDE_DIR does not contain hip/hip_runtime.h: ${S2_HIP_INCLUDE_DIR}")
+    endif()
+    target_include_directories(s2 PRIVATE "${S2_HIP_INCLUDE_DIR}")
+endif()
+
 if(S2_HEADER_ONLY_CROW)
     target_include_directories(s2 PRIVATE ${S2_CROW_INCLUDE_DIR} ${S2_ASIO_INCLUDE_DIR})
     target_compile_definitions(s2 PRIVATE ASIO_STANDALONE)

@@ -118,7 +118,7 @@ req('inline run step must declare shell: bash or pwsh', 'explicit shell guard fo
 for token, label in [
     ("group: ${{ github.workflow }}-${{ github.ref }}", 'workflow concurrency group'),
     ("cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}", 'do not cancel tagged releases'),
-    ("actions/setup-python@v7", 'pinned Python 3.12 setup for ROCm wheels'),
+    ("actions/setup-python@v7", 'pinned Windows Python 3.12 setup for ROCm wheels'),
     ("python-version: '3.12'", 'ROCm wheel Python version'),
 ]:
     req(token, label)
@@ -253,7 +253,7 @@ for token in [
 ]:
     req(token, 'pinned Windows CUDA redistributable component', cuda_region)
 for required in [
-    "'bin\\nvcc.exe'", "'include\\cuda_runtime.h'", "'include\\cub'", "'include\\thrust'",
+    "'bin\\nvcc.exe'", "'include\\cuda_runtime.h'", "'include\\cccl\\cub'", "'include\\cccl\\thrust'", "'include\\cccl\\cuda'",
     "'include\\cublas_v2.h'", "'lib\\x64\\cudart_static.lib'", "'lib\\x64\\cudadevrt.lib'",
     "'lib\\x64\\cuda.lib'", "'lib\\x64\\cublas.lib'", "'lib\\x64\\cublasLt.lib'",
     "'nvvm\\libdevice\\libdevice.10.bc'", "'bin\\cicc.exe'", "'bin\\ptxas.exe'",
@@ -370,6 +370,8 @@ for token, label in [
         errors.append(f'Linux build script contains forbidden {label}: {token!r}')
 if re.search(r'\|\s*grep\s+-q', build_script):
     errors.append('Linux build script uses producer | grep -q under pipefail')
+req('export PATH="$glslc_dir:$PATH"', 'pinned Linux Vulkan glslc PATH', build_script)
+req('-DVulkan_GLSLC_EXECUTABLE="$glslc"', 'explicit Linux Vulkan glslc CMake hint', build_script)
 for token in [
     'vulkan-sdk-1.4.357.0', 'v2026.3',
     'e3b1eec08173d6b825cd3ac88c885a63b621504a',

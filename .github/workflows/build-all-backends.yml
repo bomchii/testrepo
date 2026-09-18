@@ -473,7 +473,7 @@ jobs:
           }
 
           $required = @(
-            'bin\nvcc.exe', 'include\cuda_runtime.h', 'include\cub', 'include\thrust',
+            'bin\nvcc.exe', 'include\cuda_runtime.h', 'include\cccl\cub', 'include\cccl\thrust', 'include\cccl\cuda',
             'include\cublas_v2.h', 'lib\x64\cudart_static.lib', 'lib\x64\cudadevrt.lib',
             'lib\x64\cuda.lib', 'lib\x64\cublas.lib', 'lib\x64\cublasLt.lib',
             'nvvm\libdevice\libdevice.10.bc', 'bin\cicc.exe', 'bin\ptxas.exe',
@@ -1342,6 +1342,12 @@ jobs:
           if (-Not (Test-Path $clang)) { throw "ROCm clang++.exe not found: $clang" }
           $deviceLib = Join-Path $rocm 'lib\llvm\amdgcn\bitcode'
           if (-Not (Test-Path (Join-Path $deviceLib 'oclc_abi_version_400.bc'))) { throw "ROCm device bitcode missing: $deviceLib" }
+          $hipHeader = Get-ChildItem $rocm -Recurse -File -Filter 'hip_runtime.h' -ErrorAction Stop |
+            Where-Object { $_.FullName -match '[\\/]hip[\\/]hip_runtime\.h$' } |
+            Select-Object -First 1
+          if (-Not $hipHeader) { throw "ROCm HIP header hip/hip_runtime.h not found under $rocm" }
+          $hipInclude = Split-Path -Parent (Split-Path -Parent $hipHeader.FullName)
+          if (-Not (Test-Path (Join-Path $hipInclude 'hip\hip_runtime.h'))) { throw "Invalid ROCm HIP include root: $hipInclude" }
           "ROCM_PATH=$rocm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "HIP_PATH=$rocm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "HIP_PLATFORM=amd" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -1349,10 +1355,12 @@ jobs:
           "ROCM_LLVM_BIN=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "ROCM_BIN=$rocmBin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "ROCM_CMAKE_PREFIX=$cmakePrefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "S2_HIP_INCLUDE=$hipInclude" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "ROCM_PATH=$rocm"
           Write-Host "ROCM_BIN=$rocmBin"
           Write-Host "CMAKE_PREFIX_PATH=$cmakePrefix"
           Write-Host "HIP_DEVICE_LIB_PATH=$deviceLib"
+          Write-Host "S2_HIP_INCLUDE=$hipInclude"
           Get-PSDrive -Name C | Format-Table Name,Used,Free -AutoSize
 
       - name: Pin MSVC 14.44 headers and libraries for ROCm HIP
@@ -1446,6 +1454,7 @@ jobs:
             -DCMAKE_PREFIX_PATH="$env:ROCM_CMAKE_PREFIX" `
             -DS2_CROW_INCLUDE_DIR="$crow" `
             -DS2_ASIO_INCLUDE_DIR="$asio" `
+            -DS2_HIP_INCLUDE_DIR="$env:S2_HIP_INCLUDE" `
             -DS2_HIP=ON -DS2_VULKAN=OFF -DS2_CUDA=OFF -DS2_METAL=OFF `
             -DGGML_HIP=ON -DGGML_STATIC=OFF -DGGML_NATIVE=OFF -DGGML_AVX512=OFF `
             "-DGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1200;gfx1201"
@@ -1620,19 +1629,13 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git tar gzip xz-utils build-essential libgfortran5 libnuma1
+          apt-get install -y --no-install-recommends ca-certificates curl git tar gzip xz-utils build-essential libgfortran5 libnuma1 python3 python3-venv python3-pip
           rm -rf /var/lib/apt/lists/*
 
       - name: Checkout
         uses: actions/checkout@v7
         with:
           submodules: recursive
-
-      - name: Setup Python 3.12 for ROCm wheels
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-          check-latest: false
 
       - name: Prepare pinned Linux Crow/Asio dependencies
         shell: bash
