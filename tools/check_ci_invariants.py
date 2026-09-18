@@ -256,10 +256,12 @@ for required in [
     "'bin\\nvcc.exe'", "'include\\cuda_runtime.h'", "'include\\cccl\\cub'", "'include\\cccl\\thrust'", "'include\\cccl\\cuda'",
     "'include\\cublas_v2.h'", "'lib\\x64\\cudart_static.lib'", "'lib\\x64\\cudadevrt.lib'",
     "'lib\\x64\\cuda.lib'", "'lib\\x64\\cublas.lib'", "'lib\\x64\\cublasLt.lib'",
-    "'nvvm\\libdevice\\libdevice.10.bc'", "'bin\\cicc.exe'", "'bin\\ptxas.exe'",
+    "'nvvm\\libdevice\\libdevice.10.bc'", "'nvvm\\bin\\cicc.exe'", "'bin\\ptxas.exe'",
     "'bin\\nvlink.exe'", "'bin\\fatbinary.exe'",
 ]:
     req(required, 'assembled CUDA toolkit validation', cuda_region)
+forbid("'bin\\cicc.exe'", 'legacy incorrect CUDA cicc location', cuda_region)
+req('CUDA_ASSEMBLY_FAILURE', 'early Windows CUDA assembly diagnostic capture', cuda_region)
 
 # Root CMake is authoritative and backend names must match artifacts.
 cmake = (ROOT / 'CMakeLists.txt').read_text(encoding='utf-8')
@@ -275,6 +277,13 @@ for token, label in [
     ('OUTPUT_NAME "s2-cpu"', 'CPU output'),
     ('add_executable(s2-cuda-launcher tools/cuda_launcher.cpp)', 'Windows CUDA launcher target'),
     ('/arch:AVX2', 'Windows AVX2 baseline'),
+]:
+    req(token, label, cmake)
+for token, label in [
+    ('find_package(CUDAToolkit REQUIRED)', 'root CUDA toolkit discovery'),
+    ('target_link_libraries(s2 PRIVATE CUDA::cudart_static)', 'direct CUDA runtime dependency'),
+    ('find_package(hip REQUIRED)', 'root HIP package discovery'),
+    ('target_link_libraries(s2 PRIVATE hip::host)', 'direct HIP host runtime dependency'),
 ]:
     req(token, label, cmake)
 try:
@@ -370,6 +379,12 @@ for token, label in [
         errors.append(f'Linux build script contains forbidden {label}: {token!r}')
 if re.search(r'\|\s*grep\s+-q', build_script):
     errors.append('Linux build script uses producer | grep -q under pipefail')
+req('-DSHADERC_ENABLE_EXECUTABLES=ON', 'shaderc executable build enabled', build_script)
+req('--target glslc_exe', 'shaderc glslc executable target', build_script)
+req('build-linux-shaderc/glslc/glslc', 'deterministic glslc executable path', build_script)
+req('asio-src/asio/LICENSE_1_0.txt', 'correct nested Asio license path', build_script)
+if 'asio-src/LICENSE_1_0.txt' in build_script:
+    errors.append('Linux build script still references the nonexistent root Asio license path')
 req('export PATH="$glslc_dir:$PATH"', 'pinned Linux Vulkan glslc PATH', build_script)
 req('-DVulkan_GLSLC_EXECUTABLE="$glslc"', 'explicit Linux Vulkan glslc CMake hint', build_script)
 for token in [
@@ -417,6 +432,9 @@ if text.count('Collect robust crash report') != 10:
 if text.count('Upload concise failure diagnostics') != 10:
     errors.append('all ten backend jobs must upload captured diagnostic logs on failure')
 crash = (ROOT / 'tools/ci/collect-crash-report.py').read_text(encoding='utf-8')
+for source, label in [(diag, 'diagnostic runner'), (crash, 'crash report collector')]:
+    if 'CMAKE_PROBE_MISS' not in source:
+        errors.append(f'{label} must ignore nonfatal CMake feature-test misses')
 for token, label in [
     ('GITHUB_RUN_ATTEMPT', 'run-attempt metadata'),
     ('RUNNER_ARCH', 'runner architecture metadata'),

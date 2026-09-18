@@ -40,6 +40,7 @@ PATTERNS = [
     ]
 ]
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CMAKE_PROBE_MISS = re.compile(r"^\s*--\s+(?:Performing Test|Looking for)\b.*-\s*(?:Failed|not found)\s*$", re.I)
 
 
 def gh_escape(s: str) -> str:
@@ -50,6 +51,8 @@ def find_error(lines: list[str]) -> int:
     clean = [ANSI.sub('', x) for x in lines]
     for pat in PATTERNS:
         for i, line in enumerate(clean):
+            if CMAKE_PROBE_MISS.search(line):
+                continue
             if pat.search(line):
                 return i
     return max(0, len(lines) - 1)

@@ -138,10 +138,16 @@ if [[ "$backend" == "vulkan" ]]; then
     -DCMAKE_BUILD_TYPE=Release \
     -DSHADERC_SKIP_TESTS=ON \
     -DSHADERC_SKIP_EXAMPLES=ON \
+    -DSHADERC_ENABLE_EXECUTABLES=ON \
     -DSHADERC_ENABLE_HLSL=OFF
-  cmake --build "$root/build-linux-shaderc" --target glslc --parallel "$jobs"
-  glslc="$(find "$root/build-linux-shaderc" -type f -name glslc -perm -111 -print -quit)"
-  test -n "$glslc" && test -x "$glslc"
+  # In shaderc 2026.3, target "glslc" is a static library; the command-line
+  # executable is target "glslc_exe" with OUTPUT_NAME "glslc".
+  cmake --build "$root/build-linux-shaderc" --target glslc_exe --parallel "$jobs"
+  glslc="$root/build-linux-shaderc/glslc/glslc"
+  if [[ ! -x "$glslc" ]]; then
+    echo "::error::Pinned shaderc build did not produce executable: $glslc" >&2
+    exit 1
+  fi
   # CMake 4.4 FindVulkan treats glslc as a required component when Vulkan is
   # enabled. Put our pinned, freshly-built glslc on PATH as well as passing
   # Vulkan_GLSLC_EXECUTABLE explicitly so both discovery paths agree.
@@ -210,10 +216,12 @@ fi
 # Crow and standalone Asio are header-only dependencies whose code is compiled
 # into every executable. Preserve their redistribution notices in each Linux
 # archive, alongside the runtime licenses above.
-test -f "$deps/crow-src/LICENSE"
-test -f "$deps/asio-src/LICENSE_1_0.txt"
-cp "$deps/crow-src/LICENSE" "$release/LICENSE-Crow-BSD-3-Clause.txt"
-cp "$deps/asio-src/LICENSE_1_0.txt" "$release/LICENSE-Asio-Boost-1.0.txt"
+crow_license="$deps/crow-src/LICENSE"
+asio_license="$deps/asio-src/asio/LICENSE_1_0.txt"
+[[ -f "$crow_license" ]] || { echo "::error::Crow license missing: $crow_license" >&2; exit 1; }
+[[ -f "$asio_license" ]] || { echo "::error::Asio license missing: $asio_license" >&2; exit 1; }
+cp "$crow_license" "$release/LICENSE-Crow-BSD-3-Clause.txt"
+cp "$asio_license" "$release/LICENSE-Asio-Boost-1.0.txt"
 
 cat > "$release/THIRD_PARTY_NOTICES.txt" <<EOF
 This archive contains code from Crow 1.3.4 (BSD-3-Clause) and standalone

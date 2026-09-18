@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CMAKE_PROBE_MISS = re.compile(r"^\s*--\s+(?:Performing Test|Looking for)\b.*-\s*(?:Failed|not found)\s*$", re.I)
 ERR = re.compile(r"(?:CMake Error|fatal error|\berror:|\bFAILED:|undefined reference|cannot find -l|nvcc fatal|HIP error|HSA_STATUS_ERROR|Traceback|Exception|PowerShell parser rejected|SHA-256 mismatch|not found|failed)", re.I)
 SAFE_ENV = [
     'GITHUB_WORKFLOW','GITHUB_JOB','GITHUB_RUN_ID','GITHUB_RUN_NUMBER','GITHUB_RUN_ATTEMPT',
@@ -72,8 +73,11 @@ def command_version(cmd: list[str]) -> str:
 
 def first_error(lines: list[str]) -> tuple[int, str]:
     for i, line in enumerate(lines):
-        if ERR.search(clean(line)):
-            return i, clean(line).strip()
+        cleaned = clean(line)
+        if CMAKE_PROBE_MISS.search(cleaned):
+            continue
+        if ERR.search(cleaned):
+            return i, cleaned.strip()
     if lines:
         return len(lines)-1, clean(lines[-1]).strip()
     return 0, 'No captured log line was available.'

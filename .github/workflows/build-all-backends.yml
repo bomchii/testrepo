@@ -408,7 +408,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           Set-StrictMode -Version Latest
+          New-Item -ItemType Directory -Force ci-logs | Out-Null
+          $assembleLog = Join-Path (Get-Location) 'ci-logs\windows-cuda-assemble.log'
 
+          try {
           $redistBase = 'https://developer.download.nvidia.com/compute/cuda/redist'
           $manifestPath = Join-Path $env:RUNNER_TEMP 'redistrib_13.2.0.json'
           curl.exe -fL --retry 3 --retry-delay 2 -o $manifestPath "$redistBase/redistrib_13.2.0.json"
@@ -476,7 +479,7 @@ jobs:
             'bin\nvcc.exe', 'include\cuda_runtime.h', 'include\cccl\cub', 'include\cccl\thrust', 'include\cccl\cuda',
             'include\cublas_v2.h', 'lib\x64\cudart_static.lib', 'lib\x64\cudadevrt.lib',
             'lib\x64\cuda.lib', 'lib\x64\cublas.lib', 'lib\x64\cublasLt.lib',
-            'nvvm\libdevice\libdevice.10.bc', 'bin\cicc.exe', 'bin\ptxas.exe',
+            'nvvm\libdevice\libdevice.10.bc', 'nvvm\bin\cicc.exe', 'bin\ptxas.exe',
             'bin\nvlink.exe', 'bin\fatbinary.exe'
           )
           foreach ($relative in $required) {
@@ -505,6 +508,16 @@ jobs:
           (Join-Path $cudaRoot 'bin') >> $env:GITHUB_PATH
           Write-Host "CUDA_PATH=$cudaRoot"
           Write-Host "VS2026_PATH=$vsRoot"
+          } catch {
+              @(
+                  'CUDA_ASSEMBLY_FAILURE'
+                  "message=$($_.Exception.Message)"
+                  "category=$($_.CategoryInfo)"
+                  "position=$($_.InvocationInfo.PositionMessage)"
+                  "stack=$($_.ScriptStackTrace)"
+              ) | Set-Content -Path $assembleLog -Encoding utf8
+              throw
+          }
 
       - name: Probe CUDA compiler with Ninja + VS 2026 host compiler
         shell: pwsh

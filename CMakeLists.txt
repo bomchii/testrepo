@@ -60,6 +60,19 @@ elseif(S2_METAL)
 endif()
 
 
+# main.cpp calls the CUDA/HIP host runtime APIs directly. Resolve those packages
+# in the root directory so the s2 target receives their headers, platform
+# definitions, and link requirements instead of relying on GGML's private
+# backend dependencies to leak into its parent target.
+if(S2_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+elseif(S2_HIP)
+    find_package(hip REQUIRED)
+    if(NOT TARGET hip::host)
+        message(FATAL_ERROR "HIP package was found but does not provide hip::host")
+    endif()
+endif()
+
 add_subdirectory(ggml)
 
 # ---------------------------------------------------------------------------
@@ -182,6 +195,20 @@ if(S2_HEADER_ONLY_CROW)
     target_link_libraries(s2 PRIVATE ggml)
 else()
     target_link_libraries(s2 PRIVATE ggml Crow::Crow)
+endif()
+
+# The executable itself includes the vendor runtime header and calls device
+# discovery APIs, so make that dependency direct and explicit. CUDA's imported
+# static runtime target also supplies CUDAToolkit include directories. ROCm's
+# documented hip::host target supplies HIP include paths/platform definitions
+# and host-runtime link requirements for ordinary C++ sources.
+if(S2_CUDA)
+    if(NOT TARGET CUDA::cudart_static)
+        message(FATAL_ERROR "CUDAToolkit was found but CUDA::cudart_static is unavailable")
+    endif()
+    target_link_libraries(s2 PRIVATE CUDA::cudart_static)
+elseif(S2_HIP)
+    target_link_libraries(s2 PRIVATE hip::host)
 endif()
 
 if(S2_VULKAN)
