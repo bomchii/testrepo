@@ -485,10 +485,18 @@ jobs:
           foreach ($relative in $required) {
               if (-Not (Test-Path (Join-Path $cudaRoot $relative))) { throw "Assembled CUDA toolkit missing $relative" }
           }
+          # CUDA 13.x Windows redistributables place architecture-specific runtime
+          # DLLs (including cuBLAS/cuBLASLt) under bin\x64 rather than only bin.
+          # Search both locations because nvJitLink and tool executables may still
+          # live directly under bin.
+          $cudaRuntimeDirs = @(
+              (Join-Path $cudaRoot 'bin\x64'),
+              (Join-Path $cudaRoot 'bin')
+          ) | Where-Object { Test-Path $_ }
+          if (-Not (Test-Path (Join-Path $cudaRoot 'bin\x64'))) { throw 'Assembled CUDA 13.2 toolkit missing bin\x64 runtime directory' }
           foreach ($pattern in @('cublas64_*.dll', 'cublasLt64_*.dll', 'nvJitLink*.dll')) {
-              if (-Not (Get-ChildItem (Join-Path $cudaRoot 'bin') -Filter $pattern -File -ErrorAction SilentlyContinue)) {
-                  throw "Assembled CUDA toolkit missing runtime DLL pattern $pattern"
-              }
+              $match = @($cudaRuntimeDirs | ForEach-Object { Get-ChildItem $_ -Filter $pattern -File -ErrorAction SilentlyContinue })
+              if (-Not $match.Count) { throw "Assembled CUDA toolkit missing runtime DLL pattern $pattern" }
           }
           if (Get-ChildItem $cudaRoot -Recurse -Filter 'nvcuda.dll' -File -ErrorAction SilentlyContinue) {
               throw 'nvcuda.dll is driver-owned and must not be present in the assembled toolkit'
@@ -505,6 +513,8 @@ jobs:
           "CUDA_PATH=$cudaRoot" >> $env:GITHUB_ENV
           "CUDAToolkit_ROOT=$cudaRoot" >> $env:GITHUB_ENV
           "VS2026_PATH=$vsRoot" >> $env:GITHUB_ENV
+          # nvcc/tools are in bin; CUDA 13.x runtime DLLs are in bin\x64.
+          (Join-Path $cudaRoot 'bin\x64') >> $env:GITHUB_PATH
           (Join-Path $cudaRoot 'bin') >> $env:GITHUB_PATH
           Write-Host "CUDA_PATH=$cudaRoot"
           Write-Host "VS2026_PATH=$vsRoot"
@@ -652,7 +662,17 @@ jobs:
           $core = (Resolve-Path "build-cuda\s2-cuda-core.exe").Path
           $launcher = (Resolve-Path "build-cuda\s2-cuda-launcher.exe").Path
           $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+          $cudaBinX64 = Join-Path $cudaBin 'x64'
           if (-Not (Test-Path $cudaBin)) { throw "CUDA bin does not exist: $cudaBin" }
+          if (-Not (Test-Path $cudaBinX64)) { throw "CUDA 13.2 runtime bin does not exist: $cudaBinX64" }
+          $cudaRuntimeDirs = @($cudaBinX64, $cudaBin)
+          function Find-CudaRuntimeDll([string]$name) {
+            foreach ($dir in $cudaRuntimeDirs) {
+              $candidate = Join-Path $dir $name
+              if (Test-Path $candidate) { return (Resolve-Path $candidate).Path }
+            }
+            return $null
+          }
           $dumpbin = Get-ChildItem "$env:VS2026_PATH\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction Stop |
                      Sort-Object FullName -Descending | Select-Object -First 1
           function Get-PeDependencies([string]$file) {
@@ -670,7 +690,7 @@ jobs:
 
           # cuBLAS may load cuBLASLt dynamically, so seed it explicitly and then
           # walk imports recursively. Toolkit DLLs win over polluted System32.
-          Get-ChildItem $cudaBin -Filter 'cublasLt64_*.dll' -ErrorAction SilentlyContinue | ForEach-Object {
+          $cudaRuntimeDirs | ForEach-Object { Get-ChildItem $_ -Filter 'cublasLt64_*.dll' -File -ErrorAction SilentlyContinue } | ForEach-Object {
             if ($copied.Add($_.Name)) { Copy-Item $_.FullName (Join-Path cuda-payload $_.Name); $queue.Enqueue($_.FullName) }
           }
           while ($queue.Count -gt 0) {
@@ -690,8 +710,8 @@ jobs:
                 $missing.Add("$dep (MSVC OpenMP runtime required by $([IO.Path]::GetFileName($current)))")
                 continue
               }
-              $cudaDll = Join-Path $cudaBin $dep
-              if (Test-Path $cudaDll) {
+              $cudaDll = Find-CudaRuntimeDll $dep
+              if ($cudaDll) {
                 if ($copied.Add($dep)) { Copy-Item $cudaDll (Join-Path cuda-payload $dep); $queue.Enqueue($cudaDll) }
                 continue
               }
@@ -1746,14 +1766,46 @@ jobs:
           rocm_lib="$ROCM_PATH/lib"
           test -d "$rocm_lib"
 
+          # ROCm wheel installs are split: rocm-sdk path --root points at the
+          # devel package, while runtime/system dependencies also live in sibling
+          # _rocm_sdk_core and _rocm_sdk_libraries packages. Build ldd's lookup
+          # path from all three without copying the complete SDK.
+          rocm_site="$($ROCM_VENV/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+          test -d "$rocm_site"
+          rocm_sdk_roots=(
+            "$ROCM_PATH"
+            "$rocm_site/_rocm_sdk_core"
+            "$rocm_site/_rocm_sdk_libraries"
+          )
+          rocm_loader_dirs=(
+            "$ROCM_PATH/lib"
+            "$ROCM_PATH/lib/llvm/lib"
+            "$rocm_site/_rocm_sdk_core/lib"
+            "$rocm_site/_rocm_sdk_core/lib/rocm_sysdeps/lib"
+            "$rocm_site/_rocm_sdk_libraries/lib"
+          )
+          rocm_sdk_ld_path=""
+          for dir in "${rocm_loader_dirs[@]}"; do
+            test -d "$dir" || continue
+            rocm_sdk_ld_path="${rocm_sdk_ld_path:+$rocm_sdk_ld_path:}$dir"
+          done
+          test -n "$rocm_sdk_ld_path" || { echo '::error::No ROCm wheel runtime library directories found'; exit 1; }
+          printf 'ROCM_CLOSURE_LD_PATH=%s\n' "$rocm_sdk_ld_path"
+
+          is_rocm_sdk_path() {
+            local path="$1" root
+            for root in "${rocm_sdk_roots[@]}"; do
+              test -d "$root" || continue
+              case "$path" in "$root"/*) return 0 ;; esac
+            done
+            return 1
+          }
+
           copy_rocm_lib() {
             local src="$1" name dst existing_hash new_hash
             src="$(readlink -f "$src")"
             test -f "$src" || { echo "::error::ROCm library target missing: $1"; return 1; }
-            case "$src" in
-              "$ROCM_PATH"/*) ;;
-              *) echo "::error::Refusing ROCm dependency outside SDK root: $src"; return 1 ;;
-            esac
+            is_rocm_sdk_path "$src" || { echo "::error::Refusing ROCm dependency outside approved wheel SDK roots: $src"; return 1; }
             name="$(basename "$1")"
             dst="release-rocm/rocm/lib/$name"
             if test -e "$dst"; then
@@ -1766,15 +1818,15 @@ jobs:
           }
 
           # Seed the closure with all ROCm dependencies visible from the executable
-          # and GGML shared libraries. ldd resolves them against the initialized SDK.
+          # and GGML shared libraries. Resolve against the wheel SDK only while
+          # collecting; the final audit below deliberately uses package paths only.
           collect_rocm_needed() {
-            local obj="$1" dep
+            local obj="$1" dep scan_path
+            scan_path="$PWD/release-rocm:$PWD/release-rocm/rocm/lib:$rocm_sdk_ld_path"
             while IFS= read -r dep; do
               test -n "$dep" || continue
-              case "$dep" in
-                "$ROCM_PATH"/*) copy_rocm_lib "$dep" ;;
-              esac
-            done < <(ldd "$obj" | awk '/=> \// { print $3 } /^\// { print $1 }')
+              if is_rocm_sdk_path "$dep"; then copy_rocm_lib "$dep"; fi
+            done < <(LD_LIBRARY_PATH="$scan_path" ldd "$obj" | awk '/=> \// { print $3 } /^\// { print $1 }')
           }
           collect_rocm_needed release-rocm/s2-amd-core
           for so in release-rocm/libggml*.so*; do test -e "$so" && collect_rocm_needed "$so"; done

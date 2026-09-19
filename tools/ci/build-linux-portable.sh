@@ -155,6 +155,18 @@ if [[ "$backend" == "vulkan" ]]; then
   export PATH="$glslc_dir:$PATH"
   "$glslc" --version | sed -n '1p'
 
+  # This repository snapshot contains an old generated shader declaration header
+  # in ggml's source directory. ggml-vulkan.cpp includes it with quotes, so the
+  # source copy shadows the freshly generated build-tree header and can leave new
+  # shader variants (for example coopmat cm1/cm2) undeclared. Remove only the
+  # generated source-tree header in the ephemeral CI checkout; CMake regenerates
+  # the matching header in the build directory. Do not modify vendored ggml in
+  # the published repository.
+  stale_shader_header="$root/ggml/src/ggml-vulkan/ggml-vulkan-shaders.hpp"
+  rm -f "$stale_shader_header"
+  test ! -e "$stale_shader_header"
+  echo "VULKAN_STALE_SHADER_HEADER_CLEARED"
+
   libvulkan="$(find "$vkprefix" -type f \( -name 'libvulkan.so.1' -o -name 'libvulkan.so.1.*' \) -print -quit)"
   test -n "$libvulkan" && test -f "$libvulkan"
   cmake -S . -B "$build" "${common[@]}" \
@@ -350,7 +362,7 @@ fi
 public_backend="$backend"
 public_name="s2-linux-${public_backend}-x86-64"
 rm -f "$public_name"
-"$root/tools/ci/make-linux-singlefile.sh" "$release" "s2-$backend" "$root/$public_name" "linux-$backend-x86-64"
+bash "$root/tools/ci/make-linux-singlefile.sh" "$release" "s2-$backend" "$root/$public_name" "linux-$backend-x86-64"
 test -x "$public_name"
 file "$public_name" || true
 "$public_name" --runtime-info | tee "$root/ci-logs-linux-${backend}-runtime-info.txt"

@@ -164,6 +164,11 @@ forbid('device-all]==7.14.1', 'ROCm device-all disk-space hazard')
 forbid('cp -aL "$ROCM_PATH/lib/."', 'ROCm symlink dereference/disk-space hazard')
 forbid('cp -a "$ROCM_PATH/lib/."', 'ROCm full-SDK copy/disk-space hazard')
 req('Build a fail-closed ELF dependency', 'bounded Linux ROCm runtime closure')
+req('_rocm_sdk_core/lib/rocm_sysdeps/lib', 'ROCm wheel core sysdeps runtime path')
+req('_rocm_sdk_libraries/lib', 'ROCm wheel libraries runtime path')
+req('ROCM_CLOSURE_LD_PATH=', 'ROCm closure loader-path diagnostic')
+req('is_rocm_sdk_path', 'ROCm multi-wheel-root dependency allowlist')
+req('LD_LIBRARY_PATH="$scan_path" ldd', 'ROCm transitive closure SDK resolver')
 req("'librocm_kpack.so*'", 'Linux ROCm dynamically loaded kpack runtime')
 req('Expected exactly one %s kernel data directory', 'Linux ROCm kernel-data layout guard')
 forbid('tar -tzf s2-linux-x86_64-rocm.tar.gz | head', 'pipefail/SIGPIPE-prone ROCm tar preview')
@@ -262,6 +267,9 @@ for required in [
     req(required, 'assembled CUDA toolkit validation', cuda_region)
 forbid("'bin\\cicc.exe'", 'legacy incorrect CUDA cicc location', cuda_region)
 req('CUDA_ASSEMBLY_FAILURE', 'early Windows CUDA assembly diagnostic capture', cuda_region)
+req("Join-Path $cudaRoot 'bin\\x64'", 'CUDA 13.x Windows runtime DLL directory', cuda_region)
+req("Join-Path $cudaBin 'x64'", 'CUDA payload bin\\x64 lookup', cuda_region)
+req('Find-CudaRuntimeDll', 'CUDA payload dual runtime-directory resolver', cuda_region)
 
 # Root CMake is authoritative and backend names must match artifacts.
 cmake = (ROOT / 'CMakeLists.txt').read_text(encoding='utf-8')
@@ -387,6 +395,9 @@ if 'asio-src/LICENSE_1_0.txt' in build_script:
     errors.append('Linux build script still references the nonexistent root Asio license path')
 req('export PATH="$glslc_dir:$PATH"', 'pinned Linux Vulkan glslc PATH', build_script)
 req('-DVulkan_GLSLC_EXECUTABLE="$glslc"', 'explicit Linux Vulkan glslc CMake hint', build_script)
+req('VULKAN_STALE_SHADER_HEADER_CLEARED', 'stale source Vulkan shader header cleanup', build_script)
+req('rm -f "$stale_shader_header"', 'ephemeral stale Vulkan generated-header removal', build_script)
+req('bash "$root/tools/ci/make-linux-singlefile.sh"', 'ZIP-safe Bash invocation of Linux single-file packer', build_script)
 for token in [
     'vulkan-sdk-1.4.357.0', 'v2026.3',
     'e3b1eec08173d6b825cd3ac88c885a63b621504a',
