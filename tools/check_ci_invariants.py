@@ -398,6 +398,8 @@ req('-DVulkan_GLSLC_EXECUTABLE="$glslc"', 'explicit Linux Vulkan glslc CMake hin
 req('VULKAN_STALE_SHADER_HEADER_CLEARED', 'stale source Vulkan shader header cleanup', build_script)
 req('rm -f "$stale_shader_header"', 'ephemeral stale Vulkan generated-header removal', build_script)
 req('bash "$root/tools/ci/make-linux-singlefile.sh"', 'ZIP-safe Bash invocation of Linux single-file packer', build_script)
+req('"$root/$public_name" --runtime-info', 'absolute-path Linux single-file runtime-info execution', build_script)
+forbid('"$public_name" --runtime-info', 'bare Linux single-file execution that fails when dot is absent from PATH', build_script)
 for token in [
     'vulkan-sdk-1.4.357.0', 'v2026.3',
     'e3b1eec08173d6b825cd3ac88c885a63b621504a',

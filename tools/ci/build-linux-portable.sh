@@ -365,7 +365,7 @@ rm -f "$public_name"
 bash "$root/tools/ci/make-linux-singlefile.sh" "$release" "s2-$backend" "$root/$public_name" "linux-$backend-x86-64"
 test -x "$public_name"
 file "$public_name" || true
-"$public_name" --runtime-info | tee "$root/ci-logs-linux-${backend}-runtime-info.txt"
+"$root/$public_name" --runtime-info | tee "$root/ci-logs-linux-${backend}-runtime-info.txt"
 # The published payload is exactly one executable. Sidecars/licenses remain
 # embedded inside its verified runtime payload and are extracted only to cache.
 test "$(find "$root" -maxdepth 1 -type f -name "$public_name" | wc -l | tr -d ' ')" = 1
