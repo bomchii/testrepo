@@ -434,6 +434,121 @@ std::vector<float> audio_resample(const float * data, size_t n_samples, int32_t 
     return out;
 }
 
+std::vector<float> audio_time_stretch(const float * data, size_t n_samples, int32_t sample_rate, float speed) {
+    if (!data || n_samples == 0 || sample_rate <= 0 || !std::isfinite(speed) ||
+        speed < 0.5f || speed > 2.0f) return {};
+    if (std::fabs(speed - 1.0f) < 1e-5f) return std::vector<float>(data, data + n_samples);
+
+    // Small WSOLA/SOLA implementation for mono speech.  We choose overlapping
+    // analysis windows by normalized correlation, then crossfade them at a
+    // fixed synthesis hop.  This changes duration without changing sample rate.
+    const size_t win = std::max<size_t>(64, static_cast<size_t>(sample_rate * 0.030));
+    const size_t overlap = win / 2;
+    const size_t synth_hop = win - overlap;
+    const double analysis_hop_f = static_cast<double>(synth_hop) * speed;
+    const size_t search = std::max<size_t>(8, static_cast<size_t>(sample_rate * 0.010));
+    const size_t expected_out = static_cast<size_t>(std::ceil(static_cast<double>(n_samples) / speed));
+    if (expected_out == 0 || expected_out > MAX_DECODED_MONO_FRAMES) return {};
+    if (n_samples <= win + search) {
+        // Very short clips do not contain enough context for WSOLA matching.
+        // Linear duration interpolation is safer than returning nothing.
+        std::vector<float> out(expected_out);
+        for (size_t i = 0; i < expected_out; ++i) {
+            const double pos = std::min<double>(n_samples - 1, i * speed);
+            const size_t a = static_cast<size_t>(pos);
+            const size_t b = std::min(a + 1, n_samples - 1);
+            const float f = static_cast<float>(pos - a);
+            out[i] = data[a] * (1.0f - f) + data[b] * f;
+        }
+        return out;
+    }
+
+    std::vector<float> out;
+    try { out.assign(expected_out + win + search, 0.0f); }
+    catch (const std::bad_alloc &) { return {}; }
+    std::vector<float> weight(out.size(), 0.0f);
+
+    auto add_window = [&](size_t in_pos, size_t out_pos) {
+        const size_t count = std::min(win, n_samples - in_pos);
+        for (size_t j = 0; j < count && out_pos + j < out.size(); ++j) {
+            // Hann window avoids discontinuities at both edges.
+            const float w = 0.5f - 0.5f * std::cos(static_cast<float>(2.0 * 3.14159265358979323846 * j / std::max<size_t>(1, win - 1)));
+            out[out_pos + j] += data[in_pos + j] * w;
+            weight[out_pos + j] += w;
+        }
+    };
+
+    size_t in_pos = 0;
+    size_t out_pos = 0;
+    add_window(0, 0);
+    double desired_in = analysis_hop_f;
+    out_pos += synth_hop;
+
+    while (out_pos < expected_out && desired_in + win < static_cast<double>(n_samples + search)) {
+        const size_t center = static_cast<size_t>(std::llround(desired_in));
+        const size_t lo = center > search ? center - search : 0;
+        const size_t hi = std::min(n_samples > win ? n_samples - win : 0, center + search);
+        size_t best = std::min(center, hi);
+        long double best_corr = -2.0L;
+
+        // Compare candidate input overlap against the already synthesized tail.
+        for (size_t cand = lo; cand <= hi; ++cand) {
+            long double dot = 0.0L, aa = 0.0L, bb = 0.0L;
+            for (size_t j = 0; j < overlap && out_pos + j < out.size() && cand + j < n_samples; ++j) {
+                const float existing = weight[out_pos + j] > 1e-9f ? out[out_pos + j] / weight[out_pos + j] : 0.0f;
+                const float incoming = data[cand + j];
+                dot += static_cast<long double>(existing) * incoming;
+                aa += static_cast<long double>(existing) * existing;
+                bb += static_cast<long double>(incoming) * incoming;
+            }
+            const long double denom = std::sqrt(std::max<long double>(aa * bb, 1e-24L));
+            const long double corr = denom > 0.0L ? dot / denom : 0.0L;
+            if (corr > best_corr) { best_corr = corr; best = cand; }
+            if (cand == hi) break; // avoid size_t wrap
+        }
+        in_pos = best;
+        add_window(in_pos, out_pos);
+        out_pos += synth_hop;
+        desired_in += analysis_hop_f;
+        if (in_pos + 1 >= n_samples) break;
+    }
+
+    out.resize(expected_out);
+    weight.resize(expected_out);
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (weight[i] > 1e-9f) out[i] /= weight[i];
+        else {
+            const size_t src = std::min(n_samples - 1, static_cast<size_t>(std::min<double>(n_samples - 1, i * speed)));
+            out[i] = data[src];
+        }
+        if (!std::isfinite(out[i])) out[i] = 0.0f;
+    }
+    return out;
+}
+
+void audio_normalize_loudness(std::vector<float> & audio, float target_dbfs) {
+    if (audio.empty() || !std::isfinite(target_dbfs) || target_dbfs > 0.0f || target_dbfs < -80.0f) return;
+    long double sum_sq = 0.0L;
+    size_t n = 0;
+    for (float x : audio) {
+        if (!std::isfinite(x)) continue;
+        sum_sq += static_cast<long double>(x) * x;
+        ++n;
+    }
+    if (n == 0) return;
+    const long double rms = std::sqrt(sum_sq / static_cast<long double>(n));
+    if (!(rms > 1e-9L)) return;
+    const long double target = std::pow(10.0L, static_cast<long double>(target_dbfs) / 20.0L);
+    long double gain = target / rms;
+    long double peak = 0.0L;
+    for (float x : audio) if (std::isfinite(x)) peak = std::max(peak, std::fabs(static_cast<long double>(x)));
+    if (peak > 0.0L && peak * gain > 0.999L) gain = 0.999L / peak;
+    for (float & x : audio) {
+        if (!std::isfinite(x)) x = 0.0f;
+        else x = static_cast<float>(std::clamp(static_cast<long double>(x) * gain, -0.999L, 0.999L));
+    }
+}
+
 std::vector<float> audio_trim_trailing_silence(const float * data, size_t n_samples,
                                                int32_t sample_rate,
                                                float threshold,

@@ -63,6 +63,23 @@ static FILE * open_binary_input_utf8(const std::string & path) {
 #endif
 }
 
+static bool hash_file_content_utf8(const std::string & path, uint64_t & out_hash) {
+    out_hash = 1469598103934665603ull;
+    FILE * f = open_binary_input_utf8(path);
+    if (!f) return false;
+    struct Guard { FILE * f; ~Guard() { if (f) std::fclose(f); } } guard{f};
+    unsigned char buf[64u * 1024u];
+    for (;;) {
+        const size_t n = std::fread(buf, 1, sizeof(buf), f);
+        for (size_t i = 0; i < n; ++i) { out_hash ^= buf[i]; out_hash *= 1099511628211ull; }
+        if (n < sizeof(buf)) {
+            if (std::ferror(f)) return false;
+            break;
+        }
+    }
+    return true;
+}
+
 static void remove_file_utf8(const std::string & path) noexcept {
     if (path.empty()) return;
 #ifdef _WIN32
@@ -177,224 +194,174 @@ struct KvCacheScope {
 Pipeline::Pipeline()  = default;
 Pipeline::~Pipeline() = default;
 
-static void build_wav_header(char * hdr, uint32_t n_samples, int32_t sample_rate,
-                             int16_t n_channels = 1, int16_t bits = 16);
+static void put_le16(char * p, uint16_t v) {
+    p[0] = static_cast<char>(v & 0xffu); p[1] = static_cast<char>((v >> 8) & 0xffu);
+}
+static void put_le32(char * p, uint32_t v) {
+    for (int i = 0; i < 4; ++i) p[i] = static_cast<char>((v >> (8*i)) & 0xffu);
+}
+static void put_le64(char * p, uint64_t v) {
+    for (int i = 0; i < 8; ++i) p[i] = static_cast<char>((v >> (8*i)) & 0xffu);
+}
 
-// ---------------------------------------------------------------------------
-// TempWavFile -- incremental mono PCM16 WAV writer in %TEMP% (or /tmp).
-//
-// Escribe float32 -> int16 directamente a disco segmento a segmento.
-// Nunca acumula mas de un segmento en RAM.
-// La cabecera RIFF provisional se parchea al final; no se crea una segunda
-// copia WAV, por lo que el pico de disco queda cerca de 1x el audio final.
-// ---------------------------------------------------------------------------
+static void build_wav_header(char * hdr, uint32_t n_samples, int32_t sample_rate,
+                             int16_t n_channels = 1, int16_t bits = 16) {
+    const uint32_t data_size = n_samples * static_cast<uint32_t>(n_channels) * static_cast<uint32_t>(bits / 8);
+    const uint32_t file_size = 36u + data_size;
+    const uint32_t byte_rate = static_cast<uint32_t>(sample_rate) * static_cast<uint32_t>(n_channels) * static_cast<uint32_t>(bits / 8);
+    const uint16_t block_align = static_cast<uint16_t>(n_channels * (bits / 8));
+    std::memcpy(hdr + 0, "RIFF", 4); put_le32(hdr + 4, file_size);
+    std::memcpy(hdr + 8, "WAVEfmt ", 8); put_le32(hdr + 16, 16u);
+    put_le16(hdr + 20, 1u); put_le16(hdr + 22, static_cast<uint16_t>(n_channels));
+    put_le32(hdr + 24, static_cast<uint32_t>(sample_rate)); put_le32(hdr + 28, byte_rate);
+    put_le16(hdr + 32, block_align); put_le16(hdr + 34, static_cast<uint16_t>(bits));
+    std::memcpy(hdr + 36, "data", 4); put_le32(hdr + 40, data_size);
+}
+
+// EBU Tech 3306 RF64 layout: RF64 + ds64 + fmt + data, 80-byte header for PCM16 mono.
+static void build_rf64_header(char * hdr, uint64_t n_samples, int32_t sample_rate,
+                              int16_t n_channels = 1, int16_t bits = 16) {
+    const uint64_t data_size = n_samples * static_cast<uint64_t>(n_channels) * static_cast<uint64_t>(bits / 8);
+    const uint64_t riff_size = 72ull + data_size;
+    const uint32_t byte_rate = static_cast<uint32_t>(sample_rate) * static_cast<uint32_t>(n_channels) * static_cast<uint32_t>(bits / 8);
+    const uint16_t block_align = static_cast<uint16_t>(n_channels * (bits / 8));
+    std::memset(hdr, 0, 80);
+    std::memcpy(hdr + 0, "RF64", 4); put_le32(hdr + 4, 0xffffffffu); std::memcpy(hdr + 8, "WAVE", 4);
+    std::memcpy(hdr + 12, "ds64", 4); put_le32(hdr + 16, 28u);
+    put_le64(hdr + 20, riff_size); put_le64(hdr + 28, data_size); put_le64(hdr + 36, n_samples); put_le32(hdr + 44, 0u);
+    std::memcpy(hdr + 48, "fmt ", 4); put_le32(hdr + 52, 16u); put_le16(hdr + 56, 1u);
+    put_le16(hdr + 58, static_cast<uint16_t>(n_channels)); put_le32(hdr + 60, static_cast<uint32_t>(sample_rate));
+    put_le32(hdr + 64, byte_rate); put_le16(hdr + 68, block_align); put_le16(hdr + 70, static_cast<uint16_t>(bits));
+    std::memcpy(hdr + 72, "data", 4); put_le32(hdr + 76, 0xffffffffu);
+}
+
+// Incremental mono PCM16 WAV/RF64 writer. It never holds more than one decoded
+// segment in RAM and patches the provisional header in-place at finalization.
 struct TempWavFile {
-    FILE*    fp          = nullptr;
-    uint64_t total_samps = 0;   // int16 samples escritas en total
-    int32_t  wav_sample_rate = 0;
-    bool     finalized = false;
+    FILE* fp = nullptr;
+    uint64_t total_samps = 0;
+    int32_t wav_sample_rate = 0;
+    bool finalized = false;
+    bool rf64 = false;
     std::string path;
 #ifdef _WIN32
     std::wstring path_w;
 #endif
 
-    bool open(int32_t sample_rate) {
+    size_t header_size() const noexcept { return rf64 ? 80u : 44u; }
+    bool write_provisional_header() {
+        if (!fp) return false;
+        char hdr[80] = {};
+        if (rf64) build_rf64_header(hdr, 0, wav_sample_rate);
+        else build_wav_header(hdr, 0, wav_sample_rate);
+        return std::fwrite(hdr, 1, header_size(), fp) == header_size();
+    }
+
+    bool open(int32_t sample_rate, bool use_rf64 = false) {
         if (sample_rate < 1000 || sample_rate > 768000) return false;
-        wav_sample_rate = sample_rate;
+        wav_sample_rate = sample_rate; rf64 = use_rf64;
 #ifdef _WIN32
         wchar_t tmp_dir[MAX_PATH] = {};
         const DWORD dir_len = GetTempPathW(MAX_PATH, tmp_dir);
         if (dir_len == 0 || dir_len >= MAX_PATH) return false;
-
-        // This helper stores a provisional WAV; keeping the
-        // path returned by GetTempFileNameW also avoids a rename race/failure.
         wchar_t tmp_file[MAX_PATH] = {};
         if (GetTempFileNameW(tmp_dir, L"s2_", 0, tmp_file) == 0) return false;
-
-        // GetTempFileNameW has already created the file. Any std::string/
-        // std::wstring allocation below can throw, so keep the OS path in the
-        // fixed buffer and remove the file on every failure path.
         try {
             const int wlen = static_cast<int>(wcslen(tmp_file));
-            const int n = WideCharToMultiByte(CP_UTF8, 0, tmp_file, wlen,
-                                              nullptr, 0, nullptr, nullptr);
-            if (n <= 0) {
-                DeleteFileW(tmp_file);
-                return false;
-            }
-            path_w.assign(tmp_file);
-            path.resize(static_cast<size_t>(n));
-            if (WideCharToMultiByte(CP_UTF8, 0, tmp_file, wlen,
-                                    path.data(), n, nullptr, nullptr) != n) {
-                DeleteFileW(tmp_file);
-                path.clear();
-                path_w.clear();
-                return false;
+            const int n = WideCharToMultiByte(CP_UTF8, 0, tmp_file, wlen, nullptr, 0, nullptr, nullptr);
+            if (n <= 0) { DeleteFileW(tmp_file); return false; }
+            path_w.assign(tmp_file); path.resize(static_cast<size_t>(n));
+            if (WideCharToMultiByte(CP_UTF8, 0, tmp_file, wlen, path.data(), n, nullptr, nullptr) != n) {
+                DeleteFileW(tmp_file); path.clear(); path_w.clear(); return false;
             }
             fp = _wfopen(tmp_file, L"w+b");
-            if (!fp) {
-                DeleteFileW(tmp_file);
-                path.clear();
-                path_w.clear();
-                return false;
-            }
-        } catch (...) {
-            DeleteFileW(tmp_file);
-            path.clear();
-            path_w.clear();
-            return false;
-        }
+            if (!fp) { DeleteFileW(tmp_file); path.clear(); path_w.clear(); return false; }
+        } catch (...) { DeleteFileW(tmp_file); path.clear(); path_w.clear(); return false; }
 #else
         path = "/tmp/s2_XXXXXX.wav";
-        // mkstemps para extension
         int fd = mkstemps(path.data(), 4);
         if (fd < 0) return false;
         fp = fdopen(fd, "w+b");
-        if (!fp) {
-            ::close(fd);
-            ::unlink(path.c_str());
-            path.clear();
-            return false;
-        }
+        if (!fp) { ::close(fd); ::unlink(path.c_str()); path.clear(); return false; }
 #endif
-        char hdr[44];
-        build_wav_header(hdr, 0, wav_sample_rate);
-        if (std::fwrite(hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) { cleanup(); return false; }
+        if (!write_provisional_header()) { cleanup(); return false; }
         return true;
     }
 
-    bool open_at(const std::string & custom_path, int32_t sample_rate) {
+    bool open_at(const std::string & custom_path, int32_t sample_rate, bool use_rf64 = false) {
         if (custom_path.empty() || sample_rate < 1000 || sample_rate > 768000) return false;
-        wav_sample_rate = sample_rate;
+        wav_sample_rate = sample_rate; rf64 = use_rf64;
         try {
             path = custom_path;
 #ifdef _WIN32
             path_w = fs::path(custom_path).wstring();
 #endif
             fp = open_binary_output_utf8(custom_path);
-        } catch (...) {
-            path.clear();
+        } catch (...) { path.clear();
 #ifdef _WIN32
             path_w.clear();
 #endif
-            fp = nullptr;
-            return false;
-        }
+            fp = nullptr; return false; }
         if (!fp) { cleanup(); return false; }
-        char hdr[44];
-        build_wav_header(hdr, 0, wav_sample_rate);
-        if (std::fwrite(hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) { cleanup(); return false; }
+        if (!write_provisional_header()) { cleanup(); return false; }
         return true;
     }
 
-    // Escribe un segmento de audio float32 -> int16 a disco.
-    // Solo este segmento necesita estar en RAM simultaneamente.
     bool write_segment(const std::vector<float> & samples) {
         if (!fp || samples.empty()) return false;
-        // Every non-streaming caller ultimately emits classic RIFF/WAV, whose
-        // data chunk is uint32-sized. Reject an impossible result *before*
-        // allocating the temporary int16 conversion buffer.
-        constexpr uint64_t MAX_WAV_I16_SAMPLES =
-            (static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - 36u) / sizeof(int16_t);
-        if (total_samps > MAX_WAV_I16_SAMPLES ||
-            samples.size() > static_cast<size_t>(MAX_WAV_I16_SAMPLES - total_samps)) {
-            std::cerr << "Pipeline error: accumulated audio exceeds classic WAV/RIFF 4 GiB limit.\n";
-            return false;
+        if (!rf64) {
+            constexpr uint64_t MAX_WAV_I16_SAMPLES =
+                (static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - 36u) / sizeof(int16_t);
+            if (total_samps > MAX_WAV_I16_SAMPLES || samples.size() > static_cast<size_t>(MAX_WAV_I16_SAMPLES - total_samps)) {
+                std::cerr << "Pipeline error: accumulated audio exceeds classic WAV/RIFF 4 GiB limit; request RF64.\n";
+                return false;
+            }
         }
-        // Convertir float32 -> int16 en un buffer temporal del tamano del segmento
+        if (samples.size() > std::numeric_limits<uint64_t>::max() - total_samps) return false;
         std::vector<int16_t> pcm(samples.size());
         for (size_t i = 0; i < samples.size(); ++i) {
             const float raw = samples[i];
-            if (!std::isfinite(raw)) {
-                std::cerr << "Pipeline error: codec produced NaN/Inf PCM at sample " << i << ".\n";
-                return false;
-            }
-            const float s = std::clamp(raw, -1.0f, 1.0f);
-            pcm[i] = static_cast<int16_t>(s * 32767.0f);
+            if (!std::isfinite(raw)) { std::cerr << "Pipeline error: codec produced NaN/Inf PCM.\n"; return false; }
+            pcm[i] = static_cast<int16_t>(std::clamp(raw, -1.0f, 1.0f) * 32767.0f);
         }
-        size_t written = std::fwrite(pcm.data(), sizeof(int16_t), pcm.size(), fp);
+        const size_t written = std::fwrite(pcm.data(), sizeof(int16_t), pcm.size(), fp);
         if (written != pcm.size()) return false;
-        total_samps += static_cast<uint64_t>(written);
-        return true;
+        total_samps += static_cast<uint64_t>(written); return true;
     }
 
     bool finalize_wav() {
         if (!fp || finalized || wav_sample_rate < 1000 || wav_sample_rate > 768000 || total_samps == 0) return false;
-        constexpr uint64_t MAX_WAV_I16_SAMPLES =
-            (static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - 36u) / sizeof(int16_t);
-        if (total_samps > MAX_WAV_I16_SAMPLES) return false;
-        if (std::fflush(fp) != 0) return false;
-        if (!rewind_binary_file(fp)) return false;
-        char hdr[44];
-        build_wav_header(hdr, static_cast<uint32_t>(total_samps), wav_sample_rate);
-        if (std::fwrite(hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) return false;
+        if (!rf64) {
+            constexpr uint64_t MAX_WAV_I16_SAMPLES =
+                (static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) - 36u) / sizeof(int16_t);
+            if (total_samps > MAX_WAV_I16_SAMPLES) return false;
+        }
+        if (std::fflush(fp) != 0 || !rewind_binary_file(fp)) return false;
+        char hdr[80] = {};
+        if (rf64) build_rf64_header(hdr, total_samps, wav_sample_rate);
+        else build_wav_header(hdr, static_cast<uint32_t>(total_samps), wav_sample_rate);
+        if (std::fwrite(hdr, 1, header_size(), fp) != header_size()) return false;
         if (!sync_binary_file(fp)) return false;
-        finalized = true;
-        return true;
+        finalized = true; return true;
     }
 
-    bool close_file() noexcept {
-        if (!fp) return true;
-        FILE * f = fp;
-        fp = nullptr;
-        return std::fclose(f) == 0;
-    }
-
-    // Transfer ownership of the temporary path to the caller. On Windows keep
-    // the UTF-16 path in sync so the destructor does not delete the released file.
-    std::string release_path() {
-        std::string out = path;
-        path.clear();
+    bool close_file() noexcept { if (!fp) return true; FILE * f = fp; fp = nullptr; return std::fclose(f) == 0; }
+    std::string release_path() { std::string out = path; path.clear();
 #ifdef _WIN32
         path_w.clear();
 #endif
-        return out;
-    }
-
-    // Cierra y borra el archivo temporal
+        return out; }
     void cleanup() {
         if (fp) { std::fclose(fp); fp = nullptr; }
 #ifdef _WIN32
-        if (!path_w.empty()) DeleteFileW(path_w.c_str());
-        path_w.clear();
+        if (!path_w.empty()) DeleteFileW(path_w.c_str()); path_w.clear();
 #else
         if (!path.empty()) ::unlink(path.c_str());
 #endif
-        path.clear();
-        wav_sample_rate = 0;
-        finalized = false;
-        total_samps = 0;
+        path.clear(); wav_sample_rate = 0; finalized = false; total_samps = 0; rf64 = false;
     }
-
     ~TempWavFile() { cleanup(); }
 };
-
-// ---------------------------------------------------------------------------
-// build_wav_header -- 44 bytes estandar PCM WAV
-// ---------------------------------------------------------------------------
-static void build_wav_header(char * hdr, uint32_t n_samples, int32_t sample_rate,
-                              int16_t n_channels, int16_t bits) {
-    uint32_t data_size  = n_samples * n_channels * (bits / 8);
-    uint32_t file_size  = 36 + data_size;
-    uint32_t byte_rate  = sample_rate * n_channels * (bits / 8);
-    uint16_t block_align= n_channels * (bits / 8);
-    uint16_t fmt_pcm    = 1;
-
-    std::memcpy(hdr +  0, "RIFF",      4);
-    std::memcpy(hdr +  4, &file_size,  4);
-    std::memcpy(hdr +  8, "WAVE",      4);
-    std::memcpy(hdr + 12, "fmt ",      4);
-    uint32_t fmt_sz = 16;
-    std::memcpy(hdr + 16, &fmt_sz,     4);
-    std::memcpy(hdr + 20, &fmt_pcm,    2);
-    std::memcpy(hdr + 22, &n_channels, 2);
-    std::memcpy(hdr + 24, &sample_rate,4);
-    std::memcpy(hdr + 28, &byte_rate,  4);
-    std::memcpy(hdr + 32, &block_align,2);
-    std::memcpy(hdr + 34, &bits,       2);
-    std::memcpy(hdr + 36, "data",      4);
-    std::memcpy(hdr + 40, &data_size,  4);
-}
 
 // ---------------------------------------------------------------------------
 // split_sentences -- Unicode/speaker/tag-aware implementation lives in
@@ -435,6 +402,8 @@ bool Pipeline::init(const PipelineParams & params) {
     active_voice_transcript_.clear();
     voice_cache_.clear();
     voice_cache_order_.clear();
+    inline_voice_cache_.clear();
+    inline_voice_cache_order_.clear();
 
     int model_gpu = params.vulkan_device;
     int codec_gpu = params.codec_vulkan_device;
@@ -589,6 +558,8 @@ bool Pipeline::init(const PipelineParams & params) {
     active_voice_transcript_.clear();
     voice_cache_.clear();
     voice_cache_order_.clear();
+    inline_voice_cache_.clear();
+    inline_voice_cache_order_.clear();
     return false;
 }
 
@@ -742,14 +713,24 @@ static void apply_output_gain(std::vector<float> & audio, float db) {
 // ---------------------------------------------------------------------------
 // postprocess_audio -- trim silence (otras operaciones pueden anadirse aqui)
 // ---------------------------------------------------------------------------
-void Pipeline::postprocess_audio(std::vector<float> & audio, const PipelineParams & params) const {
-    if (params.trim_silence && !audio.empty()) {
-        auto trimmed = audio_trim_trailing_silence(audio.data(), audio.size(), codec_.sample_rate());
+void Pipeline::postprocess_audio(std::vector<float> & audio, const PipelineParams & params, bool trim_tail) const {
+    const int32_t native_rate = codec_.sample_rate();
+    if (trim_tail && params.trim_silence && !audio.empty()) {
+        auto trimmed = audio_trim_trailing_silence(audio.data(), audio.size(), native_rate);
         if (!trimmed.empty()) audio = std::move(trimmed);
     }
-    // Fish prosody.volume is specified in decibels. Apply it after trimming so
-    // gain never changes silence-boundary decisions.
+    if (std::fabs(params.prosody_speed - 1.0f) > 1e-6f && !audio.empty()) {
+        auto stretched = audio_time_stretch(audio.data(), audio.size(), native_rate, params.prosody_speed);
+        if (stretched.empty()) { audio.clear(); return; }
+        audio = std::move(stretched);
+    }
+    if (params.normalize_loudness) audio_normalize_loudness(audio);
     apply_output_gain(audio, params.prosody_volume_db);
+    if (params.output_sample_rate > 0 && params.output_sample_rate != native_rate && !audio.empty()) {
+        auto resampled = audio_resample(audio.data(), audio.size(), native_rate, params.output_sample_rate);
+        if (resampled.empty()) { audio.clear(); return; }
+        audio = std::move(resampled);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -776,7 +757,9 @@ bool Pipeline::encode_reference(const PipelineParams & params,
 // Prioridad:
 //   1. prompt_audio_path explicito del request -- cachea/encodea la referencia
 //   2. voice_id persistido (.s2voice) -- se carga fresco desde disco
-//   3. reference.wav + reference.txt globales cargados durante init()
+//   3. references[] inline de Fish -- encodeadas y opcionalmente cacheadas en memoria
+//   4. reference.wav + reference.txt globales cargados durante init()
+//   5. sin referencia
 // ---------------------------------------------------------------------------
 bool Pipeline::get_ref_codes(const PipelineParams & params,
                               std::vector<int32_t> & out_codes,
@@ -832,50 +815,48 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         // explicit reference audio, including cache hits.
         active_voice_transcript_ = params.prompt_text;
 
-        // Cache by path, but verify the file did not change in place. Without
-        // this, overwriting ref.wav would keep returning codes for the old audio.
-        uintmax_t source_size = 0;
-        int64_t source_mtime_ns = 0;
-        bool have_fingerprint = false;
-        try {
-            source_size = fs::file_size(params.prompt_audio_path);
-            const auto ft = fs::last_write_time(params.prompt_audio_path);
-            source_mtime_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                ft.time_since_epoch()).count();
-            have_fingerprint = true;
-        } catch (...) {
-            // Let load_audio() below report the real read error. We simply avoid
-            // trusting an unverifiable cache entry.
-        }
-        const bool fingerprint_before_ok = have_fingerprint;
-        const uintmax_t source_size_before = source_size;
-        const int64_t source_mtime_before_ns = source_mtime_ns;
-
-        auto it = voice_cache_.find(params.prompt_audio_path);
-        if (it != voice_cache_.end()) {
-            const bool fresh = have_fingerprint && it->second.has_fingerprint &&
-                               it->second.source_size == source_size &&
-                               it->second.source_mtime_ns == source_mtime_ns;
-            if (fresh) {
-                std::cout << "[VoiceCache] HIT: " << params.prompt_audio_path << "\n";
-                out_codes    = it->second.codes;
-                out_T_prompt = it->second.T_prompt;
-
-                // Real LRU: a hit becomes the newest entry.
-                voice_cache_order_.erase(
-                    std::remove(voice_cache_order_.begin(), voice_cache_order_.end(), params.prompt_audio_path),
-                    voice_cache_order_.end());
-                voice_cache_order_.push_back(params.prompt_audio_path);
-                return save_profile_if_requested(out_codes, out_T_prompt);
+        // Cache by path only when requested. Fingerprint with content as well as
+        // metadata so same-size replacements on coarse-mtime filesystems cannot
+        // return stale voice codes.
+        const std::string cache_key = "path:" + params.prompt_audio_path;
+        uintmax_t source_size_before = 0;
+        int64_t source_mtime_before_ns = 0;
+        uint64_t source_hash_before = 0;
+        bool fingerprint_before_ok = false;
+        if (params.reference_memory_cache) {
+            try {
+                source_size_before = fs::file_size(params.prompt_audio_path);
+                const auto ft = fs::last_write_time(params.prompt_audio_path);
+                source_mtime_before_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    ft.time_since_epoch()).count();
+                fingerprint_before_ok = hash_file_content_utf8(params.prompt_audio_path, source_hash_before);
+            } catch (...) {
+                fingerprint_before_ok = false;
             }
-            std::cout << "[VoiceCache] STALE -- re-encoding: " << params.prompt_audio_path << "\n";
-            voice_cache_.erase(it);
-            voice_cache_order_.erase(
-                std::remove(voice_cache_order_.begin(), voice_cache_order_.end(), params.prompt_audio_path),
-                voice_cache_order_.end());
+
+            auto it = voice_cache_.find(cache_key);
+            if (it != voice_cache_.end()) {
+                const bool fresh = fingerprint_before_ok && it->second.has_fingerprint &&
+                                   it->second.source_size == source_size_before &&
+                                   it->second.source_mtime_ns == source_mtime_before_ns &&
+                                   it->second.source_hash == source_hash_before;
+                if (fresh) {
+                    std::cout << "[VoiceCache] HIT: " << params.prompt_audio_path << "\n";
+                    out_codes = it->second.codes;
+                    out_T_prompt = it->second.T_prompt;
+                    voice_cache_order_.erase(std::remove(voice_cache_order_.begin(), voice_cache_order_.end(), cache_key), voice_cache_order_.end());
+                    voice_cache_order_.push_back(cache_key);
+                    return save_profile_if_requested(out_codes, out_T_prompt);
+                }
+                std::cout << "[VoiceCache] STALE -- re-encoding: " << params.prompt_audio_path << "\n";
+                voice_cache_.erase(it);
+                voice_cache_order_.erase(std::remove(voice_cache_order_.begin(), voice_cache_order_.end(), cache_key), voice_cache_order_.end());
+            }
+            std::cout << "[VoiceCache] MISS -- encoding: " << params.prompt_audio_path << "\n";
+        } else {
+            std::cout << "[VoiceCache] BYPASS: " << params.prompt_audio_path << "\n";
         }
 
-        std::cout << "[VoiceCache] MISS -- encoding: " << params.prompt_audio_path << "\n";
         AudioData ra;
         if (!load_audio(params.prompt_audio_path, ra, codec_.sample_rate()) || ra.samples.empty()) {
             std::cerr << "[VoiceCache] Error loading audio: " << params.prompt_audio_path << "\n";
@@ -898,43 +879,43 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
             return false;
         }
 
-        // Re-read metadata after encoding. Cache only when the file fingerprint
-        // is identical before and after the read/encode. Otherwise a concurrent
-        // replacement could pair OLD codes with the NEW file's mtime/size and
-        // make the stale entry look fresh forever.
-        uintmax_t source_size_after = 0;
-        int64_t source_mtime_after_ns = 0;
-        bool fingerprint_after_ok = false;
-        try {
-            source_size_after = fs::file_size(params.prompt_audio_path);
-            const auto ft = fs::last_write_time(params.prompt_audio_path);
-            source_mtime_after_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                ft.time_since_epoch()).count();
-            fingerprint_after_ok = true;
-        } catch (...) {
-        }
-        const bool cacheable = fingerprint_before_ok && fingerprint_after_ok &&
-                               source_size_before == source_size_after &&
-                               source_mtime_before_ns == source_mtime_after_ns;
-        if (cacheable) {
-            if (voice_cache_.size() >= VOICE_CACHE_MAX && !voice_cache_order_.empty()) {
-                const std::string oldest = voice_cache_order_.front();
-                std::cout << "[VoiceCache] Evicting: " << oldest << "\n";
-                voice_cache_.erase(oldest);
-                voice_cache_order_.erase(voice_cache_order_.begin());
+        if (params.reference_memory_cache) {
+            uintmax_t source_size_after = 0;
+            int64_t source_mtime_after_ns = 0;
+            uint64_t source_hash_after = 0;
+            bool fingerprint_after_ok = false;
+            try {
+                source_size_after = fs::file_size(params.prompt_audio_path);
+                const auto ft = fs::last_write_time(params.prompt_audio_path);
+                source_mtime_after_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    ft.time_since_epoch()).count();
+                fingerprint_after_ok = hash_file_content_utf8(params.prompt_audio_path, source_hash_after);
+            } catch (...) {
+                fingerprint_after_ok = false;
             }
-            VoiceCache entry;
-            entry.codes            = codes;
-            entry.T_prompt         = T_prompt;
-            entry.source_size      = source_size_after;
-            entry.source_mtime_ns  = source_mtime_after_ns;
-            entry.has_fingerprint  = true;
-            voice_cache_[params.prompt_audio_path] = std::move(entry);
-            voice_cache_order_.push_back(params.prompt_audio_path);
-            std::cout << "[VoiceCache] Cached (" << voice_cache_.size()
-                      << "/" << VOICE_CACHE_MAX << "): " << params.prompt_audio_path << "\n";
-        } else {
-            std::cout << "[VoiceCache] Reference changed while encoding; not caching this result.\n";
+            const bool cacheable = fingerprint_before_ok && fingerprint_after_ok &&
+                                   source_size_before == source_size_after &&
+                                   source_mtime_before_ns == source_mtime_after_ns &&
+                                   source_hash_before == source_hash_after;
+            if (cacheable) {
+                if (voice_cache_.size() >= VOICE_CACHE_MAX && !voice_cache_order_.empty()) {
+                    const std::string oldest = voice_cache_order_.front();
+                    voice_cache_.erase(oldest);
+                    voice_cache_order_.erase(voice_cache_order_.begin());
+                }
+                VoiceCache entry;
+                entry.codes = codes; entry.T_prompt = T_prompt;
+                entry.source_size = source_size_after;
+                entry.source_mtime_ns = source_mtime_after_ns;
+                entry.source_hash = source_hash_after;
+                entry.has_fingerprint = true;
+                voice_cache_[cache_key] = std::move(entry);
+                voice_cache_order_.push_back(cache_key);
+                std::cout << "[VoiceCache] Cached (" << voice_cache_.size() << "/" << VOICE_CACHE_MAX << "): "
+                          << params.prompt_audio_path << "\n";
+            } else {
+                std::cout << "[VoiceCache] Reference changed while encoding; not caching this result.\n";
+            }
         }
 
         out_codes    = std::move(codes);
@@ -942,11 +923,42 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         return save_profile_if_requested(out_codes, out_T_prompt);
     }
 
-    // 2. Persisted voice profile.
+    // 2. Persisted voice profile. use_memory_cache controls these profiles too,
+    // matching Fish reference_id cache semantics.
     if (!params.voice_id.empty()) {
         voice_mgr_.set_storage_dir(params.voice_storage_dir);
         std::cout << "[Voice] Loading profile: " << params.voice_id << "\n";
         try {
+            const std::string profile_path = voice_mgr_.path_for(params.voice_id);
+            const std::string cache_key = "profile:" + profile_path;
+            uintmax_t size_before = 0; int64_t mtime_before = 0; uint64_t hash_before = 0;
+            bool fp_before = false;
+            if (params.reference_memory_cache) {
+                try {
+                    size_before = fs::file_size(profile_path);
+                    const auto ft = fs::last_write_time(profile_path);
+                    mtime_before = std::chrono::duration_cast<std::chrono::nanoseconds>(ft.time_since_epoch()).count();
+                    fp_before = hash_file_content_utf8(profile_path, hash_before);
+                } catch (...) { fp_before = false; }
+                auto it = voice_cache_.find(cache_key);
+                if (it != voice_cache_.end()) {
+                    const bool fresh = fp_before && it->second.has_fingerprint &&
+                                       it->second.source_size == size_before &&
+                                       it->second.source_mtime_ns == mtime_before &&
+                                       it->second.source_hash == hash_before;
+                    if (fresh) {
+                        out_codes = it->second.codes; out_T_prompt = it->second.T_prompt;
+                        active_voice_transcript_ = it->second.transcript;
+                        voice_cache_order_.erase(std::remove(voice_cache_order_.begin(), voice_cache_order_.end(), cache_key), voice_cache_order_.end());
+                        voice_cache_order_.push_back(cache_key);
+                        std::cout << "[VoiceCache] HIT profile: " << params.voice_id << "\n";
+                        return true;
+                    }
+                    voice_cache_.erase(it);
+                    voice_cache_order_.erase(std::remove(voice_cache_order_.begin(), voice_cache_order_.end(), cache_key), voice_cache_order_.end());
+                }
+            }
+
             VoiceProfile profile = voice_mgr_.load(params.voice_id);
             if (!profile.is_compatible(num_cb, model_.hparams().codebook_size, codec_.sample_rate())) {
                 std::cerr << "[Voice] Profile incompatible with current model/codec.\n";
@@ -958,10 +970,26 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
                 return false;
             }
             active_voice_transcript_ = profile.transcript;
-            out_codes    = std::move(profile.codes);
-            out_T_prompt = profile.T_prompt;
-            std::cout << "[Voice] Loaded: " << params.voice_id
-                      << " (" << out_T_prompt << " frames)\n";
+            out_codes = profile.codes; out_T_prompt = profile.T_prompt;
+
+            if (params.reference_memory_cache) {
+                uintmax_t size_after = 0; int64_t mtime_after = 0; uint64_t hash_after = 0; bool fp_after = false;
+                try {
+                    size_after = fs::file_size(profile_path);
+                    const auto ft = fs::last_write_time(profile_path);
+                    mtime_after = std::chrono::duration_cast<std::chrono::nanoseconds>(ft.time_since_epoch()).count();
+                    fp_after = hash_file_content_utf8(profile_path, hash_after);
+                } catch (...) { fp_after = false; }
+                if (fp_before && fp_after && size_before == size_after && mtime_before == mtime_after && hash_before == hash_after) {
+                    if (voice_cache_.size() >= VOICE_CACHE_MAX && !voice_cache_order_.empty()) {
+                        voice_cache_.erase(voice_cache_order_.front()); voice_cache_order_.erase(voice_cache_order_.begin());
+                    }
+                    VoiceCache entry; entry.codes = out_codes; entry.T_prompt = out_T_prompt; entry.transcript = active_voice_transcript_;
+                    entry.source_size = size_after; entry.source_mtime_ns = mtime_after; entry.source_hash = hash_after; entry.has_fingerprint = true;
+                    voice_cache_[cache_key] = std::move(entry); voice_cache_order_.push_back(cache_key);
+                }
+            }
+            std::cout << "[Voice] Loaded: " << params.voice_id << " (" << out_T_prompt << " frames)\n";
             return true;
         } catch (const std::exception & e) {
             std::cerr << "[Voice] Failed to load '" << params.voice_id << "': " << e.what() << "\n";
@@ -969,7 +997,78 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         }
     }
 
-    // 3. Global reference loaded at startup, if any.
+    // 3. Fish inline references. A saved voice_id remains authoritative so
+    // clients can send both without silently replacing the persisted voice.
+    if (!params.inline_references.empty()) {
+        std::string key;
+        if (params.reference_memory_cache) {
+            uint64_t h = 1469598103934665603ull;
+            auto hash_bytes = [&](const void * ptr, size_t n) {
+                const auto * b = static_cast<const unsigned char *>(ptr);
+                for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+            };
+            for (const auto & ref : params.inline_references) {
+                const uint64_t asz = static_cast<uint64_t>(ref.audio.size());
+                const uint64_t tsz = static_cast<uint64_t>(ref.text.size());
+                hash_bytes(&asz, sizeof(asz)); if (!ref.audio.empty()) hash_bytes(ref.audio.data(), ref.audio.size());
+                hash_bytes(&tsz, sizeof(tsz)); if (!ref.text.empty()) hash_bytes(ref.text.data(), ref.text.size());
+            }
+            key = "inline:" + std::to_string(h);
+            auto it = inline_voice_cache_.find(key);
+            if (it != inline_voice_cache_.end()) {
+                out_codes = it->second.codes; out_T_prompt = it->second.T_prompt;
+                active_voice_transcript_ = it->second.transcript;
+                inline_voice_cache_order_.erase(std::remove(inline_voice_cache_order_.begin(), inline_voice_cache_order_.end(), key), inline_voice_cache_order_.end());
+                inline_voice_cache_order_.push_back(key);
+                std::cout << "[InlineVoiceCache] HIT (" << out_T_prompt << " frames)\n";
+                return true;
+            }
+        }
+
+        std::vector<std::vector<int32_t>> encoded;
+        std::vector<int32_t> frame_counts;
+        encoded.reserve(params.inline_references.size()); frame_counts.reserve(params.inline_references.size());
+        int64_t total_frames = 0;
+        std::string transcript;
+        for (const auto & ref : params.inline_references) {
+            AudioData ra;
+            if (!load_audio_from_memory(ref.audio.data(), ref.audio.size(), ra, codec_.sample_rate()) || ra.samples.empty() ||
+                !reference_audio_within_limit(ra, codec_.sample_rate()) ||
+                ra.samples.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
+                std::cerr << "[Voice] Invalid/too-long inline reference audio.\n"; return false;
+            }
+            std::vector<int32_t> codes; int32_t frames = 0;
+            if (!codec_.encode(ra.samples.data(), static_cast<int32_t>(ra.samples.size()), params.gen.n_threads, codes, frames) ||
+                frames <= 0 || codes.size() != static_cast<size_t>(num_cb) * static_cast<size_t>(frames)) {
+                std::cerr << "[Voice] Failed to encode inline reference audio.\n"; return false;
+            }
+            if (total_frames > std::numeric_limits<int32_t>::max() - frames) return false;
+            total_frames += frames; encoded.push_back(std::move(codes)); frame_counts.push_back(frames);
+            if (!transcript.empty()) transcript.push_back('\n');
+            transcript += ref.text;
+        }
+        out_T_prompt = static_cast<int32_t>(total_frames);
+        try { out_codes.reserve(static_cast<size_t>(num_cb) * static_cast<size_t>(out_T_prompt)); }
+        catch (...) { return false; }
+        for (int32_t cb = 0; cb < num_cb; ++cb) {
+            for (size_t r = 0; r < encoded.size(); ++r) {
+                const size_t a = static_cast<size_t>(cb) * static_cast<size_t>(frame_counts[r]);
+                const size_t b = a + static_cast<size_t>(frame_counts[r]);
+                out_codes.insert(out_codes.end(), encoded[r].begin() + static_cast<std::ptrdiff_t>(a), encoded[r].begin() + static_cast<std::ptrdiff_t>(b));
+            }
+        }
+        active_voice_transcript_ = transcript;
+        if (params.reference_memory_cache) {
+            if (inline_voice_cache_.size() >= VOICE_CACHE_MAX && !inline_voice_cache_order_.empty()) {
+                inline_voice_cache_.erase(inline_voice_cache_order_.front()); inline_voice_cache_order_.erase(inline_voice_cache_order_.begin());
+            }
+            VoiceCache entry; entry.codes = out_codes; entry.T_prompt = out_T_prompt; entry.transcript = transcript;
+            inline_voice_cache_[key] = std::move(entry); inline_voice_cache_order_.push_back(key);
+        }
+        return true;
+    }
+
+    // 4. Global reference loaded at startup, if any.
     if (reference_loaded_) {
         active_voice_transcript_ = reference_text_;
         if (reference_embedding_.size() % sizeof(int32_t) != 0) return false;
@@ -989,7 +1088,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         return true;
     }
 
-    // 4. No reference requested.
+    // 5. No reference requested.
     return true;
 }
 
@@ -1006,11 +1105,32 @@ static bool validate_pipeline_text_payload(const PipelineParams & params, bool r
         std::cerr << "Pipeline error: reference audio requires a non-empty prompt transcript.\n";
         return false;
     }
-    if ((params.chunk_length != 0 && (params.chunk_length < 100 || params.chunk_length > 300)) ||
+    size_t inline_audio_bytes = 0, inline_text_bytes = 0;
+    if (params.inline_references.size() > 8) {
+        std::cerr << "Pipeline error: references supports at most 8 items.\n";
+        return false;
+    }
+    for (const auto & ref : params.inline_references) {
+        if (ref.audio.empty() || ref.audio.size() > 4u * 1024u * 1024u || !utf8::is_valid(ref.text) ||
+            !utf8::has_non_whitespace(ref.text)) {
+            std::cerr << "Pipeline error: invalid inline reference.\n"; return false;
+        }
+        if (inline_audio_bytes > 6u * 1024u * 1024u - std::min<size_t>(ref.audio.size(), 6u * 1024u * 1024u)) {
+            std::cerr << "Pipeline error: inline reference audio exceeds 6 MiB combined.\n"; return false;
+        }
+        inline_audio_bytes += ref.audio.size(); inline_text_bytes += ref.text.size();
+        if (inline_audio_bytes > 6u * 1024u * 1024u || inline_text_bytes > 1024u * 1024u) {
+            std::cerr << "Pipeline error: inline references exceed request limits.\n"; return false;
+        }
+    }
+    if ((params.chunk_length != 0 && (params.chunk_length < 100 || params.chunk_length > 1000)) ||
         params.min_chunk_length < 0 || params.min_chunk_length > 100 ||
         (params.chunk_length == 0 && params.min_chunk_length != 0) ||
-        !std::isfinite(params.prosody_volume_db) || params.prosody_volume_db < -20.0f || params.prosody_volume_db > 20.0f) {
-        std::cerr << "Pipeline error: invalid long-form/prosody parameters.\n";
+        !std::isfinite(params.prosody_volume_db) || params.prosody_volume_db < -20.0f || params.prosody_volume_db > 20.0f ||
+        !std::isfinite(params.prosody_speed) || params.prosody_speed < 0.5f || params.prosody_speed > 2.0f ||
+        (params.output_sample_rate != 0 && (params.output_sample_rate < 8000 || params.output_sample_rate > 192000)) ||
+        !std::isfinite(params.gen.early_stop_threshold) || (params.gen.early_stop_threshold != -1.0f && params.gen.early_stop_threshold != 1.0f)) {
+        std::cerr << "Pipeline error: invalid long-form/prosody/output parameters.\n";
         return false;
     }
     return true;
@@ -1027,24 +1147,26 @@ static bool request_is_chunked(const PipelineParams & params) noexcept {
 
 static std::vector<std::string> request_text_segments(const PipelineParams & params) {
     std::vector<std::string> out;
+    const std::string request_text = params.normalize_text ? normalize_tts_text(params.text) : params.text;
     if (params.chunk_length > 0) {
-        auto chunks = split_text_chunks(params.text, params.chunk_length, params.min_chunk_length);
+        auto chunks = split_text_chunks(request_text, params.chunk_length, params.min_chunk_length);
         out.reserve(chunks.size());
         for (auto & chunk : chunks) out.push_back(std::move(chunk.text));
         return out;
     }
     if (params.segment_sentences) {
-        auto segments = split_text_segments(params.text, params.min_seg_chars);
+        auto segments = split_text_segments(request_text, params.min_seg_chars);
         out.reserve(segments.size());
         for (auto & segment : segments) out.push_back(std::move(segment.text));
         return out;
     }
-    out.push_back(params.text);
+    out.push_back(request_text);
     return out;
 }
 
 static bool request_has_multiple_speakers(const PipelineParams & params) {
-    const auto segments = split_text_segments(params.text, 0);
+    const std::string request_text = params.normalize_text ? normalize_tts_text(params.text) : params.text;
+    const auto segments = split_text_segments(request_text, 0);
     return distinct_speaker_count(segments) > 1;
 }
 
@@ -1156,7 +1278,7 @@ bool Pipeline::synthesize(const PipelineParams & params) {
         ~StagedCleanup() { if (!path.empty()) remove_file_utf8(path); }
     } staged_cleanup{staged_path};
     TempWavFile tmp;
-    if (!tmp.open_at(staged_path, codec_.sample_rate())) {
+    if (!tmp.open_at(staged_path, output_sample_rate(params), params.output_rf64)) {
         std::cerr << "Pipeline error: could not create staged WAV.\n";
         return false;
     }
@@ -1192,8 +1314,8 @@ bool Pipeline::synthesize(const PipelineParams & params) {
             }
             auto_voice_anchor_pending = false;
         }
-        if (is_last) postprocess_audio(audio, params);
-        else apply_output_gain(audio, params.prosody_volume_db);
+        postprocess_audio(audio, params, is_last);
+        if (audio.empty()) return false;
         return tmp.write_segment(audio);
         // 'audio' se destruye aqui -> RAM liberada antes del siguiente segmento
     };
@@ -1264,7 +1386,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
 
     // Abrir un unico WAV temporal incremental (cabecera provisional)
     TempWavFile tmp;
-    if (!tmp.open(codec_.sample_rate())) {
+    if (!tmp.open(output_sample_rate(params), params.output_rf64)) {
         std::cerr << "Pipeline error: GetTempFileName failed.\n";
         return false;
     }
@@ -1304,9 +1426,9 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
             }
             auto_voice_anchor_pending = false;
         }
-        if (is_last) postprocess_audio(audio, params);
-        else apply_output_gain(audio, params.prosody_volume_db);
-        float dur_s = audio.size() / (float)codec_.sample_rate();
+        postprocess_audio(audio, params, is_last);
+        if (audio.empty()) return false;
+        float dur_s = audio.size() / (float)output_sample_rate(params);
         if (!tmp.write_segment(audio)) {
             std::cerr << "Error writing segment to disk.\n";
             return false;
@@ -1335,7 +1457,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
     }
 
     auto t1 = std::chrono::steady_clock::now();
-    float total_audio_s = tmp.total_samps / (float)codec_.sample_rate();
+    float total_audio_s = tmp.total_samps / (float)output_sample_rate(params);
     float total_inf_s   = std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count()/1000.f;
     std::cout << "[Timing] " << total_audio_s << "s audio total in "
               << total_inf_s << "s (" << (total_audio_s/std::max(total_inf_s,0.001f)) << "x RT)\n";
@@ -1346,7 +1468,7 @@ bool Pipeline::synthesize_to_buffer(const PipelineParams & params,
         std::cerr << "Pipeline error: could not finalize temporary WAV.\n";
         return false;
     }
-    const uint64_t wav_bytes64 = 44u + tmp.total_samps * sizeof(int16_t);
+    const uint64_t wav_bytes64 = static_cast<uint64_t>(tmp.header_size()) + tmp.total_samps * sizeof(int16_t);
     if (wav_bytes64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) return false;
     std::vector<char> result(static_cast<size_t>(wav_bytes64));
     std::clearerr(tmp.fp);
@@ -1389,7 +1511,7 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
 
     // Escribir directamente al unico WAV temporal incremental
     TempWavFile tmp;
-    if (!tmp.open(codec_.sample_rate())) {
+    if (!tmp.open(output_sample_rate(params), params.output_rf64)) {
         std::cerr << "Pipeline error: could not create temporary WAV.\n";
         return false;
     }
@@ -1426,9 +1548,9 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
             }
             auto_voice_anchor_pending = false;
         }
-        if (is_last) postprocess_audio(audio, params);
-        else apply_output_gain(audio, params.prosody_volume_db);
-        float dur_s = audio.size() / (float)codec_.sample_rate();
+        postprocess_audio(audio, params, is_last);
+        if (audio.empty()) return false;
+        float dur_s = audio.size() / (float)output_sample_rate(params);
         bool ok = tmp.write_segment(audio);
         // audio destruido aqui -- RAM liberada
         auto te = std::chrono::steady_clock::now();
@@ -1458,12 +1580,12 @@ bool Pipeline::synthesize_to_file(const PipelineParams & params,
     }
 
     auto t1 = std::chrono::steady_clock::now();
-    float total_s   = tmp.total_samps / (float)codec_.sample_rate();
+    float total_s   = tmp.total_samps / (float)output_sample_rate(params);
     float elapsed_s = std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count()/1000.f;
     std::cout << "[Timing] " << total_s << "s audio in " << elapsed_s << "s ("
               << (total_s/std::max(elapsed_s,0.001f)) << "x RT)\n";
-    std::cout << "[File] WAV: " << tmp.path
-              << " (" << (44 + tmp.total_samps*2)/1024 << " KB)\n";
+    std::cout << "[File] " << (tmp.rf64 ? "RF64" : "WAV") << ": " << tmp.path
+              << " (" << (tmp.header_size() + tmp.total_samps*2)/1024 << " KB)\n";
 
     // Transferir ownership de la ruta -- el llamador borra el archivo
     out_wav_path = tmp.release_path();
@@ -1489,8 +1611,9 @@ void Pipeline::float_to_int16(const std::vector<float> & in,
 // Con stream_decode_stride_frames > 0 (o auto=4):
 //   Usa generate_streaming() para recibir frames uno a uno mientras el
 //   transformer genera. Cada vez que se acumulan stride frames, decodifica
-//   ese chunk con el codec y lo envia al cliente. Latencia hasta el primer
-//   chunk: prefill + stride * ~11ms en lugar de esperar todos los tokens.
+//   ese chunk con el codec y lo envia al cliente. Con el codec S2 Pro actual
+//   (~2048 samples/frame a 44.1 kHz), stride=2/4/8 representa ~93/186/372 ms
+//   de audio generado por actualizacion, mas el tiempo real de computo/prefill.
 //
 // Con stream_decode_stride_frames < 0:
 //   Desactiva el stride: genera el segmento completo, lo decodifica y lo envia.
@@ -1522,7 +1645,12 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
     // 0 -> auto (4 frames), matching CLI/API documentation. Negative disables.
     // Valores tipicos: 4 (baja latencia) a 32 (menor overhead).
     const int32_t stride = params.stream_decode_stride_frames == 0 ? 4 : params.stream_decode_stride_frames;
-    const bool    use_stride = (stride > 0);
+    const bool requires_whole_audio = std::fabs(params.prosody_speed - 1.0f) > 1e-6f ||
+        params.normalize_loudness ||
+        (params.output_sample_rate > 0 && params.output_sample_rate != codec_.sample_rate());
+    const bool use_stride = (stride > 0) && !requires_whole_audio;
+    if (stride > 0 && requires_whole_audio)
+        std::cout << "[Stream] Whole-audio postprocessing disables stride decode for exact output.\n";
 
     // -----------------------------------------------------------------------
     // Helper: genera un segmento con decode en tiempo real (stride activo)
@@ -1589,9 +1717,10 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
         model_.reset();
         KvCacheScope kv_guard{&model_, &kv_cache_initialized_, &kv_cache_max_len_, true};
 
-        // Keep generated code frames per codebook. Streaming output is committed
-        // only once the decoder has enough right context for that boundary; the
-        // still-unstable tail is held back and revisited on the next stride.
+        // Keep generated code frames per codebook. The codec is causal, so a
+        // new commit needs LEFT history for boundary quality but does not need to
+        // hold future frames hostage. This keeps decode work bounded while allowing
+        // the first low-latency commit after the requested stride.
         const int32_t requested_history = params.codec_overlap_frames > 0
             ? params.codec_overlap_frames
             : std::max(0, codec_.streaming_history_frames());
@@ -1600,14 +1729,17 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             decode_window_limit = std::min(params.codec_chunk_frames, codec_max_frames);
         } else {
             const int64_t desired = std::max<int64_t>(120,
-                static_cast<int64_t>(requested_history) * 2 + 4);
+                static_cast<int64_t>(requested_history) + static_cast<int64_t>(decode_stride));
             decode_window_limit = static_cast<int32_t>(std::min<int64_t>(codec_max_frames, desired));
         }
-        if (decode_window_limit <= 0) return false;
+        if (decode_window_limit <= 0 || decode_stride > decode_window_limit) {
+            std::cerr << "[Stream] decode stride exceeds bounded codec window.\n";
+            return false;
+        }
         const int32_t history_target = std::min(requested_history,
-                                                std::max(0, (decode_window_limit - 1) / 2));
+                                                std::max(0, decode_window_limit - decode_stride));
         if (history_target < requested_history) {
-            std::cerr << "[Stream] codec history reduced from " << requested_history
+            std::cerr << "[Stream] codec left-history reduced from " << requested_history
                       << " to " << history_target << " frames by decode-window limit "
                       << decode_window_limit << ".\n";
         }
@@ -1630,15 +1762,15 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
                               int32_t new_frames,
                               bool is_last_chunk,
                               bool trim_final) -> bool {
-            if (trim_final) postprocess_audio(audio_chunk, params);
-            else apply_output_gain(audio_chunk, params.prosody_volume_db);
+            postprocess_audio(audio_chunk, params, trim_final);
+            if (audio_chunk.empty()) return false;
 
             std::vector<int16_t> pcm;
             float_to_int16(audio_chunk, pcm);
             audio_chunk.clear();
             audio_chunk.shrink_to_fit();
 
-            const float dur_s = pcm.size() / static_cast<float>(codec_.sample_rate());
+            const float dur_s = pcm.size() / static_cast<float>(output_sample_rate(params));
             std::cout << "[Stream] Chunk " << new_frames << " stable frames ("
                       << dur_s << "s)" << (is_last_chunk ? " [LAST]" : "") << "\n";
 
@@ -1647,7 +1779,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             return ok;
         };
 
-        auto decode_available = [&](bool finalize_codec, bool terminal_chunk) -> bool {
+        auto decode_available = [&](bool terminal_chunk) -> bool {
             if (accumulated_codes.empty()) return false;
             const size_t available_sz = accumulated_codes[0].size();
             if (available_sz > static_cast<size_t>(std::numeric_limits<int32_t>::max())) return false;
@@ -1657,9 +1789,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             }
             if (frames_available <= 0) return true;
 
-            const int32_t stable_frames = finalize_codec
-                ? frames_available
-                : std::max(0, frames_available - history_target);
+            const int32_t stable_frames = frames_available;
             if (stable_frames <= committed_frames) return true;
 
             const int32_t window_start = std::max(0, committed_frames - history_target);
@@ -1678,12 +1808,14 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
                           decode_codes.begin() + static_cast<size_t>(cb) * window_frames);
             }
 
+            if (window_frames > decode_window_limit) {
+                std::cerr << "[Stream] internal causal decode window exceeded configured bound.\n";
+                return false;
+            }
             std::vector<float> decoded;
-            if (!codec_.decode_chunked(decode_codes.data(), window_frames,
-                                       params.gen.n_threads, decoded,
-                                       params.codec_chunk_frames,
-                                       params.codec_overlap_frames)) {
-                std::cerr << "[Stream] decode_chunked failed for stable window ["
+            if (!codec_.decode(decode_codes.data(), window_frames,
+                               params.gen.n_threads, decoded)) {
+                std::cerr << "[Stream] causal window decode failed for ["
                           << window_start << ".." << frames_available << ").\n";
                 return false;
             }
@@ -1755,7 +1887,7 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             }
             const int32_t frames_available = static_cast<int32_t>(accumulated_codes[0].size());
             if (frames_available - last_decode_frames >= decode_stride) {
-                cb_ok = decode_available(false, false);
+                cb_ok = decode_available(false);
                 last_decode_frames = frames_available;
             }
             return cb_ok;
@@ -1777,9 +1909,9 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
             return false;
         }
 
-        // Always finalize, including exact stride multiples. This releases the
-        // right-edge holdback that deliberately was not committed earlier.
-        cb_ok = decode_available(true, is_last_seg);
+        // Flush any final partial stride. Causal commits do not retain a
+        // future/right-edge holdback between updates.
+        cb_ok = decode_available(is_last_seg);
 
         // With trimming enabled the last decoded chunk is intentionally delayed
         // until we know whether this is the final segment. Internal segment tails
@@ -1864,12 +1996,12 @@ bool Pipeline::synthesize_streaming(const PipelineParams & params,
 
         // A segment boundary is internal audio. Trimming every sentence removes
         // natural pauses, so only trim the final segment of the request.
-        if (is_last) postprocess_audio(audio, params);
-        else apply_output_gain(audio, params.prosody_volume_db);
+        postprocess_audio(audio, params, is_last);
+        if (audio.empty()) return false;
         float_to_int16(audio, pcm);
         audio.clear(); audio.shrink_to_fit();
 
-        float dur_s = pcm.size() / (float)codec_.sample_rate();
+        float dur_s = pcm.size() / (float)output_sample_rate(params);
         std::cout << "[Stream] Sending " << pcm.size() << " samples ("
                   << dur_s << "s)" << (is_last ? " [LAST]" : "") << "\n";
 

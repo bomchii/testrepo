@@ -4,6 +4,10 @@
 #include <vector>
 
 namespace s2 {
+// Conservative request text normalization for TTS. Preserves UTF-8 content,
+// collapses whitespace, and trims leading/trailing whitespace.
+std::string normalize_tts_text(const std::string & text);
+
 struct TextSegment {
     std::string text;
     int32_t speaker_id = -1;

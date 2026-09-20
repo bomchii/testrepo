@@ -21,6 +21,12 @@ struct GenerateParams {
     float   top_p                   = 0.7f;
     int32_t top_k                   = 30;
     int32_t min_tokens_before_end   = 64;
+    // Legacy Fish early_stop_threshold compatibility. Fish used fractional
+    // completion across multiple samples; this engine generates one sample per
+    // Pipeline request. -1 (local disabled sentinel) and 1.0 (all samples
+    // finished / neutral Fish value) are accepted; effectful 0..1 values are
+    // rejected rather than assigned an invented single-sample meaning.
+    float   early_stop_threshold     = -1.0f;
     int32_t n_threads               = 4;
     bool    verbose                 = true;
 

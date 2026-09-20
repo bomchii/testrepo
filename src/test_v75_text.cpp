@@ -15,6 +15,13 @@ static void expect_n(const std::string& s, size_t n) {
 }
 
 int main(){
+    // Local Fish `normalize` semantics: preserve content while trimming and
+    // collapsing Unicode whitespace to one ASCII space.
+    assert(s2::normalize_tts_text(u8"\t  Hello\u00a0\u2003world \n") == "Hello world");
+    assert(s2::normalize_tts_text(u8"你好　 世界") == u8"你好 世界");
+    std::string invalid_norm="x"; invalid_norm.push_back(static_cast<char>(0xC0));
+    assert(s2::normalize_tts_text(invalid_norm) == invalid_norm);
+
     // Arabic/Persian/Urdu: no ASCII-space requirement and combining marks preserved.
     expect_n(u8"مَرْحَبًا؟كَيْفَ حَالُكَ؟",2);
     expect_n(u8"سلام۔خوبی۔",2);

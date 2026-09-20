@@ -11,6 +11,11 @@ need('CancelCallback should_continue = {}' in h, 'public optional cancel probe m
 need('if (should_continue && !should_continue())' in p, 'pipeline does not check cancellation')
 need(p.count('should_continue && !should_continue()') >= 4, 'cancellation not checked at enough boundaries')
 need('auto on_frame' in p and 'cb_ok = false;' in p, 'streaming frame callback cancel plumbing missing')
-need('s2::CancelCallback should_continue = [alive]' in m, 'WebSocket alive signal not wired into pipeline')
+need('s2::CancelCallback should_continue = [state]' in m, 'WebSocket alive signal not wired into pipeline')
 need('synthesize_streaming(ws_params, cb, &segment_count, should_continue)' in m, 'WebSocket does not pass cancel callback')
-print('STREAM_CANCEL_INVARIANTS_PASS frame_probe=1 ws_alive=1 fallback_segment_probe=1')
+need('pipeline_pool.acquire(&state->alive)' in m, 'disconnect cannot cancel while waiting for a pipeline worker')
+need('mark_ws_closed' in m and 'state->alive.store(false' in m, 'WebSocket close does not publish cancellation')
+need('mark_all_ws_closed' in m and m.count('mark_all_ws_closed();') >= 3,
+     'server shutdown must invalidate all WebSocket states before draining worker tasks')
+
+print('STREAM_CANCEL_INVARIANTS_PASS frame_probe=1 ws_alive=1 wait_cancel=1 fallback_segment_probe=1')

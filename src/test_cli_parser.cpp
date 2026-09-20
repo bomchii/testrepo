@@ -59,6 +59,7 @@ struct GenerateParams {
     float   top_p                   = 0.7f;
     int32_t top_k                   = 30;
     int32_t min_tokens_before_end   = 64;
+    float   early_stop_threshold    = -1.0f;
     int32_t n_threads               = 4;
     bool    verbose                 = true;
     int32_t ras_window_size         = 10;
@@ -92,6 +93,12 @@ struct PipelineParams {
     int32_t min_chunk_length       = 0;
     bool    condition_on_previous_chunks = true;
     float   prosody_volume_db      = 0.0f;
+    float   prosody_speed          = 1.0f;
+    bool    normalize_loudness     = false;
+    bool    normalize_text         = false;
+    int32_t output_sample_rate     = 0;
+    bool    output_rf64            = false;
+    bool    reference_memory_cache = true;
     int32_t multi_turn_history     = 0;
     bool warmup                    = false;
     bool trim_silence = false;
@@ -131,7 +138,8 @@ static float parse_float_arg(const char * raw) {
 
 // Returns 0 = parsed OK, 1 = error/exit, 2 = --help.
 int parse_args(int argc, char** argv,
-               PipelineParams& params, int& port, std::string& bind_host, bool& list_voices) {
+               PipelineParams& params, int& port, std::string& bind_host, bool& list_voices,
+               int& server_workers, std::string& ffmpeg_bin) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         // std::stoi / std::stof throw std::invalid_argument on non-numeric input
@@ -168,6 +176,22 @@ int parse_args(int argc, char** argv,
             params.condition_on_previous_chunks = false;
         } else if (arg == "--prosody-volume" && i + 1 < argc) {
             params.prosody_volume_db = parse_float_arg(argv[++i]);
+        } else if (arg == "--prosody-speed" && i + 1 < argc) {
+            params.prosody_speed = parse_float_arg(argv[++i]);
+        } else if (arg == "--normalize") {
+            params.normalize_text = true;
+        } else if (arg == "--no-normalize") {
+            params.normalize_text = false;
+        } else if (arg == "--normalize-loudness") {
+            params.normalize_loudness = true;
+        } else if (arg == "--no-normalize-loudness") {
+            params.normalize_loudness = false;
+        } else if (arg == "--sample-rate" && i + 1 < argc) {
+            params.output_sample_rate = parse_int_arg(argv[++i]);
+        } else if (arg == "--rf64") {
+            params.output_rf64 = true;
+        } else if (arg == "--no-rf64") {
+            params.output_rf64 = false;
         } else if ((arg == "--temperature" || arg == "--temp") && i + 1 < argc) {
             params.gen.temperature = parse_float_arg(argv[++i]);
         } else if (arg == "--top-p" && i + 1 < argc) {
@@ -176,6 +200,8 @@ int parse_args(int argc, char** argv,
             params.gen.top_k = parse_int_arg(argv[++i]);
         } else if (arg == "--min-end-tokens" && i + 1 < argc) {
             params.gen.min_tokens_before_end = parse_int_arg(argv[++i]);
+        } else if (arg == "--early-stop-threshold" && i + 1 < argc) {
+            params.gen.early_stop_threshold = parse_float_arg(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             params.gen.seed = parse_u64_arg(argv[++i]);
         } else if (arg == "--repetition-penalty" && i + 1 < argc) {
@@ -198,6 +224,10 @@ int parse_args(int argc, char** argv,
             port = parse_int_arg(argv[++i]);
         } else if (arg == "--host" && i + 1 < argc) {
             bind_host = argv[++i];
+        } else if (arg == "--workers" && i + 1 < argc) {
+            server_workers = parse_int_arg(argv[++i]);
+        } else if (arg == "--ffmpeg" && i + 1 < argc) {
+            ffmpeg_bin = argv[++i];
         } else if ((arg == "-threads" || arg == "--threads") && i + 1 < argc) {
             params.gen.n_threads = parse_int_arg(argv[++i]);
         } else if ((arg == "--max-tokens") && i + 1 < argc) {
@@ -264,6 +294,8 @@ struct RunResult {
     int          port = 8080;
     std::string  bind_host = "127.0.0.1";
     bool         list_voices = false;
+    int          server_workers = 1;
+    std::string  ffmpeg_bin = "ffmpeg";
     std::string  err;                  // captured std::cerr
 };
 
@@ -282,7 +314,7 @@ static RunResult run(const std::vector<std::string>& args) {
     RunResult r;
     std::ostringstream capture;
     std::streambuf* old = std::cerr.rdbuf(capture.rdbuf());
-    r.rc = parse_args((int)argv.size(), argv.data(), r.params, r.port, r.bind_host, r.list_voices);
+    r.rc = parse_args((int)argv.size(), argv.data(), r.params, r.port, r.bind_host, r.list_voices, r.server_workers, r.ffmpeg_bin);
     std::cerr.rdbuf(old);
     r.err = capture.str();
     return r;
@@ -337,6 +369,7 @@ int main() {
     { RunResult r = run({"--top-p","0.8"});              ok(r.rc==0 && feq(r.params.gen.top_p,0.8f), "--top-p sets gen.top_p"); }
     { RunResult r = run({"--top-k","40"});               ok(r.rc==0 && r.params.gen.top_k==40, "--top-k sets gen.top_k"); }
     { RunResult r = run({"--min-end-tokens","64"});      ok(r.rc==0 && r.params.gen.min_tokens_before_end==64, "--min-end-tokens sets gen.min_tokens_before_end"); }
+    { RunResult r = run({"--early-stop-threshold","1.0"}); ok(r.rc==0 && feq(r.params.gen.early_stop_threshold,1.0f), "--early-stop-threshold parses neutral legacy value"); }
     { RunResult r = run({"--seed","18446744073709551615"}); ok(r.rc==0 && r.params.gen.seed==UINT64_MAX, "--seed accepts UINT64_MAX exactly"); }
     { RunResult r = run({"--repetition-penalty","1.2"}); ok(r.rc==0 && feq(r.params.gen.repetition_penalty,1.2f), "--repetition-penalty sets gen.repetition_penalty"); }
     { RunResult r = run({"--repetition-window","128"});  ok(r.rc==0 && r.params.gen.repetition_window==128, "--repetition-window sets gen.repetition_window"); }
@@ -347,7 +380,9 @@ int main() {
     { RunResult r = run({"--max-seg-tokens","300"});     ok(r.rc==0 && r.params.max_tokens_per_segment==300, "--max-seg-tokens sets max_tokens_per_segment"); }
     { RunResult r = run({"-p","9090"});                  ok(r.rc==0 && r.port==9090, "-p sets port"); }
     { RunResult r = run({"--port","8000"});              ok(r.rc==0 && r.port==8000, "--port sets port"); }
-    { RunResult r = run({"--host","0.0.0.0"});            ok(r.rc==0 && r.bind_host=="0.0.0.0", "--host sets bind_host"); }
+    { RunResult r = run({"--host","localhost"});          ok(r.rc==0 && r.bind_host=="localhost", "--host accepts hostname text for startup resolution"); }
+    { RunResult r = run({"--workers","3"});               ok(r.rc==0 && r.server_workers==3, "--workers sets server worker count"); }
+    { RunResult r = run({"--ffmpeg","/usr/bin/ffmpeg"}); ok(r.rc==0 && r.ffmpeg_bin=="/usr/bin/ffmpeg", "--ffmpeg sets encoder executable"); }
     { RunResult r = run({"--threads","8"});              ok(r.rc==0 && r.params.gen.n_threads==8, "--threads sets gen.n_threads"); }
     { RunResult r = run({"-threads","6"});               ok(r.rc==0 && r.params.gen.n_threads==6, "-threads (single-dash alias) sets gen.n_threads"); }
     { RunResult r = run({"--max-tokens","512"});         ok(r.rc==0 && r.params.gen.max_new_tokens==512, "--max-tokens sets gen.max_new_tokens"); }
@@ -361,6 +396,8 @@ int main() {
     { RunResult r = run({"-o","out.wav"});               ok(r.rc==0 && r.params.output_path=="out.wav", "-o sets output_path"); }
     { RunResult r = run({"--output","out.wav"});         ok(r.rc==0 && r.params.output_path=="out.wav", "--output sets output_path"); }
     { RunResult r = run({"--stream-decode-stride","16"});ok(r.rc==0 && r.params.stream_decode_stride_frames==16, "--stream-decode-stride sets stream_decode_stride_frames"); }
+    { RunResult r = run({"--prosody-speed","1.25"});      ok(r.rc==0 && feq(r.params.prosody_speed,1.25f), "--prosody-speed sets speed"); }
+    { RunResult r = run({"--sample-rate","48000"});      ok(r.rc==0 && r.params.output_sample_rate==48000, "--sample-rate sets output rate"); }
 
     // ----------------------------------------------------------------------
     // 2. Boolean flags.
@@ -372,6 +409,12 @@ int main() {
     { RunResult r = run({"--list-voices"});              ok(r.rc==0 && r.list_voices==true, "--list-voices sets list_voices"); }
     { RunResult r = run({"--trim-silence"});             ok(r.rc==0 && r.params.trim_silence==true, "--trim-silence sets trim_silence=true"); }
     { RunResult r = run({"--trim-silence","--no-trim-silence"}); ok(r.rc==0 && r.params.trim_silence==false, "--no-trim-silence overrides --trim-silence"); }
+    { RunResult r = run({"--normalize"});                  ok(r.rc==0 && r.params.normalize_text, "--normalize enables text normalization"); }
+    { RunResult r = run({"--normalize","--no-normalize"}); ok(r.rc==0 && !r.params.normalize_text, "--no-normalize overrides normalize"); }
+    { RunResult r = run({"--normalize-loudness"});         ok(r.rc==0 && r.params.normalize_loudness, "--normalize-loudness enables loudness normalization"); }
+    { RunResult r = run({"--normalize-loudness","--no-normalize-loudness"}); ok(r.rc==0 && !r.params.normalize_loudness, "--no-normalize-loudness overrides"); }
+    { RunResult r = run({"--rf64"});                       ok(r.rc==0 && r.params.output_rf64, "--rf64 enables RF64"); }
+    { RunResult r = run({"--rf64","--no-rf64"});          ok(r.rc==0 && !r.params.output_rf64, "--no-rf64 overrides RF64"); }
     expect_rc({"-h"}, 2, "-h returns help sentinel (2)");
     expect_rc({"--help"}, 2, "--help returns help sentinel (2)");
 
@@ -384,14 +427,15 @@ int main() {
         "-v","--vulkan","--codec-vulkan","--codec-chunk","--codec-overlap",
         "--min-seg-chars","--top-k","--min-end-tokens","--repetition-window",
         "--multi-turn-history","--ras-window","--max-seg-tokens","-p","--port",
-        "--threads","-threads","--max-tokens",
+        "--threads","-threads","--max-tokens","--workers","--sample-rate",
         "--stream-decode-stride"
     };
     for (const char* f : int_flags)
         expect_rc({f, "abc"}, 1, std::string("int flag ") + f + " rejects non-numeric");
 
     const char* float_flags[] = {
-        "--temperature","--temp","--top-p","--repetition-penalty","--ras-temp","--ras-top-p"
+        "--temperature","--temp","--top-p","--repetition-penalty","--ras-temp","--ras-top-p",
+        "--prosody-speed","--early-stop-threshold"
     };
     for (const char* f : float_flags)
         expect_rc({f, "xyz"}, 1, std::string("float flag ") + f + " rejects non-numeric");

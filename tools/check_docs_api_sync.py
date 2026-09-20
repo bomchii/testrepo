@@ -46,9 +46,12 @@ for route in sorted(routes):
 http_start = main.index("auto do_synthesize")
 http_end = main.index("auto handle_synthesis_request", http_start)
 http_block = main[http_start:http_end]
-ws_start = main.index("auto json = load_json_strict(data);", main.index("CROW_WEBSOCKET_ROUTE"))
+ws_handler_start = main.index("auto process_ws_message")
+ws_start = main.index("auto json = load_json_strict(data);", ws_handler_start)
 ws_end = main.index("std::string validation_error;", ws_start)
 ws_block = main[ws_start:ws_end]
+must(ws_handler_start < main.index("CROW_WEBSOCKET_ROUTE"),
+     "WebSocket synthesis handler must live outside Crow onmessage so I/O stays responsive")
 validator_start = main.index("static void validate_fish_json_subset")
 validator_end = main.index("static crow::json::rvalue load_json_strict", validator_start)
 validator_block = main[validator_start:validator_end]
@@ -65,33 +68,33 @@ common_fields = {
     'ras_window', 'ras_temp', 'ras_top_p', 'codec_chunk', 'codec_overlap',
     'min_seg_chars', 'chunk_length', 'min_chunk_length',
     'condition_on_previous_chunks', 'prosody', 'latency', 'trim_silence',
-    'streaming',
+    'streaming', 'references', 'early_stop_threshold', 'normalize', 'sample_rate',
+    'use_memory_cache',
 }
 for field in sorted(common_fields):
     must(field in help_text, f"--help is missing synthesis JSON field {field}")
     must(field in readme, f"README is missing synthesis JSON field {field}")
 
-for field in ('format', 'response_format', 'stream_stride'):
+for field in ('format', 'response_format', 'stream_stride', 'mp3_bitrate', 'opus_bitrate'):
     must(field in help_text, f"--help is missing route-specific JSON field {field}")
     must(field in readme, f"README is missing route-specific JSON field {field}")
 
-# Compatibility fields that are intentionally rejected should still be visible
-# in the README so users do not mistake the API subset for drop-in Fish support.
+# Implemented compatibility fields must remain visible in both user references.
 for field in (
     'references', 'early_stop_threshold', 'normalize', 'sample_rate',
     'mp3_bitrate', 'opus_bitrate', 'use_memory_cache', 'normalize_loudness',
 ):
-    must(field in readme, f"README does not explain unsupported Fish field {field}")
-    must(field in help_text, f"--help does not explain unsupported Fish field {field}")
+    must(field in readme, f"README does not explain Fish field {field}")
+    must(field in help_text, f"--help does not explain Fish field {field}")
 
 # The two route-specific no-op traps must remain errors and be documented.
 must('stream_stride is WebSocket-only' in main,
      'HTTP stream_stride must fail instead of being a silent no-op')
-must('format/response_format are HTTP-only' in main,
-     'WebSocket format fields must fail instead of being silently ignored')
+must('encoded-audio bitrate fields are HTTP-only' in main,
+     'WebSocket format/bitrate fields must fail instead of being silently ignored')
 must('stream_stride' in readme and 'rejected on HTTP' in readme,
      'README must explain HTTP stream_stride rejection')
-must('format`/`response_format` are rejected' in readme,
+must('WebSocket always returns framed PCM' in readme and '`format`/`response_format`' in readme and 'are rejected there' in readme,
      'README must explain WS format rejection')
 must('websocket_max_payload' in main,
      'server must configure the Crow WebSocket frame payload limit')
@@ -99,6 +102,18 @@ must('Crow 1.3.4' in readme and 'complete reassembled message' in readme and 'fr
      'README must document Crow 1.3.4 cumulative WebSocket payload enforcement')
 must('Crow 1.3.4' in help_text and 'complete reassembled' in help_text and 'fragmented messages' in help_text,
      '--help must document Crow 1.3.4 cumulative WebSocket payload enforcement')
+must('s2-pro-local' in readme and 'instructions' in readme and 'stream_format' in readme,
+     'README must document the implemented OpenAI model/unsupported-field subset')
+must('s2-pro-local' in help_text and 'instructions' in help_text and 'stream_format' in help_text,
+     '--help must document the implemented OpenAI model/unsupported-field subset')
+must('buffered HTTP still defaults to WAV' in readme,
+     'README must distinguish one-shot --rf64 from buffered HTTP default WAV')
+must('Buffered HTTP defaults to WAV even when CLI --rf64 is set' in help_text,
+     '--help must distinguish one-shot --rf64 from buffered HTTP default WAV')
+must('normalize` defaults to `true`' in readme and '`use_memory_cache` defaults to `off`' in readme,
+     'README must state Fish normalize/cache defaults')
+must('Fish requests default normalize=true' in help_text and 'use_memory_cache defaults off' in help_text,
+     '--help must state Fish normalize/cache defaults')
 
 # All inline curl JSON examples must remain valid JSON. This catches quoting edits
 # that look fine in Markdown/help but fail when copied into a shell.
@@ -190,5 +205,5 @@ must('--keepParent' not in active_workflow_lines and 's2-macos-metal.zip' not in
      'Metal packaging must not wrap the one-file release in a ZIP')
 print(
     f"DOCS_API_SYNC_PASS options={len(options)} routes={len(routes)} "
-    f"json_fields={len(common_fields)+3}"
+    f"json_fields={len(common_fields)+5}"
 )

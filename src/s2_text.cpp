@@ -12,6 +12,29 @@
 #include <vector>
 
 namespace s2 {
+
+std::string normalize_tts_text(const std::string & text) {
+    if (!utf8::is_valid(text)) return text;
+    std::string out;
+    out.reserve(text.size());
+    bool pending_space = false;
+    bool have_content = false;
+    for (size_t pos = 0; pos < text.size();) {
+        uint32_t cp = 0; size_t width = 0;
+        if (!utf8::decode_one(text, pos, cp, width)) return text;
+        if (utf8::is_whitespace(cp)) {
+            if (have_content) pending_space = true;
+        } else {
+            if (pending_space) out.push_back(' ');
+            out.append(text, pos, width);
+            have_content = true;
+            pending_space = false;
+        }
+        pos += width;
+    }
+    return out;
+}
+
 namespace {
 #include "s2_unicode_ranges.inc"
 #include "s2_sentence_break_ignore.inc"

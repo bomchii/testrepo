@@ -15,6 +15,10 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#ifndef _WIN32
+#  include <unistd.h>
+#  include <fcntl.h>
+#endif
 namespace s2 {
 
 static std::FILE * open_binary_input_utf8(const std::string & path) {
@@ -1345,6 +1349,12 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
                 ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
             }
         }
+#ifdef __linux__
+        // The backend now owns the uploaded weights; drop the codec GGUF pages
+        // from the kernel page cache to avoid keeping a second RAM-sized copy.
+        const int codec_fd = ::fileno(f);
+        if (codec_fd >= 0) (void)::posix_fadvise(codec_fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
         std::fclose(f);
         file_guard.f = nullptr;
         if (dequant_count > 0)

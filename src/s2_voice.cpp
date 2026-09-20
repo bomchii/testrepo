@@ -254,8 +254,11 @@ VoiceProfile VoiceProfileManager::load(const std::string & voice_id) {
 }
 
 bool VoiceProfileManager::remove(const std::string & voice_id) {
-    const std::string path = get_path(voice_id);
-    if (!fs::exists(path)) return false;
+    const fs::path path(get_path(voice_id));
+    // A directory named <id>.s2voice is not a voice profile. Treat it as a
+    // missing resource instead of allowing fs::remove() to delete an empty
+    // directory through the DELETE /v1/voices/<id> API.
+    if (!fs::exists(path) || !fs::is_regular_file(path)) return false;
     return fs::remove(path);
 }
 

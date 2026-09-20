@@ -1,6 +1,7 @@
 #include "s2_pipeline.h"
 #include "s2_json.h"
 #include "s2_utf8.h"
+#include "base64.h"
 #if defined(GGML_USE_HIP)
 #  include <hip/hip_runtime.h>
 #elif defined(GGML_USE_CUDA)
@@ -27,6 +28,13 @@
 #include <atomic>
 #include <memory>
 #include <unordered_map>
+#include <condition_variable>
+#include <future>
+#include <functional>
+#include <utility>
+#include <deque>
+#include <cstdlib>
+#include <cerrno>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -34,14 +42,29 @@
 #  endif
 #  include <windows.h>
 #  include <ws2tcpip.h>
+#  include <process.h>
 #elif defined(__APPLE__)
 #  include <mach-o/dyld.h>
+#  include <crt_externs.h>
 #  include <limits.h>
 #  include <arpa/inet.h>
+#  include <netdb.h>
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <spawn.h>
+#  include <unistd.h>
 #else
 #  include <unistd.h>
 #  include <limits.h>
 #  include <arpa/inet.h>
+#  include <netdb.h>
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <spawn.h>
+#endif
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+extern char **environ;
 #endif
 
 // tokenizer_data.h es generado por el workflow antes de compilar.
@@ -129,16 +152,49 @@ static bool utf8_to_wide_path(const std::string & value, std::wstring & out) {
 }
 #endif
 
-static bool is_ip_address_literal(const std::string & value) {
-    if (value.empty()) return false;
-    unsigned char storage[16] = {};
+static bool resolve_bind_host(const std::string & value, std::string & resolved) {
+    resolved.clear();
+    if (value.empty() || value.size() > 254) return false;
 #ifdef _WIN32
-    return InetPtonA(AF_INET, value.c_str(), storage) == 1 ||
-           InetPtonA(AF_INET6, value.c_str(), storage) == 1;
-#else
-    return inet_pton(AF_INET, value.c_str(), storage) == 1 ||
-           inet_pton(AF_INET6, value.c_str(), storage) == 1;
+    static std::once_flag winsock_once;
+    static int winsock_rc = 0;
+    std::call_once(winsock_once, [] {
+        WSADATA wsa{};
+        winsock_rc = WSAStartup(MAKEWORD(2, 2), &wsa);
+    });
+    if (winsock_rc != 0) return false;
 #endif
+    // Preserve literal-address behavior independently of AI_ADDRCONFIG. In
+    // particular, ::1 must remain bindable on hosts without a global IPv6
+    // address. DNS resolution is needed only for actual hostnames.
+    in_addr ipv4{};
+    if (inet_pton(AF_INET, value.c_str(), &ipv4) == 1) { resolved = value; return true; }
+    in6_addr ipv6{};
+    if (inet_pton(AF_INET6, value.c_str(), &ipv6) == 1) { resolved = value; return true; }
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = 0;
+    addrinfo * result = nullptr;
+    if (getaddrinfo(value.c_str(), nullptr, &hints, &result) != 0 || !result) return false;
+
+    char host[NI_MAXHOST] = {};
+    bool ok = false;
+    for (int pass = 0; pass < 2 && !ok; ++pass) {
+        const int wanted = pass == 0 ? AF_INET : AF_INET6;
+        for (addrinfo * ai = result; ai; ai = ai->ai_next) {
+            if (ai->ai_family != wanted) continue;
+            if (getnameinfo(ai->ai_addr, static_cast<int>(ai->ai_addrlen),
+                            host, sizeof(host), nullptr, 0, NI_NUMERICHOST) == 0) {
+                resolved = host;
+                ok = true;
+                break;
+            }
+        }
+    }
+    freeaddrinfo(result);
+    return ok;
 }
 
 static float parse_float_arg(const char * raw) {
@@ -193,57 +249,117 @@ static int32_t checked_json_fish_max_new_tokens(const crow::json::rvalue & value
     return v == 0 ? 32768 : v;
 }
 
-static void validate_fish_json_subset(const crow::json::rvalue & json, bool http_buffered) {
-    // Known Fish fields that materially change generation/output but do not yet
-    // have an equivalent implementation here must fail explicitly. Silently
-    // accepting them is worse than a clear subset error because the client may
-    // believe it requested different prosody/chunk continuity/normalization.
-    static constexpr const char * unsupported_semantic_fields[] = {
-        "early_stop_threshold",
-        "normalize",
-        "sample_rate",
-        "mp3_bitrate",
-        "opus_bitrate",
-        "use_memory_cache",
-    };
-    for (const char * field : unsupported_semantic_fields) {
-        if (json.has(field)) {
-            throw std::invalid_argument(
-                std::string("Fish field '") + field +
-                "' is not supported by this API subset and must not be ignored");
+static bool checked_json_bool(const crow::json::rvalue & value, const char * field) {
+    if (value.t() != crow::json::type::True && value.t() != crow::json::type::False)
+        throw std::invalid_argument(std::string(field) + " must be a boolean");
+    return value.b();
+}
+
+static bool checked_json_memory_cache(const crow::json::rvalue & value) {
+    if (value.t() == crow::json::type::True || value.t() == crow::json::type::False)
+        return value.b();
+    if (value.t() != crow::json::type::String)
+        throw std::invalid_argument("use_memory_cache must be 'on'/'off' or boolean");
+    std::string mode = value.s();
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (mode == "on" || mode == "true" || mode == "1") return true;
+    if (mode == "off" || mode == "false" || mode == "0") return false;
+    throw std::invalid_argument("use_memory_cache must be 'on' or 'off'");
+}
+
+static void parse_inline_references(const crow::json::rvalue & refs, s2::PipelineParams & params) {
+    if (refs.t() != crow::json::type::List)
+        throw std::invalid_argument("Fish field 'references' must be an array");
+    if (refs.size() > 8)
+        throw std::invalid_argument("Fish field 'references' supports at most 8 entries");
+    params.inline_references.clear();
+    size_t total_audio = 0, total_text = 0;
+    for (size_t i = 0; i < refs.size(); ++i) {
+        const auto & ref = refs[i];
+        if (ref.t() != crow::json::type::Object)
+            throw std::invalid_argument("each references[] entry must be an object");
+        if (!ref.has("audio") || !ref.has("text"))
+            throw std::invalid_argument("each references[] entry requires audio and text");
+        if (ref["audio"].t() != crow::json::type::String || ref["text"].t() != crow::json::type::String)
+            throw std::invalid_argument("references[].audio/text must be strings in JSON");
+        s2::InlineReference item;
+        const std::string encoded = ref["audio"].s();
+        if (!s2::base64_decode(encoded, item.audio) || item.audio.empty())
+            throw std::invalid_argument("references[].audio must be non-empty canonical base64 audio bytes");
+        item.text = ref["text"].s();
+        if (!s2::utf8::is_valid(item.text) || !s2::utf8::has_non_whitespace(item.text))
+            throw std::invalid_argument("references[].text must be non-empty valid UTF-8");
+        if (item.audio.size() > 4u * 1024u * 1024u)
+            throw std::invalid_argument("one inline reference exceeds the 4 MiB decoded-audio limit");
+        if (item.text.size() > 1024u * 1024u)
+            throw std::invalid_argument("one inline reference transcript exceeds 1 MiB");
+        if (total_audio > 6u * 1024u * 1024u - item.audio.size())
+            throw std::invalid_argument("combined inline reference audio exceeds 6 MiB");
+        if (total_text > 1024u * 1024u - item.text.size())
+            throw std::invalid_argument("combined inline reference transcripts exceed 1 MiB");
+        total_audio += item.audio.size();
+        total_text += item.text.size();
+        params.inline_references.push_back(std::move(item));
+    }
+}
+
+static void apply_fish_fields(const crow::json::rvalue & json, s2::PipelineParams & p, bool websocket) {
+    if (json.has("early_stop_threshold")) {
+        if (json["early_stop_threshold"].t() != crow::json::type::Number)
+            throw std::invalid_argument("early_stop_threshold must be a number");
+        p.gen.early_stop_threshold = static_cast<float>(json["early_stop_threshold"].d());
+    }
+    if (json.has("normalize")) p.normalize_text = checked_json_bool(json["normalize"], "normalize");
+    if (json.has("sample_rate")) p.output_sample_rate = checked_json_i32(json["sample_rate"]);
+    if (json.has("use_memory_cache")) p.reference_memory_cache = checked_json_memory_cache(json["use_memory_cache"]);
+    if (json.has("references")) parse_inline_references(json["references"], p);
+
+    if (json.has("prosody")) {
+        const auto & pr = json["prosody"];
+        if (pr.t() != crow::json::type::Object) throw std::invalid_argument("prosody must be an object");
+        if (pr.has("speed")) {
+            if (pr["speed"].t() != crow::json::type::Number) throw std::invalid_argument("prosody.speed must be a number");
+            p.prosody_speed = static_cast<float>(pr["speed"].d());
         }
+        if (pr.has("volume")) {
+            if (pr["volume"].t() != crow::json::type::Number) throw std::invalid_argument("prosody.volume must be a number");
+            p.prosody_volume_db = static_cast<float>(pr["volume"].d());
+        }
+        if (pr.has("normalize_loudness"))
+            p.normalize_loudness = checked_json_bool(pr["normalize_loudness"], "prosody.normalize_loudness");
     }
 
-    if (json.has("references")) {
-        const auto & refs = json["references"];
-        if (refs.t() != crow::json::type::List)
-            throw std::invalid_argument("Fish field 'references' must be an array");
-        if (refs.size() != 0)
-            throw std::invalid_argument(
-                "inline Fish 'references' are not supported by this JSON API; "
-                "use reference_audio+prompt_text or reference_id/voice");
+    if (json.has("latency")) {
+        if (json["latency"].t() != crow::json::type::String)
+            throw std::invalid_argument("latency must be normal, balanced, or low");
+        std::string latency = json["latency"].s();
+        std::transform(latency.begin(), latency.end(), latency.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (latency != "normal" && latency != "balanced" && latency != "low")
+            throw std::invalid_argument("latency must be normal, balanced, or low");
+        if (!websocket && latency != "normal")
+            throw std::invalid_argument("latency=balanced/low is supported by the local low-latency WebSocket path; buffered HTTP supports latency=normal");
+        if (websocket && !json.has("stream_stride"))
+            p.stream_decode_stride_frames = latency == "low" ? 2 : (latency == "balanced" ? 4 : 8);
     }
+}
+
+static void validate_fish_json_subset(const crow::json::rvalue & json, bool http_buffered) {
     if (json.has("streaming")) {
         const auto & streaming = json["streaming"];
-        if (streaming.t() != crow::json::type::True &&
-            streaming.t() != crow::json::type::False)
+        if (streaming.t() != crow::json::type::True && streaming.t() != crow::json::type::False)
             throw std::invalid_argument("Fish field 'streaming' must be a boolean");
         if (http_buffered && streaming.b())
-            throw std::invalid_argument(
-                "HTTP streaming=true is not supported; use /ws/tts for streaming audio");
+            throw std::invalid_argument("HTTP streaming=true is not supported; use /ws/tts for streaming audio");
         if (!http_buffered && !streaming.b())
-            throw std::invalid_argument(
-                "streaming=false is incompatible with /ws/tts; use an HTTP synthesis endpoint");
+            throw std::invalid_argument("streaming=false is incompatible with /ws/tts; use an HTTP synthesis endpoint");
     }
-
-    // Route-specific fields must not be accepted as silent no-ops. HTTP returns
-    // one buffered WAV/PCM response; WebSocket always streams framed PCM.
     if (http_buffered && json.has("stream_stride"))
-        throw std::invalid_argument(
-            "stream_stride is WebSocket-only; use /ws/tts or --stream-decode-stride as its server default");
-    if (!http_buffered && (json.has("format") || json.has("response_format")))
-        throw std::invalid_argument(
-            "format/response_format are HTTP-only; /ws/tts always streams PCM");
+        throw std::invalid_argument("stream_stride is WebSocket-only; use /ws/tts or --stream-decode-stride as its server default");
+    if (!http_buffered && (json.has("format") || json.has("response_format") ||
+                           json.has("mp3_bitrate") || json.has("opus_bitrate")))
+        throw std::invalid_argument("format/response_format and encoded-audio bitrate fields are HTTP-only; /ws/tts streams PCM");
 }
 
 static crow::json::rvalue load_json_strict(const std::string & raw) {
@@ -254,6 +370,41 @@ static crow::json::rvalue load_json_strict(const std::string & raw) {
 }
 
 constexpr size_t MAX_JSON_REQUEST_BYTES = 8u * 1024u * 1024u;
+constexpr size_t MAX_TEXT_REQUEST_BYTES = 1024u * 1024u;
+constexpr uint64_t MAX_BATCH_REQUESTED_TOKENS = 32768u;
+constexpr size_t MAX_BATCH_BASE64_BYTES = 128u * 1024u * 1024u;
+
+static bool read_stdin_text_bounded(std::istream & input, std::string & out, std::string & error) {
+    out.clear();
+    error.clear();
+    char buffer[8192];
+    while (input) {
+        input.read(buffer, static_cast<std::streamsize>(sizeof(buffer)));
+        const std::streamsize got = input.gcount();
+        if (got <= 0) break;
+        const size_t n = static_cast<size_t>(got);
+        if (n > MAX_TEXT_REQUEST_BYTES - out.size()) {
+            error = "stdin text exceeds 1 MiB request limit";
+            out.clear();
+            return false;
+        }
+        out.append(buffer, n);
+    }
+    if (input.bad()) {
+        error = "failed to read text from stdin";
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+static bool base64_encoded_size(size_t input_bytes, size_t & encoded_bytes) noexcept {
+    if (input_bytes > std::numeric_limits<size_t>::max() - 2u) return false;
+    const size_t groups = (input_bytes + 2u) / 3u;
+    if (groups > std::numeric_limits<size_t>::max() / 4u) return false;
+    encoded_bytes = groups * 4u;
+    return true;
+}
 
 struct ScopedTempPath {
     std::string path;
@@ -278,18 +429,18 @@ static uint16_t read_le_u16(const unsigned char * p) {
     return static_cast<uint16_t>(p[0]) |
            static_cast<uint16_t>(static_cast<uint16_t>(p[1]) << 8);
 }
-
 static uint32_t read_le_u32(const unsigned char * p) {
     return static_cast<uint32_t>(p[0]) |
            (static_cast<uint32_t>(p[1]) << 8) |
            (static_cast<uint32_t>(p[2]) << 16) |
            (static_cast<uint32_t>(p[3]) << 24);
 }
+static uint64_t read_le_u64(const unsigned char * p) {
+    return static_cast<uint64_t>(read_le_u32(p)) |
+           (static_cast<uint64_t>(read_le_u32(p + 4)) << 32);
+}
 
-// synthesize_to_file() creates one exact 44-byte PCM WAV layout. Validate it
-// before returning bytes to a client so a truncated temp file cannot look like
-// a successful empty/partial response.
-static bool read_generated_wav(const std::string & path, bool pcm_only, std::string & out) {
+static bool read_binary_file(const std::string & path, std::string & out) {
     out.clear();
     std::ifstream f;
 #ifdef _WIN32
@@ -300,50 +451,165 @@ static bool read_generated_wav(const std::string & path, bool pcm_only, std::str
     f.open(path, std::ios::binary);
 #endif
     if (!f) return false;
-
-    unsigned char header[44] = {};
-    if (!f.read(reinterpret_cast<char *>(header), sizeof(header))) return false;
-    if (std::memcmp(header + 0, "RIFF", 4) != 0 ||
-        std::memcmp(header + 8, "WAVE", 4) != 0 ||
-        std::memcmp(header + 12, "fmt ", 4) != 0 ||
-        std::memcmp(header + 36, "data", 4) != 0) return false;
-
-    const uint32_t fmt_size     = read_le_u32(header + 16);
-    const uint16_t audio_format = read_le_u16(header + 20);
-    const uint16_t channels     = read_le_u16(header + 22);
-    const uint32_t sample_rate  = read_le_u32(header + 24);
-    const uint32_t byte_rate    = read_le_u32(header + 28);
-    const uint16_t block_align  = read_le_u16(header + 32);
-    const uint16_t bits         = read_le_u16(header + 34);
-    const uint32_t riff_size    = read_le_u32(header + 4);
-    const uint32_t data_size    = read_le_u32(header + 40);
-
-    // synthesize_to_file() always emits canonical mono signed-16 PCM.  Validate
-    // the complete format contract before stripping the 44-byte header for the
-    // raw-PCM API. This also catches a corrupted header that merely has the
-    // expected RIFF/data magic bytes.
-    if (fmt_size != 16u || audio_format != 1u || channels != 1u ||
-        sample_rate == 0u || sample_rate > std::numeric_limits<uint32_t>::max() / 2u ||
-        bits != 16u || block_align != 2u ||
-        byte_rate != sample_rate * 2u || (data_size % block_align) != 0u) return false;
-    if (data_size > std::numeric_limits<uint32_t>::max() - 36u ||
-        riff_size != 36u + data_size) return false;
-    const uint64_t expected64 = 44ull + static_cast<uint64_t>(data_size);
-    if (expected64 > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
-        expected64 > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) return false;
-
     f.seekg(0, std::ios::end);
-    const std::streamoff actual = f.tellg();
-    if (actual < 0 || static_cast<uint64_t>(actual) != expected64) return false;
+    const std::streamoff n = f.tellg();
+    if (n < 0 || static_cast<uint64_t>(n) > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        static_cast<uint64_t>(n) > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) return false;
+    out.resize(static_cast<size_t>(n));
+    f.seekg(0, std::ios::beg);
+    return out.empty() || static_cast<bool>(f.read(out.data(), static_cast<std::streamsize>(out.size())));
+}
 
-    if (pcm_only) {
-        out.resize(static_cast<size_t>(data_size));
-        f.seekg(44, std::ios::beg);
-        if (data_size > 0 && !f.read(out.data(), static_cast<std::streamsize>(data_size))) return false;
+static bool read_generated_wave(const std::string & path, bool pcm_only, std::string & out,
+                                uint32_t & sample_rate_out, bool & rf64_out) {
+    out.clear(); sample_rate_out = 0; rf64_out = false;
+    std::string bytes;
+    if (!read_binary_file(path, bytes) || bytes.size() < 44u) return false;
+    const auto * b = reinterpret_cast<const unsigned char *>(bytes.data());
+    const bool riff = std::memcmp(b, "RIFF", 4) == 0;
+    const bool rf64 = std::memcmp(b, "RF64", 4) == 0;
+    if ((!riff && !rf64) || std::memcmp(b + 8, "WAVE", 4) != 0) return false;
+
+    size_t fmt_off = 0, data_off = 0;
+    uint64_t data_size64 = 0, riff_size64 = 0;
+    bool have_ds64 = false;
+    size_t pos = 12;
+    while (pos + 8u <= bytes.size()) {
+        const uint32_t chunk_size = read_le_u32(b + pos + 4u);
+        const size_t payload = pos + 8u;
+        if (payload > bytes.size()) return false;
+        const bool rf64_data_sentinel = rf64 && std::memcmp(b + pos, "data", 4) == 0 && chunk_size == 0xffffffffu;
+        if (!rf64_data_sentinel && static_cast<uint64_t>(chunk_size) > bytes.size() - payload) return false;
+        if (std::memcmp(b + pos, "ds64", 4) == 0) {
+            if (chunk_size < 28u) return false;
+            riff_size64 = read_le_u64(b + payload);
+            data_size64 = read_le_u64(b + payload + 8u);
+            have_ds64 = true;
+        } else if (std::memcmp(b + pos, "fmt ", 4) == 0) {
+            if (chunk_size < 16u) return false;
+            fmt_off = payload;
+        } else if (std::memcmp(b + pos, "data", 4) == 0) {
+            data_off = payload;
+            if (!rf64) data_size64 = chunk_size;
+            break;
+        }
+        const uint64_t next = static_cast<uint64_t>(payload) + chunk_size + (chunk_size & 1u);
+        if (next > bytes.size()) return false;
+        pos = static_cast<size_t>(next);
+    }
+    if (!fmt_off || !data_off || (rf64 && !have_ds64)) return false;
+    if (fmt_off + 16u > bytes.size()) return false;
+    const uint16_t audio_format = read_le_u16(b + fmt_off);
+    const uint16_t channels = read_le_u16(b + fmt_off + 2u);
+    const uint32_t sample_rate = read_le_u32(b + fmt_off + 4u);
+    const uint32_t byte_rate = read_le_u32(b + fmt_off + 8u);
+    const uint16_t block_align = read_le_u16(b + fmt_off + 12u);
+    const uint16_t bits = read_le_u16(b + fmt_off + 14u);
+    if (audio_format != 1u || channels != 1u || sample_rate == 0u || bits != 16u ||
+        block_align != 2u || sample_rate > std::numeric_limits<uint32_t>::max() / 2u ||
+        byte_rate != sample_rate * 2u || (data_size64 % 2u) != 0u) return false;
+    if (data_size64 > bytes.size() - data_off) return false;
+    if (data_off + data_size64 != bytes.size()) return false;
+    if (riff) {
+        if (read_le_u32(b + 4u) != bytes.size() - 8u) return false;
     } else {
-        out.resize(static_cast<size_t>(expected64));
-        f.seekg(0, std::ios::beg);
-        if (!out.empty() && !f.read(out.data(), static_cast<std::streamsize>(out.size()))) return false;
+        if (read_le_u32(b + 4u) != 0xffffffffu || riff_size64 != bytes.size() - 8u) return false;
+    }
+    sample_rate_out = sample_rate;
+    rf64_out = rf64;
+    if (pcm_only) out.assign(bytes.data() + data_off, static_cast<size_t>(data_size64));
+    else out = std::move(bytes);
+    return true;
+}
+
+static int run_process(const std::vector<std::string> & args) {
+    if (args.empty()) return -1;
+#ifdef _WIN32
+    // Use the wide CRT spawn API so --ffmpeg, %TEMP% and generated paths do
+    // not depend on the active ANSI code page.
+    std::vector<std::wstring> wide_args;
+    wide_args.reserve(args.size());
+    for (const auto & a : args) {
+        std::wstring w;
+        if (!utf8_to_wide_path(a, w)) return -1;
+        wide_args.push_back(std::move(w));
+    }
+    std::vector<const wchar_t *> argv;
+    argv.reserve(wide_args.size() + 1u);
+    for (const auto & a : wide_args) argv.push_back(a.c_str());
+    argv.push_back(nullptr);
+    return static_cast<int>(_wspawnvp(_P_WAIT, argv[0], argv.data()));
+#else
+    // fork()+non-async-signal-safe C++ work in the child can deadlock when the
+    // HTTP server is multithreaded. posix_spawnp performs process creation
+    // without running our allocator/iostream state in a post-fork child.
+    std::vector<char *> argv;
+    argv.reserve(args.size() + 1u);
+    for (const auto & a : args) argv.push_back(const_cast<char *>(a.c_str()));
+    argv.push_back(nullptr);
+    pid_t pid = -1;
+    #  if defined(__APPLE__)
+    char ** envp = *_NSGetEnviron();
+#  else
+    char ** envp = environ;
+#  endif
+    const int spawn_rc = posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), envp);
+    if (spawn_rc != 0) { errno = spawn_rc; return -1; }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+static bool is_mono_ogg_opus(const std::string & payload) noexcept {
+    if (payload.size() < 27u || payload.compare(0, 4, "OggS") != 0) return false;
+    const size_t head = payload.find("OpusHead");
+    if (head == std::string::npos || payload.size() - head < 19u) return false;
+    const unsigned char version = static_cast<unsigned char>(payload[head + 8u]);
+    const unsigned char channels = static_cast<unsigned char>(payload[head + 9u]);
+    const unsigned char mapping_family = static_cast<unsigned char>(payload[head + 18u]);
+    // RFC 7845 output from our -ac 1 encoder must be a mono Opus identification
+    // header. Reject a generic Ogg stream or unexpected multichannel output.
+    return version != 0u && version <= 15u && channels == 1u && mapping_family == 0u;
+}
+
+static bool encode_with_ffmpeg(const std::string & ffmpeg_bin, const std::string & wav_path,
+                               const std::string & format, int bitrate_kbps, int output_rate,
+                               std::string & payload, std::string & error) {
+    payload.clear(); error.clear();
+    const std::string ext = format == "mp3" ? ".mp3" : ".opus";
+    ScopedTempPath encoded{wav_path + ext};
+    std::vector<std::string> args = {
+        ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-i", wav_path, "-map_metadata", "-1", "-vn", "-ac", "1",
+        "-ar", std::to_string(output_rate)
+    };
+    if (bitrate_kbps != -1000) {
+        args.push_back("-b:a");
+        args.push_back(std::to_string(bitrate_kbps) + "k");
+    }
+    args.push_back("-f");
+    args.push_back(format == "mp3" ? "mp3" : "opus");
+    args.push_back(encoded.path);
+    const int rc = run_process(args);
+    if (rc != 0) {
+        error = "ffmpeg failed for " + format + " (exit " + std::to_string(rc) + ")";
+        return false;
+    }
+    if (!read_binary_file(encoded.path, payload) || payload.empty()) {
+        error = "ffmpeg produced no readable " + format + " output";
+        return false;
+    }
+    if (format == "mp3") {
+        const bool id3 = payload.size() >= 3u && payload.compare(0, 3, "ID3") == 0;
+        const bool frame = payload.size() >= 2u && static_cast<unsigned char>(payload[0]) == 0xffu &&
+                           (static_cast<unsigned char>(payload[1]) & 0xe0u) == 0xe0u;
+        if (!id3 && !frame) { error = "ffmpeg output is not recognizable MP3"; return false; }
+    } else if (!is_mono_ogg_opus(payload)) {
+        error = "ffmpeg output is not a mono Ogg/Opus stream with a valid OpusHead"; return false;
     }
     return true;
 }
@@ -357,8 +623,8 @@ static bool validate_pipeline_params(const s2::PipelineParams & p,
     if (require_text && !s2::utf8::has_non_whitespace(p.text)) return fail("text must not be empty or whitespace-only");
     if (!p.prompt_audio_path.empty() && !s2::utf8::has_non_whitespace(p.prompt_text))
         return fail("reference_audio/--prompt-audio requires a non-empty prompt_text/--prompt-text");
-    if (p.text.size() > 1024u * 1024u) return fail("text exceeds 1 MiB request limit");
-    if (p.prompt_text.size() > 1024u * 1024u) return fail("prompt_text exceeds 1 MiB request limit");
+    if (p.text.size() > MAX_TEXT_REQUEST_BYTES) return fail("text exceeds 1 MiB request limit");
+    if (p.prompt_text.size() > MAX_TEXT_REQUEST_BYTES) return fail("prompt_text exceeds 1 MiB request limit");
     if (p.prompt_audio_path.size() > 32768u) return fail("reference audio path is too long");
     if (p.voice_id.size() > 128u) return fail("voice id is too long");
     if (!p.voice_id.empty()) {
@@ -380,6 +646,9 @@ static bool validate_pipeline_params(const s2::PipelineParams & p,
     if (p.gen.top_k < 0 || p.gen.top_k > 1000000) return fail("top_k must be between 0 and 1000000");
     if (p.gen.min_tokens_before_end < 0 || p.gen.min_tokens_before_end > 32768)
         return fail("min_end_tokens must be between 0 and 32768");
+    if (!std::isfinite(p.gen.early_stop_threshold) ||
+        (p.gen.early_stop_threshold != -1.0f && p.gen.early_stop_threshold != 1.0f))
+        return fail("early_stop_threshold values that change legacy Fish multi-sample early-stop semantics require tensor-batched generation; this single-sample engine accepts only -1 (disabled) or 1.0 (neutral/all-finished)");
     if (p.gen.min_tokens_before_end >= p.gen.max_new_tokens)
         return fail("min_end_tokens must be smaller than max_tokens");
     if (p.gen.repetition_penalty < 1.0f || !std::isfinite(p.gen.repetition_penalty) || p.gen.repetition_penalty > 10.0f)
@@ -397,20 +666,165 @@ static bool validate_pipeline_params(const s2::PipelineParams & p,
     if (p.codec_chunk_frames < 0) return fail("codec_chunk must be >= 0");
     if (p.codec_overlap_frames < 0) return fail("codec_overlap must be >= 0");
     if (p.min_seg_chars < 0 || p.min_seg_chars > 1000000) return fail("min_seg_chars must be between 0 and 1000000");
-    if (p.chunk_length != 0 && (p.chunk_length < 100 || p.chunk_length > 300))
-        return fail("chunk_length must be 0 (off) or between 100 and 300");
+    if (p.chunk_length != 0 && (p.chunk_length < 100 || p.chunk_length > 1000))
+        return fail("chunk_length must be 0 (off) or between 100 and 1000");
     if (p.min_chunk_length < 0 || p.min_chunk_length > 100)
         return fail("min_chunk_length must be between 0 and 100");
     if (p.chunk_length == 0 && p.min_chunk_length != 0)
         return fail("min_chunk_length requires chunk_length");
     if (!std::isfinite(p.prosody_volume_db) || p.prosody_volume_db < -20.0f || p.prosody_volume_db > 20.0f)
         return fail("prosody volume must be finite and between -20 and 20 dB");
+    if (!std::isfinite(p.prosody_speed) || p.prosody_speed < 0.5f || p.prosody_speed > 2.0f)
+        return fail("prosody speed must be finite and between 0.5 and 2.0");
+    if (p.output_sample_rate != 0 && (p.output_sample_rate < 8000 || p.output_sample_rate > 192000))
+        return fail("sample_rate must be 0 (native) or between 8000 and 192000");
+    if (p.inline_references.size() > 8) return fail("at most 8 inline references are supported");
     if (p.stream_decode_stride_frames < -1 || p.stream_decode_stride_frames > 32768)
         return fail("stream_stride must be -1 (disabled), 0 (auto), or 1..32768");
     if (p.vulkan_device < -1) return fail("model device must be -1 (CPU) or >= 0");
     if (p.codec_vulkan_device < -2) return fail("codec device must be -2 (inherit), -1 (CPU), or >= 0");
     return true;
 }
+
+class BoundedTaskPool {
+public:
+    BoundedTaskPool(size_t thread_count, size_t max_queue)
+        : max_queue_(std::max<size_t>(1u, max_queue)) {
+        thread_count = std::max<size_t>(1u, thread_count);
+        try {
+            workers_.reserve(thread_count);
+            for (size_t i = 0; i < thread_count; ++i)
+                workers_.emplace_back([this] { worker_loop(); });
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping_ = true;
+            }
+            cv_.notify_all();
+            for (auto & worker : workers_) if (worker.joinable()) worker.join();
+            throw;
+        }
+    }
+
+    BoundedTaskPool(const BoundedTaskPool &) = delete;
+    BoundedTaskPool & operator=(const BoundedTaskPool &) = delete;
+    ~BoundedTaskPool() { shutdown(); }
+
+    template <class F>
+    bool submit(F && fn) noexcept {
+        try {
+            std::function<void()> job(std::forward<F>(fn));
+            if (!job) return false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (stopping_ || queue_.size() >= max_queue_) return false;
+                queue_.push_back(std::move(job));
+            }
+            cv_.notify_one();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void shutdown() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) {
+                // A constructor-failure cleanup may have set the flag already;
+                // still join any threads owned by a fully-constructed object.
+            }
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        for (auto & worker : workers_) if (worker.joinable()) worker.join();
+        workers_.clear();
+    }
+
+private:
+    void worker_loop() noexcept {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
+                if (stopping_ && queue_.empty()) return;
+                job = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            try { job(); } catch (...) { /* task owns user-visible error handling */ }
+        }
+    }
+
+    const size_t max_queue_;
+    std::vector<std::thread> workers_;
+    std::deque<std::function<void()>> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stopping_ = false;
+};
+
+class PipelinePool {
+public:
+    class Lease {
+    public:
+        Lease() = default;
+        Lease(PipelinePool * owner, size_t index) : owner_(owner), index_(index) {}
+        Lease(const Lease &) = delete;
+        Lease & operator=(const Lease &) = delete;
+        Lease(Lease && other) noexcept : owner_(other.owner_), index_(other.index_) { other.owner_ = nullptr; }
+        Lease & operator=(Lease && other) noexcept {
+            if (this != &other) { release(); owner_ = other.owner_; index_ = other.index_; other.owner_ = nullptr; }
+            return *this;
+        }
+        ~Lease() { release(); }
+        explicit operator bool() const noexcept { return owner_ != nullptr; }
+        s2::Pipeline * operator->() const { return owner_->pipelines_[index_]; }
+        s2::Pipeline & operator*() const { return *owner_->pipelines_[index_]; }
+    private:
+        void release() {
+            if (!owner_) return;
+            owner_->release(index_);
+            owner_ = nullptr;
+        }
+        PipelinePool * owner_ = nullptr;
+        size_t index_ = 0;
+    };
+
+    explicit PipelinePool(std::vector<s2::Pipeline *> pipelines) : pipelines_(std::move(pipelines)) {
+        for (size_t i = 0; i < pipelines_.size(); ++i) available_.push_back(i);
+    }
+
+    Lease acquire(const std::atomic_bool * keep_waiting = nullptr) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (keep_waiting) {
+            while (available_.empty() && keep_waiting->load(std::memory_order_relaxed))
+                cv_.wait_for(lock, std::chrono::milliseconds(50));
+            if (!keep_waiting->load(std::memory_order_relaxed)) return Lease();
+        } else {
+            cv_.wait(lock, [&] { return !available_.empty(); });
+        }
+        const size_t index = available_.back();
+        available_.pop_back();
+        return Lease(this, index);
+    }
+
+    size_t capacity() const noexcept { return pipelines_.size(); }
+
+private:
+    friend class Lease;
+    void release(size_t index) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            available_.push_back(index);
+        }
+        cv_.notify_one();
+    }
+    std::vector<s2::Pipeline *> pipelines_;
+    std::vector<size_t> available_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+};
 
 int main(int argc, char** argv) {
     const std::string exe_dir = get_exe_dir();
@@ -438,11 +852,18 @@ int main(int argc, char** argv) {
     params.min_chunk_length      = 0;
     params.condition_on_previous_chunks = true;
     params.prosody_volume_db     = 0.0f;
+    params.prosody_speed         = 1.0f;
+    params.normalize_loudness    = false;
+    params.normalize_text        = false;
+    params.output_sample_rate    = 0;
+    params.output_rf64           = false;
+    params.reference_memory_cache = true;
     // GenerateParams defaults (tambien en s2_generate.h)
     params.gen.temperature       = 0.7f;
     params.gen.top_p             = 0.7f;
     params.gen.top_k             = 30;
     params.gen.min_tokens_before_end = 64;
+    params.gen.early_stop_threshold = -1.0f;
     params.gen.ras_window_size   = 10;
     params.gen.ras_high_temp     = 1.0f;
     params.gen.ras_high_top_p    = 0.9f;
@@ -458,10 +879,14 @@ int main(int argc, char** argv) {
     params.stream_decode_stride_frames = 0;
 
     int port = 8080;
+    int server_workers = 1;
+    std::string ffmpeg_bin = "ffmpeg";
+    if (const char * env_ffmpeg = std::getenv("S2_FFMPEG"); env_ffmpeg && *env_ffmpeg) ffmpeg_bin = env_ffmpeg;
     // Crow defaults to 0.0.0.0. This API accepts local filesystem paths for
     // reference audio, so bind to loopback unless the user explicitly opts in.
     std::string bind_host = "127.0.0.1";
     bool list_voices = false;
+    bool normalize_cli_explicit = false;
 
     // --- Parse des arguments ---
     for (int i = 1; i < argc; i++) {
@@ -500,6 +925,24 @@ int main(int argc, char** argv) {
             params.condition_on_previous_chunks = false;
         } else if (arg == "--prosody-volume" && i + 1 < argc) {
             params.prosody_volume_db = parse_float_arg(argv[++i]);
+        } else if (arg == "--prosody-speed" && i + 1 < argc) {
+            params.prosody_speed = parse_float_arg(argv[++i]);
+        } else if (arg == "--normalize") {
+            params.normalize_text = true;
+            normalize_cli_explicit = true;
+        } else if (arg == "--no-normalize") {
+            params.normalize_text = false;
+            normalize_cli_explicit = true;
+        } else if (arg == "--normalize-loudness") {
+            params.normalize_loudness = true;
+        } else if (arg == "--no-normalize-loudness") {
+            params.normalize_loudness = false;
+        } else if (arg == "--sample-rate" && i + 1 < argc) {
+            params.output_sample_rate = parse_int_arg(argv[++i]);
+        } else if (arg == "--rf64") {
+            params.output_rf64 = true;
+        } else if (arg == "--no-rf64") {
+            params.output_rf64 = false;
         } else if ((arg == "--temperature" || arg == "--temp") && i + 1 < argc) {
             params.gen.temperature = parse_float_arg(argv[++i]);
         } else if (arg == "--top-p" && i + 1 < argc) {
@@ -508,6 +951,8 @@ int main(int argc, char** argv) {
             params.gen.top_k = parse_int_arg(argv[++i]);
         } else if (arg == "--min-end-tokens" && i + 1 < argc) {
             params.gen.min_tokens_before_end = parse_int_arg(argv[++i]);
+        } else if (arg == "--early-stop-threshold" && i + 1 < argc) {
+            params.gen.early_stop_threshold = parse_float_arg(argv[++i]);
         } else if (arg == "--seed" && i + 1 < argc) {
             params.gen.seed = parse_u64_arg(argv[++i]);
         } else if (arg == "--repetition-penalty" && i + 1 < argc) {
@@ -530,6 +975,10 @@ int main(int argc, char** argv) {
             port = parse_int_arg(argv[++i]);
         } else if (arg == "--host" && i + 1 < argc) {
             bind_host = argv[++i];
+        } else if (arg == "--workers" && i + 1 < argc) {
+            server_workers = parse_int_arg(argv[++i]);
+        } else if (arg == "--ffmpeg" && i + 1 < argc) {
+            ffmpeg_bin = argv[++i];
         } else if ((arg == "-threads" || arg == "--threads") && i + 1 < argc) {
             params.gen.n_threads = parse_int_arg(argv[++i]);
         } else if ((arg == "--max-tokens") && i + 1 < argc) {
@@ -564,7 +1013,7 @@ and WebSocket PCM streaming. The same CLI is used by every backend-specific buil
 
 USAGE:
   s2 [options]                         Start the HTTP/WebSocket server.
-  s2 [options] --output out.wav        Synthesize once to WAV and exit.
+  s2 [options] --output out.wav        Synthesize once to RIFF/WAV (or RF64) and exit.
   s2 [options] --save-voice ...        Encode/save a .s2voice profile.
   s2 [options] --list-voices           List saved profiles and exit.
   s2 --help                            Show this help and exit.
@@ -622,7 +1071,8 @@ COMMAND MODES / FUNCTIONS:
     defaults and supported request JSON fields can override them per request.
 
   One-shot synthesis
-    --output <path> writes one WAV file and exits without starting the server.
+    --output <path> writes one PCM16 RIFF/WAV file (RF64 with --rf64) and exits
+    without starting the server.
     Input comes from --text; if --text is omitted, UTF-8 text is read from stdin.
 
   Save a voice profile
@@ -682,14 +1132,20 @@ ALL COMMAND-LINE OPTIONS:
 
   Server:
     -p, --port <N>                Listen port. Default: 8080. Range: 1..65535.
-        --host <IP>               Bind IPv4/IPv6 address literal only.
-                                  Default: 127.0.0.1. Max text length: 64 chars.
+        --host <name-or-IP>       Server-only bind IPv4/IPv6 literal or DNS hostname.
+                                  Default: 127.0.0.1. Hostnames resolve at server startup.
                                   Use 0.0.0.0 only for intentional LAN exposure.
+        --workers <N>             Server-only independent pipeline replicas for
+                                  concurrent inference. Default: 1. Range: 1..16. Model/codec
+                                  memory usage scales roughly with worker count.
+        --ffmpeg <path>           Server-only ffmpeg executable used for HTTP MP3/Opus output.
+                                  Default: S2_FFMPEG or ffmpeg from PATH.
 
   One-shot input/output:
         --text <text>             Input for --output mode. Max: 1 MiB.
                                   If omitted with --output, text is read from stdin.
-    -o, --output <path>           Write one WAV file and exit; no server is started.
+    -o, --output <path>           Write PCM16 RIFF/WAV (RF64 with --rf64) and exit;
+                                  no server is started.
         --trim-silence            Trim only final trailing silence.
         --no-trim-silence         Disable trailing-silence trim (default; also
                                   overrides an earlier --trim-silence).
@@ -724,7 +1180,7 @@ ALL COMMAND-LINE OPTIONS:
                                   Range: 0..1000000; 0 disables minimum length.
         --chunk-length <N>        Fish-style long-form chunk target in visible
                                   Unicode characters. Default: 0 = disabled.
-                                  Range when enabled: 100..300. Peak PCM RAM stays
+                                  Range when enabled: 100..1000. Peak PCM RAM stays
                                   bounded; the staged WAV grows with final audio but
                                   no second raw-PCM copy is created.
         --min-chunk-length <N>    Minimum visible chars for long-form chunks.
@@ -736,6 +1192,16 @@ ALL COMMAND-LINE OPTIONS:
                                   Disable automatic inter-chunk VQ conditioning.
         --prosody-volume <dB>     Output gain after final trim. Default: 0 dB.
                                   Range: -20..20 dB.
+        --prosody-speed <F>       WSOLA-style tempo change. Default: 1.0.
+                                  Range: 0.5..2.0; tiny clips use interpolation.
+        --normalize               Normalize Unicode whitespace in request text.
+        --no-normalize            Disable request-text normalization (default).
+        --normalize-loudness      Normalize final RMS loudness before gain.
+        --no-normalize-loudness   Disable loudness normalization (default).
+        --sample-rate <N>         Resample output. 0 = codec-native (default),
+                                  otherwise 8000..192000 Hz.
+        --rf64                    Write RF64 rather than RIFF/WAV in one-shot/file paths.
+        --no-rf64                 Use classic RIFF/WAV output (default).
 
   Sampling:
         --temperature <F>         Sampling temperature. Alias: --temp.
@@ -746,6 +1212,11 @@ ALL COMMAND-LINE OPTIONS:
                                   Default: 64. Range: 0..32768 and must be
                                   strictly smaller than --max-tokens. It is also
                                   clamped to the effective generation budget.
+        --early-stop-threshold <F>
+                                  Legacy Fish compatibility. -1 disables (default);
+                                  1.0 is neutral/all-finished. Fractional values
+                                  require true multi-sample tensor batching and are
+                                  rejected rather than reinterpreted.
         --seed <uint64>           Request seed. Default: 0 = random source.
                                   1..UINT64_MAX are deterministic; segmented
                                   requests derive a stable sub-seed per segment.
@@ -776,7 +1247,7 @@ ALL COMMAND-LINE OPTIONS:
         --codec-chunk <N>         Maximum codec frames per decode window.
                                   Default: 0 = automatic. Range: >= 0.
                                   Positive values can reduce peak memory/VRAM.
-        --codec-overlap <N>       Decoder boundary history/holdback frames.
+        --codec-overlap <N>       Decoder left-history frames for streaming boundaries.
                                   Default: 0 = codec-derived automatic history.
                                   Range: >= 0. Positive values explicitly override
                                   history and can trade continuity for lower memory.
@@ -809,6 +1280,7 @@ SERVER ENDPOINTS (default mode):
   GET  /v1/health                Fish Speech-compatible JSON health check.
   GET  /v1/models                Local model service entry.
   POST /v1/tts                   Fish-Audio-style synthesis.
+  POST /v1/tts/batch             Batch synthesis (1..32 items, base64 results).
   POST /v1/audio/speech          OpenAI-style synthesis subset.
   POST /synthesize               Legacy synthesis alias.
   GET  /v1/voices                List saved voices.
@@ -834,7 +1306,10 @@ SERVER REQUEST EXAMPLES (default http://127.0.0.1:8080):
     curl -D pcm-headers.txt -X POST http://127.0.0.1:8080/v1/tts -H "Content-Type: application/json" -d '{"text":"PCM request.","format":"pcm"}' -o output.pcm
 
   OpenAI-style WAV:
-    curl -X POST http://127.0.0.1:8080/v1/audio/speech -H "Content-Type: application/json" -d '{"input":"Hello.","response_format":"wav"}' -o output.wav
+    curl -X POST http://127.0.0.1:8080/v1/audio/speech -H "Content-Type: application/json" -d '{"model":"s2-pro-local","input":"Hello.","response_format":"wav"}' -o output.wav
+    model is optional, but if present must be s2-pro-local. voice selects a
+    locally saved voice. instructions and stream_format are rejected because
+    this local OpenAI-style subset does not implement them.
 
   Legacy alias:
     curl -X POST http://127.0.0.1:8080/synthesize -H "Content-Type: application/json" -d '{"text":"Hello.","format":"wav"}' -o output.wav
@@ -864,15 +1339,25 @@ HTTP/WS SYNTHESIS FIELDS:
   multi_turn_history, threads, max_tokens/max_new_tokens, max_seg_tokens,
   min_end_tokens, ras_window, ras_temp, ras_top_p, codec_chunk, codec_overlap,
   min_seg_chars, chunk_length, min_chunk_length, condition_on_previous_chunks,
-  prosody (volume; speed currently only 1.0), latency (normal only),
-  trim_silence, and Fish streaming route-consistency flag.
-  HTTP only: format/response_format = wav|pcm. stream_stride is rejected.
-  WebSocket only: stream_stride. format/response_format are rejected because
-  /ws/tts always emits framed mono PCM int16.
-  Rejected Fish fields/modes: non-empty references[], early_stop_threshold,
-  normalize, sample_rate, mp3_bitrate, opus_bitrate, use_memory_cache,
-  prosody.normalize_loudness, latency balanced/low, and prosody.speed != 1.0.
-  These fail explicitly instead of being silently ignored.
+  early_stop_threshold, normalize, sample_rate, use_memory_cache, references[],
+  prosody (volume, speed, normalize_loudness), latency, trim_silence, and the
+  Fish streaming route-consistency flag.
+  HTTP only: format/response_format = wav|pcm|rf64|mp3|opus plus mp3_bitrate
+  and opus_bitrate. Buffered HTTP defaults to WAV even when CLI --rf64 is set;
+  request format=rf64 explicitly when needed. stream_stride is rejected. Buffered HTTP accepts only
+  latency=normal. MP3 supports 64/128/192 kbps and rates 8/11.025/12/16/
+  22.05/24/32/44.1/48 kHz. Opus supports -1000(auto)/24/32/48/64 kbps and
+  48 kHz output. MP3/Opus use optional ffmpeg.
+  WebSocket only: stream_stride and latency=balanced/low. Explicit balanced/low
+  or stream_stride>=0 cannot be combined with speed!=1, loudness normalization,
+  or non-native sample_rate because those need whole-segment postprocessing.
+  format/response_format and encoded-audio bitrates are rejected because
+  /ws/tts always emits framed mono PCM int16. Inline references[] accept base64
+  audio plus transcript text; use_memory_cache controls reference-code caching.
+  Explicit WS latency maps normal/balanced/low to 8/4/2 codec frames unless
+  stream_stride is supplied; generic stream_stride=0 remains auto 4 frames.
+  Fish requests default normalize=true unless CLI normalization was explicitly
+  selected; use_memory_cache defaults off per Fish request.
   Application request/message limit: 8 MiB; text and prompt_text: 1 MiB each.
   Crow 1.3.4 buffers HTTP bodies before route handlers; for a pre-buffer HTTP
   limit on non-loopback deployments, enforce a body limit in the reverse proxy.
@@ -937,16 +1422,32 @@ Run the README's complete CLI/API reference for examples and detailed backend no
         }
     }
 
-    {
-        std::string validation_error;
+    // Network/server-only options must never block one-shot synthesis or the
+    // save-only voice command. Validate and resolve them only when Crow will
+    // actually be started. Pipeline/generation options remain validated for all
+    // modes below.
+    const bool will_start_server = params.output_path.empty() && !params.save_voice;
+    std::string resolved_bind_host = bind_host;
+    if (will_start_server) {
         if (port < 1 || port > 65535) {
             std::cerr << "Error: port must be between 1 and 65535.\n";
             return 1;
         }
-        if (bind_host.size() > 64 || !is_ip_address_literal(bind_host)) {
-            std::cerr << "Error: --host must be a valid IPv4 or IPv6 address literal (for example 127.0.0.1 or ::1).\n";
+        if (server_workers < 1 || server_workers > 16) {
+            std::cerr << "Error: --workers must be between 1 and 16.\n";
             return 1;
         }
+        if (ffmpeg_bin.empty() || ffmpeg_bin.size() > 32768u) {
+            std::cerr << "Error: --ffmpeg path/name must not be empty or excessively long.\n";
+            return 1;
+        }
+        if (!resolve_bind_host(bind_host, resolved_bind_host)) {
+            std::cerr << "Error: --host could not be resolved to a bindable IPv4/IPv6 address: " << bind_host << "\n";
+            return 1;
+        }
+    }
+    {
+        std::string validation_error;
         if (!validate_pipeline_params(params, validation_error, false)) {
             std::cerr << "Error: " << validation_error << "\n";
             return 1;
@@ -1042,10 +1543,13 @@ Run the README's complete CLI/API reference for examples and detailed backend no
               << "  Model:         " << params.model_path << "\n"
               << "  Codec:         " << (params.codec_model_path.empty() ? params.model_path : params.codec_model_path) << "\n"
               << "  Model GPU:     " << gpu_str(params.vulkan_device) << "\n"
-              << "  Codec GPU:     " << gpu_str(params.codec_vulkan_device) << "\n"
-              << "  Bind address:  " << bind_host << "\n"
-              << "  Port:          " << port << "\n"
-              << "  CPU threads:   " << params.gen.n_threads << "\n"
+              << "  Codec GPU:     " << gpu_str(params.codec_vulkan_device) << "\n";
+    if (will_start_server) {
+        std::cout << "  Bind address:  " << bind_host << (resolved_bind_host != bind_host ? " -> " + resolved_bind_host : "") << "\n"
+                  << "  Port:          " << port << "\n"
+                  << "  Workers:       " << server_workers << " (independent pipeline replicas)\n";
+    }
+    std::cout << "  CPU threads:   " << params.gen.n_threads << "\n"
               << "  Max tokens:    " << params.gen.max_new_tokens << "\n"
               << "  Seg tokens:    " << params.max_tokens_per_segment << " (per segment)\n"
               << "  Segmentation:  " << (params.segment_sentences ? "ON" : "OFF (use --segment to enable)") << "\n"
@@ -1064,9 +1568,6 @@ Run the README's complete CLI/API reference for examples and detailed backend no
 
     // --- Charger le modele ---
     s2::Pipeline pipeline;
-    // Pipeline/model/codec/KV state is mutable and not re-entrant. Crow is multithreaded,
-    // so serialize all operations that touch the shared pipeline.
-    std::mutex pipeline_mutex;
 
 #ifdef S2_TOKENIZER_EMBEDDED
     // Tokenizer embebido: usar los bytes del array generado por el workflow.
@@ -1147,12 +1648,14 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // Si se especifico --output, sintetizar una vez, guardar y salir (sin servidor HTTP).
     if (!params.output_path.empty()) {
         if (params.text.empty()) {
-            // Leer stdin si no se paso texto
+            // Read raw stdin incrementally so multiline input keeps its exact
+            // line boundaries and cannot grow beyond the same 1 MiB text limit
+            // enforced for HTTP/WS requests.
             std::cout << "Reading text from stdin (Ctrl+D to finish)...\n";
-            std::string line;
-            while (std::getline(std::cin, line)) {
-                if (!params.text.empty()) params.text += " ";
-                params.text += line;
+            std::string stdin_error;
+            if (!read_stdin_text_bounded(std::cin, params.text, stdin_error)) {
+                std::cerr << "Error: " << stdin_error << ".\n";
+                return 1;
             }
         }
         if (params.text.empty()) {
@@ -1186,6 +1689,28 @@ Run the README's complete CLI/API reference for examples and detailed backend no
         return 0;
     }
 
+    // Server workers each own a complete mutable model/codec/KV state. This avoids
+    // concurrent entry into one Pipeline while allowing true request-level parallelism.
+    std::vector<std::unique_ptr<s2::Pipeline>> extra_pipelines;
+    std::vector<s2::Pipeline *> server_pipelines;
+    server_pipelines.push_back(&pipeline);
+    for (int worker = 1; worker < server_workers; ++worker) {
+        auto replica = std::make_unique<s2::Pipeline>();
+        std::cout << "[Workers] Initializing pipeline " << (worker + 1) << "/" << server_workers << "...\n";
+        if (!replica->init(params)) {
+            std::cerr << "Worker pipeline initialization failed.\n";
+            return 1;
+        }
+        if (params.warmup && !replica->warmup(params)) {
+            std::cerr << "Worker pipeline warmup failed.\n";
+            return 1;
+        }
+        server_pipelines.push_back(replica.get());
+        extra_pipelines.push_back(std::move(replica));
+    }
+    PipelinePool pipeline_pool(std::move(server_pipelines));
+    std::mutex voice_storage_mutex;
+
     // --- Serveur HTTP ---
     crow::SimpleApp app;
 
@@ -1197,135 +1722,150 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // JSON-size check as an application-level defense in depth.
     app.websocket_max_payload(MAX_JSON_REQUEST_BYTES);
 
-    // Per-connection cancellation state lets a disconnect stop an expensive
-    // synthesis even if Crow's asynchronous send itself does not throw.
+    // Crow invokes onmessage from its I/O context. Never run model inference in
+    // that callback: send_binary/send_text post work back to the same context, so
+    // blocking it would defeat incremental WebSocket delivery. Each connection
+    // gets cancellation + busy state, while a bounded pool runs heavy synthesis.
+    struct WsConnectionState {
+        std::atomic_bool alive{true};
+        std::atomic_bool busy{false};
+        std::mutex send_mutex;
+    };
     std::mutex ws_state_mutex;
-    std::unordered_map<crow::websocket::connection *, std::shared_ptr<std::atomic_bool>> ws_alive;
+    std::unordered_map<crow::websocket::connection *, std::shared_ptr<WsConnectionState>> ws_states;
+    std::unique_ptr<BoundedTaskPool> ws_tasks;
+    try {
+        ws_tasks = std::make_unique<BoundedTaskPool>(pipeline_pool.capacity(), 32u);
+    } catch (const std::exception & e) {
+        std::cerr << "Failed to initialize WebSocket worker pool: " << e.what() << "\n";
+        return 1;
+    }
     auto mark_ws_closed = [&](crow::websocket::connection & conn) {
-        std::lock_guard<std::mutex> lock(ws_state_mutex);
-        auto it = ws_alive.find(&conn);
-        if (it != ws_alive.end()) {
-            it->second->store(false, std::memory_order_relaxed);
-            ws_alive.erase(it);
+        std::shared_ptr<WsConnectionState> state;
+        {
+            std::lock_guard<std::mutex> lock(ws_state_mutex);
+            auto it = ws_states.find(&conn);
+            if (it != ws_states.end()) { state = it->second; ws_states.erase(it); }
+        }
+        if (state) {
+            std::lock_guard<std::mutex> send_lock(state->send_mutex);
+            state->alive.store(false, std::memory_order_relaxed);
         }
     };
+    auto mark_all_ws_closed = [&]() {
+        std::vector<std::shared_ptr<WsConnectionState>> states;
+        {
+            std::lock_guard<std::mutex> lock(ws_state_mutex);
+            states.reserve(ws_states.size());
+            for (auto & entry : ws_states) states.push_back(entry.second);
+            ws_states.clear();
+        }
+        // Never hold the registry mutex while waiting for an in-flight send.
+        // Once alive=false, queued/running synthesis cancels without touching
+        // Crow connection pointers after the server has stopped.
+        for (auto & state : states) {
+            if (!state) continue;
+            std::lock_guard<std::mutex> send_lock(state->send_mutex);
+            state->alive.store(false, std::memory_order_relaxed);
+        }
+    };
+
+    enum class ApiFlavor { Legacy, Fish, OpenAI };
 
     // ================================================================
     // Helper : traitement commun de synthese
     // ================================================================
-    auto do_synthesize = [&](const crow::json::rvalue& json) -> crow::response {
+    auto do_synthesize = [&](const crow::json::rvalue& json, ApiFlavor flavor) -> crow::response {
         bool request_validated = false;
         try {
+            if (json.t() != crow::json::type::Object) return crow::response(400, "JSON request must be an object");
             s2::PipelineParams synth_params = params;
+            if (flavor == ApiFlavor::Fish) {
+                // Match Fish request defaults without changing historical CLI,
+                // legacy HTTP, or OpenAI-compatible defaults.
+                if (!normalize_cli_explicit) synth_params.normalize_text = true;
+                synth_params.reference_memory_cache = false;
+            }
             validate_fish_json_subset(json, true);
+            apply_fish_fields(json, synth_params, false);
 
-            // Fish Audio uses "text"; OpenAI-compatible clients usually use "input".
-            // Treat aliases as one logical field and reject contradictory requests.
+            if (flavor == ApiFlavor::OpenAI) {
+                if (json.has("model")) {
+                    if (json["model"].t() != crow::json::type::String)
+                        throw std::invalid_argument("OpenAI model must be a string");
+                    if (json["model"].s() != "s2-pro-local")
+                        throw std::invalid_argument("Unsupported OpenAI model; this local server exposes only s2-pro-local");
+                }
+                if (json.has("instructions"))
+                    throw std::invalid_argument("OpenAI instructions is not implemented by this local synthesis subset");
+                if (json.has("stream_format"))
+                    throw std::invalid_argument("OpenAI stream_format is not implemented by this local synthesis subset");
+                if (json.has("stream")) {
+                    const bool stream = checked_json_bool(json["stream"], "stream");
+                    if (stream) throw std::invalid_argument("OpenAI stream=true is not supported on buffered HTTP; use /ws/tts");
+                }
+            }
+            if (flavor == ApiFlavor::OpenAI && json.has("speed")) {
+                if (json["speed"].t() != crow::json::type::Number)
+                    throw std::invalid_argument("speed must be a number");
+                const float speed = static_cast<float>(json["speed"].d());
+                if (json.has("prosody") && json["prosody"].t() == crow::json::type::Object && json["prosody"].has("speed")) {
+                    const float nested = static_cast<float>(json["prosody"]["speed"].d());
+                    if (std::fabs(speed - nested) > 1e-6f)
+                        throw std::invalid_argument("conflicting speed and prosody.speed");
+                }
+                synth_params.prosody_speed = speed;
+            }
+
             if (json.has("text") && json.has("input")) {
                 const std::string a = json["text"].s();
                 const std::string b = json["input"].s();
                 if (a != b) throw std::invalid_argument("conflicting text and input");
                 synth_params.text = a;
-            } else if (json.has("text")) {
-                synth_params.text = json["text"].s();
-            } else if (json.has("input")) {
-                synth_params.text = json["input"].s();
-            } else {
-                return crow::response(400, "Missing 'text' or 'input' field");
-            }
+            } else if (json.has("text")) synth_params.text = json["text"].s();
+            else if (json.has("input")) synth_params.text = json["input"].s();
+            else return crow::response(400, "Missing 'text' or 'input' field");
 
-            if (json.has("temperature"))   synth_params.gen.temperature = static_cast<float>(json["temperature"].d());
-            if (json.has("top_p"))         synth_params.gen.top_p = static_cast<float>(json["top_p"].d());
-            if (json.has("top_k"))         synth_params.gen.top_k = checked_json_i32(json["top_k"]);
-            if (json.has("seed"))          synth_params.gen.seed = checked_json_fish_seed(json["seed"]);
+            if (json.has("segment")) synth_params.segment_sentences = checked_json_bool(json["segment"], "segment");
+            if (json.has("temperature")) synth_params.gen.temperature = static_cast<float>(json["temperature"].d());
+            if (json.has("top_p")) synth_params.gen.top_p = static_cast<float>(json["top_p"].d());
+            if (json.has("top_k")) synth_params.gen.top_k = checked_json_i32(json["top_k"]);
+            if (json.has("seed")) synth_params.gen.seed = checked_json_fish_seed(json["seed"]);
             if (json.has("repetition_penalty")) synth_params.gen.repetition_penalty = static_cast<float>(json["repetition_penalty"].d());
             if (json.has("repetition_window")) synth_params.gen.repetition_window = checked_json_i32(json["repetition_window"]);
             if (json.has("multi_turn_history")) synth_params.multi_turn_history = checked_json_i32(json["multi_turn_history"]);
-            if (json.has("threads"))       synth_params.gen.n_threads = checked_json_i32(json["threads"]);
-            // Native s2.cpp uses max_tokens; Fish Speech/Fish Audio uses max_new_tokens.
-            // Accept both, but never silently choose one when a client sends conflicting values.
+            if (json.has("threads")) synth_params.gen.n_threads = checked_json_i32(json["threads"]);
             if (json.has("max_tokens") && json.has("max_new_tokens")) {
                 const int32_t a = checked_json_i32(json["max_tokens"]);
                 const int32_t b = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
                 if (a != b) throw std::invalid_argument("conflicting max_tokens and max_new_tokens");
                 synth_params.gen.max_new_tokens = a;
-            } else if (json.has("max_tokens")) {
-                synth_params.gen.max_new_tokens = checked_json_i32(json["max_tokens"]);
-            } else if (json.has("max_new_tokens")) {
-                synth_params.gen.max_new_tokens = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
-            }
+            } else if (json.has("max_tokens")) synth_params.gen.max_new_tokens = checked_json_i32(json["max_tokens"]);
+            else if (json.has("max_new_tokens")) synth_params.gen.max_new_tokens = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
             if (json.has("max_seg_tokens")) synth_params.max_tokens_per_segment = checked_json_i32(json["max_seg_tokens"]);
-            if (json.has("segment"))       synth_params.segment_sentences = json["segment"].b();
-            if (json.has("codec_chunk"))   synth_params.codec_chunk_frames = checked_json_i32(json["codec_chunk"]);
+            if (json.has("codec_chunk")) synth_params.codec_chunk_frames = checked_json_i32(json["codec_chunk"]);
             if (json.has("codec_overlap")) synth_params.codec_overlap_frames = checked_json_i32(json["codec_overlap"]);
             if (json.has("min_seg_chars")) synth_params.min_seg_chars = checked_json_i32(json["min_seg_chars"]);
             if (json.has("chunk_length")) synth_params.chunk_length = checked_json_i32(json["chunk_length"]);
             if (json.has("min_chunk_length")) synth_params.min_chunk_length = checked_json_i32(json["min_chunk_length"]);
-            if (json.has("condition_on_previous_chunks")) {
-                const auto & v = json["condition_on_previous_chunks"];
-                if (v.t() != crow::json::type::True && v.t() != crow::json::type::False)
-                    throw std::invalid_argument("condition_on_previous_chunks must be a boolean");
-                synth_params.condition_on_previous_chunks = v.b();
-            }
-            if (json.has("latency")) {
-                const std::string latency = json["latency"].s();
-                if (latency != "normal")
-                    throw std::invalid_argument("latency modes balanced/low are not implemented; use normal");
-            }
-            if (json.has("prosody")) {
-                const auto & pr = json["prosody"];
-                if (pr.t() != crow::json::type::Object)
-                    throw std::invalid_argument("prosody must be an object");
-                if (pr.has("speed")) {
-                    if (pr["speed"].t() != crow::json::type::Number)
-                        throw std::invalid_argument("prosody.speed must be a number");
-                    const double speed = pr["speed"].d();
-                    if (!std::isfinite(speed) || speed < 0.5 || speed > 2.0)
-                        throw std::invalid_argument("prosody.speed must be between 0.5 and 2.0");
-                    if (std::abs(speed - 1.0) > 1e-12)
-                        throw std::invalid_argument("prosody.speed other than 1.0 is not implemented without pitch-preserving time stretch");
-                }
-                if (pr.has("volume")) {
-                    if (pr["volume"].t() != crow::json::type::Number)
-                        throw std::invalid_argument("prosody.volume must be a number");
-                    const double volume = pr["volume"].d();
-                    if (!std::isfinite(volume) || volume < -20.0 || volume > 20.0)
-                        throw std::invalid_argument("prosody.volume must be between -20 and 20 dB");
-                    synth_params.prosody_volume_db = static_cast<float>(volume);
-                }
-                if (pr.has("normalize_loudness"))
-                    throw std::invalid_argument("prosody.normalize_loudness is not implemented");
-            }
+            if (json.has("condition_on_previous_chunks"))
+                synth_params.condition_on_previous_chunks = checked_json_bool(json["condition_on_previous_chunks"], "condition_on_previous_chunks");
             if (json.has("min_end_tokens")) synth_params.gen.min_tokens_before_end = checked_json_i32(json["min_end_tokens"]);
-            if (json.has("ras_window"))    synth_params.gen.ras_window_size = checked_json_i32(json["ras_window"]);
-            if (json.has("ras_temp"))      synth_params.gen.ras_high_temp = static_cast<float>(json["ras_temp"].d());
-            if (json.has("ras_top_p"))     synth_params.gen.ras_high_top_p = static_cast<float>(json["ras_top_p"].d());
-            if (json.has("prompt_text"))   synth_params.prompt_text = json["prompt_text"].s();
+            if (json.has("ras_window")) synth_params.gen.ras_window_size = checked_json_i32(json["ras_window"]);
+            if (json.has("ras_temp")) synth_params.gen.ras_high_temp = static_cast<float>(json["ras_temp"].d());
+            if (json.has("ras_top_p")) synth_params.gen.ras_high_top_p = static_cast<float>(json["ras_top_p"].d());
+            if (json.has("prompt_text")) synth_params.prompt_text = json["prompt_text"].s();
             if (json.has("reference_audio")) synth_params.prompt_audio_path = json["reference_audio"].s();
-            // Fish Audio names a saved voice reference_id; s2.cpp historically uses voice.
-            const bool has_reference_id =
-                json.has("reference_id") && json["reference_id"].t() != crow::json::type::Null;
+            const bool has_reference_id = json.has("reference_id") && json["reference_id"].t() != crow::json::type::Null;
             if (json.has("voice") && has_reference_id) {
-                const std::string a = json["voice"].s();
-                const std::string b = json["reference_id"].s();
+                const std::string a = json["voice"].s(), b = json["reference_id"].s();
                 if (a != b) throw std::invalid_argument("conflicting voice and reference_id");
                 synth_params.voice_id = a;
-            } else if (json.has("voice")) {
-                synth_params.voice_id = json["voice"].s();
-            } else if (has_reference_id) {
-                synth_params.voice_id = json["reference_id"].s();
-            }
-            if (json.has("trim_silence"))  synth_params.trim_silence = json["trim_silence"].b();
-            if (json.has("stream_stride")) synth_params.stream_decode_stride_frames = checked_json_i32(json["stream_stride"]);
+            } else if (json.has("voice")) synth_params.voice_id = json["voice"].s();
+            else if (has_reference_id) synth_params.voice_id = json["reference_id"].s();
+            if (json.has("trim_silence")) synth_params.trim_silence = checked_json_bool(json["trim_silence"], "trim_silence");
 
-            std::string validation_error;
-            if (!validate_pipeline_params(synth_params, validation_error, true)) {
-                return crow::response(400, validation_error);
-            }
-
-            // Native clients use "format"; OpenAI-compatible clients use
-            // "response_format". This implementation intentionally supports
-            // only WAV and raw PCM rather than silently returning WAV as MP3/Opus.
+            // HTTP defaults to WAV regardless of the one-shot/file --rf64 CLI flag.
             std::string format = "wav";
             auto normalized_format = [](std::string value) {
                 std::transform(value.begin(), value.end(), value.begin(),
@@ -1333,78 +1873,124 @@ Run the README's complete CLI/API reference for examples and detailed backend no
                 return value;
             };
             if (json.has("format") && json.has("response_format")) {
+                if (json["format"].t() != crow::json::type::String || json["response_format"].t() != crow::json::type::String)
+                    throw std::invalid_argument("format and response_format must be strings");
                 const std::string a = normalized_format(json["format"].s());
                 const std::string b = normalized_format(json["response_format"].s());
                 if (a != b) throw std::invalid_argument("conflicting format and response_format");
                 format = a;
             } else if (json.has("format")) {
+                if (json["format"].t() != crow::json::type::String) throw std::invalid_argument("format must be a string");
                 format = normalized_format(json["format"].s());
             } else if (json.has("response_format")) {
+                if (json["response_format"].t() != crow::json::type::String) throw std::invalid_argument("response_format must be a string");
                 format = normalized_format(json["response_format"].s());
             }
-            if (format != "wav" && format != "pcm") {
-                return crow::response(400, "Unsupported format. Supported formats: wav, pcm");
-            }
+            if (format != "wav" && format != "pcm" && format != "rf64" && format != "mp3" && format != "opus")
+                return crow::response(400, "Unsupported format. Supported formats: wav, pcm, rf64, mp3, opus");
 
-            // From this point onward, exceptions are execution/storage failures,
-            // not malformed client input. Keep that distinction for HTTP status.
+            int mp3_bitrate = 128, opus_bitrate = 32;
+            auto valid_mp3_bitrate = [](int v) { return v == 64 || v == 128 || v == 192; };
+            auto valid_opus_bitrate = [](int v) { return v == -1000 || v == 24 || v == 32 || v == 48 || v == 64; };
+            auto valid_mp3_rate = [](int v) {
+                switch (v) {
+                    case 8000: case 11025: case 12000: case 16000: case 22050: case 24000:
+                    case 32000: case 44100: case 48000: return true;
+                    default: return false;
+                }
+            };
+            if (json.has("mp3_bitrate")) {
+                if (format != "mp3") throw std::invalid_argument("mp3_bitrate is valid only when format=mp3");
+                mp3_bitrate = checked_json_i32(json["mp3_bitrate"]);
+                if (!valid_mp3_bitrate(mp3_bitrate)) throw std::invalid_argument("mp3_bitrate must be 64, 128, or 192 kbps");
+            }
+            if (json.has("opus_bitrate")) {
+                if (format != "opus") throw std::invalid_argument("opus_bitrate is valid only when format=opus");
+                opus_bitrate = checked_json_i32(json["opus_bitrate"]);
+                if (!valid_opus_bitrate(opus_bitrate)) throw std::invalid_argument("opus_bitrate must be -1000 (auto), 24, 32, 48, or 64 kbps");
+            }
+            if (format == "opus") {
+                if (synth_params.output_sample_rate != 0 && synth_params.output_sample_rate != 48000)
+                    throw std::invalid_argument("Opus output uses a 48000 Hz clock; sample_rate must be omitted/0 or 48000");
+                synth_params.output_sample_rate = 48000;
+            } else if (format == "mp3" && synth_params.output_sample_rate != 0 &&
+                       !valid_mp3_rate(synth_params.output_sample_rate)) {
+                throw std::invalid_argument("MP3 sample_rate must be one of 8000,11025,12000,16000,22050,24000,32000,44100,48000");
+            }
+            synth_params.output_rf64 = format == "rf64";
+
+            std::string validation_error;
+            if (!validate_pipeline_params(synth_params, validation_error, true)) return crow::response(400, validation_error);
             request_validated = true;
 
-            // Preserve the HTTP contract: a syntactically valid saved voice id
-            // that does not exist is a client-visible 404. If the file exists but
-            // is corrupt/unreadable, Pipeline::get_ref_codes() fails later and the
-            // request remains a 500. An explicit reference_audio has priority over
-            // voice/reference_id and therefore does not require a saved profile.
             if (!synth_params.voice_id.empty() && synth_params.prompt_audio_path.empty()) {
+                std::lock_guard<std::mutex> storage_lock(voice_storage_mutex);
                 s2::VoiceProfileManager mgr;
                 mgr.set_storage_dir(synth_params.voice_storage_dir);
-                if (!mgr.exists(synth_params.voice_id)) {
-                    return crow::response(404, "Voice not found: " + synth_params.voice_id);
-                }
+                if (!mgr.exists(synth_params.voice_id)) return crow::response(404, "Voice not found: " + synth_params.voice_id);
             }
 
-            // The Pipeline/model/codec/KV cache are shared and mutable. Parse and
-            // validate before taking the lock so malformed requests do not block TTS.
+            int32_t effective_rate = 0;
             std::string wav_path;
             {
-                std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex);
-                if (!pipeline.synthesize_to_file(synth_params, wav_path)) {
+                auto lease = pipeline_pool.acquire();
+                effective_rate = lease->output_sample_rate(synth_params);
+                if (format == "mp3" && !valid_mp3_rate(effective_rate))
+                    return crow::response(400, "Effective MP3 sample rate is not representable by MPEG Layer III");
+                if (!lease->synthesize_to_file(synth_params, wav_path))
                     return crow::response(500, "Synthesis failed (check requested voice/reference and server log)");
-                }
-            }
-
+            } // Release scarce model/codec worker before file parsing or FFmpeg.
             ScopedTempPath temp_wav{wav_path};
+
             crow::response res;
             std::string payload;
-            if (!read_generated_wav(wav_path, format == "pcm", payload)) {
-                return crow::response(500, "Generated WAV file is truncated or invalid");
-            }
-            if (format == "pcm") {
-                res.set_header("Content-Type", "audio/pcm");
-                res.set_header("X-Sample-Rate", std::to_string(pipeline.sample_rate()));
+            if (format == "mp3" || format == "opus") {
+                std::string encode_error;
+                const int bitrate = format == "mp3" ? mp3_bitrate : opus_bitrate;
+                if (!encode_with_ffmpeg(ffmpeg_bin, wav_path, format, bitrate, effective_rate, payload, encode_error))
+                    return crow::response(500, encode_error + ". Configure --ffmpeg or S2_FFMPEG if needed.");
+                if (format == "mp3") {
+                    res.set_header("Content-Type", "audio/mpeg");
+                    res.set_header("Content-Disposition", "attachment; filename=\"audio.mp3\"");
+                } else {
+                    res.set_header("Content-Type", "audio/ogg; codecs=opus");
+                    res.set_header("Content-Disposition", "attachment; filename=\"audio.opus\"");
+                }
             } else {
-                res.set_header("Content-Type", "audio/wav");
-                res.set_header("Content-Disposition", "attachment; filename=\"audio.wav\"");
-                res.set_header("Content-Length", std::to_string(payload.size()));
+                uint32_t parsed_rate = 0;
+                bool parsed_rf64 = false;
+                if (!read_generated_wave(wav_path, format == "pcm", payload, parsed_rate, parsed_rf64))
+                    return crow::response(500, "Generated WAV/RF64 file is truncated or invalid");
+                if (parsed_rate != static_cast<uint32_t>(effective_rate))
+                    return crow::response(500, "Generated audio sample rate does not match the request");
+                if (format == "rf64" && !parsed_rf64) return crow::response(500, "RF64 request produced RIFF output");
+                if (format != "rf64" && parsed_rf64) return crow::response(500, "RIFF/PCM request unexpectedly produced RF64 output");
+                if (format == "pcm") {
+                    res.set_header("Content-Type", "audio/pcm");
+                    res.set_header("X-Sample-Rate", std::to_string(parsed_rate));
+                } else {
+                    res.set_header("Content-Type", "audio/wav");
+                    res.set_header("X-Wave-Container", parsed_rf64 ? "RF64" : "RIFF");
+                    res.set_header("Content-Disposition", parsed_rf64 ? "attachment; filename=\"audio.rf64\"" : "attachment; filename=\"audio.wav\"");
+                }
             }
+            res.set_header("Content-Length", std::to_string(payload.size()));
             res.body = std::move(payload);
             return res;
         } catch (const std::bad_alloc &) {
             return crow::response(500, "Server ran out of memory while preparing the response");
         } catch (const std::exception & e) {
             const int status = request_validated ? 500 : 400;
-            const char * prefix = request_validated ? "Synthesis failed: " : "Invalid request: ";
-            return crow::response(status, std::string(prefix) + e.what());
+            return crow::response(status, std::string(request_validated ? "Synthesis failed: " : "Invalid request: ") + e.what());
         } catch (...) {
-            return crow::response(request_validated ? 500 : 400,
-                                  request_validated ? "Synthesis failed" : "Invalid request");
+            return crow::response(request_validated ? 500 : 400, request_validated ? "Synthesis failed" : "Invalid request");
         }
     };
 
     // Strict JSON normalization may throw before Crow sees the body (for example,
     // malformed UTF-16 surrogate escapes). Convert all client parse/type failures
     // into 4xx here instead of letting them escape the route callback.
-    auto handle_synthesis_request = [&](const crow::request & req) -> crow::response {
+    auto handle_synthesis_request = [&](const crow::request & req, ApiFlavor flavor) -> crow::response {
         if (req.body.size() > MAX_JSON_REQUEST_BYTES) {
             return crow::response(413, "JSON request body too large");
         }
@@ -1413,7 +1999,7 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             if (!json) {
                 return crow::response(400, "Invalid JSON");
             }
-            return do_synthesize(json);
+            return do_synthesize(json, flavor);
         } catch (const std::bad_alloc &) {
             return crow::response(500, "Server ran out of memory while parsing the request");
         } catch (const std::exception & e) {
@@ -1429,7 +2015,151 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     CROW_ROUTE(app, "/v1/tts")
     .methods("POST"_method)
     ([&](const crow::request& req) {
-        return handle_synthesis_request(req);
+        return handle_synthesis_request(req, ApiFlavor::Fish);
+    });
+
+    CROW_ROUTE(app, "/v1/tts/batch")
+    .methods("POST"_method)
+    ([&](const crow::request & req) -> crow::response {
+        if (req.body.size() > MAX_JSON_REQUEST_BYTES) return crow::response(413, "JSON request body too large");
+        try {
+            auto root = load_json_strict(req.body);
+            if (!root || root.t() != crow::json::type::Object || !root.has("requests") ||
+                root["requests"].t() != crow::json::type::List)
+                return crow::response(400, "Batch body must be an object with a requests array");
+            const auto & requests = root["requests"];
+            if (requests.size() < 1 || requests.size() > 32)
+                return crow::response(400, "Batch requests must contain 1..32 items");
+            for (size_t i = 0; i < requests.size(); ++i)
+                if (requests[i].t() != crow::json::type::Object)
+                    return crow::response(400, "Each batch item must be a JSON object");
+
+            const size_t count = requests.size();
+            std::vector<crow::json::rvalue> items;
+            std::vector<std::string> formats;
+            items.reserve(count); formats.reserve(count);
+            uint64_t requested_token_budget = 0;
+            for (size_t i = 0; i < count; ++i) {
+                items.emplace_back(requests[i]); // deep copy before worker threads
+
+                // Batch is buffered and returns every item in one JSON document. Bound the
+                // nominal generation budget before starting any worker so a tiny request body
+                // cannot fan out into dozens of maximum-length generations at once. The
+                // default 32 * 1024-token batch still fits exactly.
+                int32_t item_max_tokens = params.gen.max_new_tokens;
+                if (items.back().has("max_tokens") && items.back().has("max_new_tokens")) {
+                    const int32_t a = checked_json_i32(items.back()["max_tokens"]);
+                    const int32_t b = checked_json_fish_max_new_tokens(items.back()["max_new_tokens"]);
+                    if (a != b) throw std::invalid_argument("conflicting max_tokens and max_new_tokens in batch item");
+                    item_max_tokens = a;
+                } else if (items.back().has("max_tokens")) {
+                    item_max_tokens = checked_json_i32(items.back()["max_tokens"]);
+                } else if (items.back().has("max_new_tokens")) {
+                    item_max_tokens = checked_json_fish_max_new_tokens(items.back()["max_new_tokens"]);
+                }
+                if (item_max_tokens < 1 || item_max_tokens > 32768)
+                    throw std::invalid_argument("batch item max_tokens/max_new_tokens must resolve to 1..32768");
+                const uint64_t item_budget = static_cast<uint64_t>(item_max_tokens);
+                if (requested_token_budget > MAX_BATCH_REQUESTED_TOKENS - item_budget)
+                    return crow::response(413, "Batch aggregate generation budget exceeds 32768 requested tokens");
+                requested_token_budget += item_budget;
+
+                // Each buffered Fish item defaults to WAV; --rf64 is a file/one-shot default only.
+                std::string format = "wav";
+                if (items.back().has("format") && items.back()["format"].t() == crow::json::type::String) format = items.back()["format"].s();
+                else if (items.back().has("response_format") && items.back()["response_format"].t() == crow::json::type::String) format = items.back()["response_format"].s();
+                std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                formats.push_back(std::move(format));
+            }
+
+            std::vector<std::unique_ptr<crow::response>> responses(count);
+            std::atomic<size_t> next_job{0};
+            std::atomic<size_t> batch_base64_bytes{0};
+            const size_t task_count = std::min(count, pipeline_pool.capacity());
+            std::vector<std::future<void>> tasks;
+            tasks.reserve(task_count);
+            for (size_t t = 0; t < task_count; ++t) {
+                tasks.emplace_back(std::async(std::launch::async, [&] {
+                    for (;;) {
+                        const size_t i = next_job.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= count) return;
+                        auto response = std::make_unique<crow::response>(do_synthesize(items[i], ApiFlavor::Fish));
+                        if (response->code >= 200 && response->code < 300) {
+                            size_t encoded_bytes = 0;
+                            bool reserved = base64_encoded_size(response->body.size(), encoded_bytes) &&
+                                            encoded_bytes <= MAX_BATCH_BASE64_BYTES;
+                            size_t observed = batch_base64_bytes.load(std::memory_order_relaxed);
+                            while (reserved) {
+                                if (observed > MAX_BATCH_BASE64_BYTES - encoded_bytes) { reserved = false; break; }
+                                if (batch_base64_bytes.compare_exchange_weak(observed, observed + encoded_bytes,
+                                                                            std::memory_order_relaxed,
+                                                                            std::memory_order_relaxed)) break;
+                            }
+                            if (!reserved) {
+                                response = std::make_unique<crow::response>(413,
+                                    "Batch aggregate base64 audio payload exceeds 128 MiB");
+                            }
+                        }
+                        responses[i] = std::move(response);
+                    }
+                }));
+            }
+            for (auto & task : tasks) task.get();
+
+            crow::json::wvalue out;
+            out["object"] = "tts.batch";
+            out["count"] = static_cast<int64_t>(requests.size());
+            std::vector<crow::json::wvalue> rows;
+            rows.reserve(count);
+            for (size_t i = 0; i < count; ++i) {
+                crow::json::wvalue row;
+                if (!responses[i]) {
+                    row["status"] = 500;
+                    row["error"] = "batch worker produced no response";
+                    rows.emplace_back(std::move(row));
+                    continue;
+                }
+                crow::response & item = *responses[i];
+                row["status"] = item.code;
+                if (item.code >= 200 && item.code < 300) {
+                    row["format"] = formats[i];
+                    int32_t item_sample_rate = params.output_sample_rate > 0
+                        ? params.output_sample_rate : pipeline.sample_rate();
+                    if (items[i].has("sample_rate")) {
+                        const int32_t requested_rate = checked_json_i32(items[i]["sample_rate"]);
+                        if (requested_rate > 0) item_sample_rate = requested_rate;
+                    }
+                    if (formats[i] == "opus") item_sample_rate = 48000;
+                    row["sample_rate"] = item_sample_rate;
+                    size_t expected_base64_bytes = 0;
+                    const bool size_ok = base64_encoded_size(item.body.size(), expected_base64_bytes);
+                    std::string encoded = size_ok
+                        ? s2::base64_encode(reinterpret_cast<const unsigned char *>(item.body.data()), item.body.size())
+                        : std::string();
+                    if (!size_ok || encoded.size() != expected_base64_bytes) {
+                        row["status"] = 500;
+                        row["error"] = "audio response could not be base64-encoded safely";
+                    } else {
+                        row["audio_base64"] = std::move(encoded);
+                    }
+                    // The JSON row now owns the encoded representation; release the raw
+                    // binary response immediately instead of holding both copies until the
+                    // complete batch object is serialized.
+                    std::string().swap(item.body);
+                } else {
+                    row["error"] = item.body;
+                }
+                rows.emplace_back(std::move(row));
+            }
+            out["results"] = std::move(rows);
+            return crow::response(200, out);
+        } catch (const std::bad_alloc &) {
+            return crow::response(500, "Server ran out of memory while processing batch");
+        } catch (const std::system_error & e) {
+            return crow::response(500, std::string("Batch worker startup/runtime failure: ") + e.what());
+        } catch (const std::exception & e) {
+            return crow::response(400, std::string("Invalid batch request: ") + e.what());
+        }
     });
 
     // ================================================================
@@ -1438,7 +2168,7 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     CROW_ROUTE(app, "/synthesize")
     .methods("POST"_method)
     ([&](const crow::request& req) {
-        return handle_synthesis_request(req);
+        return handle_synthesis_request(req, ApiFlavor::Legacy);
     });
 
     // ================================================================
@@ -1447,7 +2177,7 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     CROW_ROUTE(app, "/v1/audio/speech")
     .methods("POST"_method)
     ([&](const crow::request& req) {
-        return handle_synthesis_request(req);
+        return handle_synthesis_request(req, ApiFlavor::OpenAI);
     });
 
     // ================================================================
@@ -1475,7 +2205,7 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     .methods("GET"_method)
     ([&]() {
         try {
-            std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex);
+            std::lock_guard<std::mutex> storage_lock(voice_storage_mutex);
             s2::VoiceProfileManager mgr;
             mgr.set_storage_dir(params.voice_storage_dir);
             std::vector<std::string> ids = mgr.list();
@@ -1527,27 +2257,33 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             }
             request_validated = true;
 
-            std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex);
             std::vector<int32_t> codes;
             int32_t T_prompt = 0;
-            if (!pipeline.encode_reference(vp, codes, T_prompt) || codes.empty() || T_prompt <= 0) {
-                return crow::response(400, "Failed to load/encode reference audio");
+            int32_t num_codebooks = 0, codebook_size = 0, sample_rate = 0;
+            {
+                auto lease = pipeline_pool.acquire();
+                if (!lease->encode_reference(vp, codes, T_prompt) || codes.empty() || T_prompt <= 0) {
+                    return crow::response(400, "Failed to load/encode reference audio");
+                }
+                num_codebooks = lease->num_codebooks();
+                codebook_size = lease->codebook_size();
+                sample_rate = lease->sample_rate();
             }
-            if (codes.size() != static_cast<size_t>(pipeline.num_codebooks()) * static_cast<size_t>(T_prompt)) {
+            if (codes.size() != static_cast<size_t>(num_codebooks) * static_cast<size_t>(T_prompt))
                 return crow::response(500, "Encoded voice has inconsistent dimensions");
-            }
 
-            s2::VoiceProfileManager mgr;
-            mgr.set_storage_dir(params.voice_storage_dir);
             s2::VoiceProfile profile;
             profile.transcript = vp.prompt_text;
             profile.codes = std::move(codes);
             profile.T_prompt = T_prompt;
-            profile.num_codebooks = pipeline.num_codebooks();
-            profile.codebook_size = pipeline.codebook_size();
-            profile.sample_rate = pipeline.sample_rate();
-            if (!mgr.save(voice_id, profile)) {
-                return crow::response(500, "Failed to save voice profile");
+            profile.num_codebooks = num_codebooks;
+            profile.codebook_size = codebook_size;
+            profile.sample_rate = sample_rate;
+            {
+                std::lock_guard<std::mutex> storage_lock(voice_storage_mutex);
+                s2::VoiceProfileManager mgr;
+                mgr.set_storage_dir(params.voice_storage_dir);
+                if (!mgr.save(voice_id, profile)) return crow::response(500, "Failed to save voice profile");
             }
 
             crow::json::wvalue resp;
@@ -1582,7 +2318,7 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     .methods("GET"_method)
     ([&](const std::string & voice_id) {
         try {
-            std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex);
+            std::lock_guard<std::mutex> storage_lock(voice_storage_mutex);
             s2::VoiceProfileManager mgr;
             mgr.set_storage_dir(params.voice_storage_dir);
             if (!mgr.exists(voice_id)) {
@@ -1614,7 +2350,7 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     .methods("DELETE"_method)
     ([&](const std::string & voice_id) {
         try {
-            std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex);
+            std::lock_guard<std::mutex> storage_lock(voice_storage_mutex);
             s2::VoiceProfileManager mgr;
             mgr.set_storage_dir(params.voice_storage_dir);
             if (!mgr.remove(voice_id)) {
@@ -1657,14 +2393,15 @@ Run the README's complete CLI/API reference for examples and detailed backend no
         info["host"] = bind_host;
         info["port"] = port;
         info["endpoints"][0] = "/v1/tts";
-        info["endpoints"][1] = "/synthesize";
-        info["endpoints"][2] = "/v1/audio/speech";
-        info["endpoints"][3] = "/v1/models";
-        info["endpoints"][4] = "/v1/voices";
-        info["endpoints"][5] = "/health";
-        info["endpoints"][6] = "/v1/health";
-        info["endpoints"][7] = "/v1/voices/<id>";
-        info["endpoints"][8] = "/ws/tts";
+        info["endpoints"][1] = "/v1/tts/batch";
+        info["endpoints"][2] = "/synthesize";
+        info["endpoints"][3] = "/v1/audio/speech";
+        info["endpoints"][4] = "/v1/models";
+        info["endpoints"][5] = "/v1/voices";
+        info["endpoints"][6] = "/health";
+        info["endpoints"][7] = "/v1/health";
+        info["endpoints"][8] = "/v1/voices/<id>";
+        info["endpoints"][9] = "/ws/tts";
         return crow::response(200, info);
     });
 
@@ -1689,52 +2426,45 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // Con stride activo, el cliente puede empezar a reproducir PCM antes de
     // que termine la oracion actual; con stride desactivado se envia por segmento.
     // ================================================================
-    CROW_WEBSOCKET_ROUTE(app, "/ws/tts")
-    .onopen([&](crow::websocket::connection& conn) {
-        auto alive = std::make_shared<std::atomic_bool>(true);
-        {
-            std::lock_guard<std::mutex> lock(ws_state_mutex);
-            ws_alive[&conn] = std::move(alive);
-        }
-        std::cout << "[WS] Client connected: " << conn.get_remote_ip() << "\n";
-    })
-    .onclose([&](crow::websocket::connection& conn, const std::string& reason, uint16_t) {
-        mark_ws_closed(conn);
-        std::cout << "[WS] Client disconnected: " << reason << "\n";
-    })
-    .onmessage([&](crow::websocket::connection& conn,
-                   const std::string& data,
-                   bool is_binary) {
-        std::shared_ptr<std::atomic_bool> alive;
-        {
-            std::lock_guard<std::mutex> lock(ws_state_mutex);
-            auto it = ws_alive.find(&conn);
-            if (it != ws_alive.end()) alive = it->second;
-        }
-        if (!alive) return;
+    auto ws_send_text = [](crow::websocket::connection * conn,
+                           const std::shared_ptr<WsConnectionState> & state,
+                           const std::string & msg) -> bool {
+        if (!conn || !state) return false;
+        std::lock_guard<std::mutex> lock(state->send_mutex);
+        if (!state->alive.load(std::memory_order_relaxed)) return false;
+        try { conn->send_text(msg); return true; } catch (...) { return false; }
+    };
+    auto ws_send_binary = [](crow::websocket::connection * conn,
+                             const std::shared_ptr<WsConnectionState> & state,
+                             const std::string & msg) -> bool {
+        if (!conn || !state) return false;
+        std::lock_guard<std::mutex> lock(state->send_mutex);
+        if (!state->alive.load(std::memory_order_relaxed)) return false;
+        try { conn->send_binary(msg); return true; } catch (...) { return false; }
+    };
 
-        auto safe_send_text = [&](const std::string & msg) -> bool {
-            if (!alive->load(std::memory_order_relaxed)) return false;
-            try { conn.send_text(msg); return true; } catch (...) { return false; }
-        };
-        if (is_binary) {
-            safe_send_text("{\"error\": \"expected JSON text message\"}");
-            return;
-        }
-        if (data.size() > MAX_JSON_REQUEST_BYTES) {
-            safe_send_text("{\"error\": \"JSON request body too large\"}");
-            return;
-        }
+    auto process_ws_message = [&](crow::websocket::connection * conn,
+                                  const std::shared_ptr<WsConnectionState> & state,
+                                  std::string data) {
+        struct BusyReset {
+            std::shared_ptr<WsConnectionState> state;
+            ~BusyReset() { if (state) state->busy.store(false, std::memory_order_release); }
+        } busy_reset{state};
+        if (!state || !state->alive.load(std::memory_order_relaxed)) return;
 
         try {
             auto json = load_json_strict(data);
             if (!json || (!json.has("text") && !json.has("input"))) {
-                safe_send_text("{\"error\": \"missing 'text' or 'input' field\"}");
+                ws_send_text(conn, state, "{\"error\": \"missing 'text' or 'input' field\"}");
                 return;
             }
 
             s2::PipelineParams ws_params = params;
+            // Fish defaults are route-local; do not mutate CLI/legacy defaults.
+            if (!normalize_cli_explicit) ws_params.normalize_text = true;
+            ws_params.reference_memory_cache = false;
             validate_fish_json_subset(json, false);
+            apply_fish_fields(json, ws_params, true);
             if (json.has("text") && json.has("input")) {
                 const std::string a = json["text"].s();
                 const std::string b = json["input"].s();
@@ -1745,15 +2475,15 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             } else {
                 ws_params.text = json["input"].s();
             }
-            if (json.has("segment"))          ws_params.segment_sentences = json["segment"].b();
-            if (json.has("temperature"))      ws_params.gen.temperature = static_cast<float>(json["temperature"].d());
-            if (json.has("top_p"))            ws_params.gen.top_p = static_cast<float>(json["top_p"].d());
-            if (json.has("top_k"))            ws_params.gen.top_k = checked_json_i32(json["top_k"]);
-            if (json.has("seed"))             ws_params.gen.seed = checked_json_fish_seed(json["seed"]);
+            if (json.has("segment")) ws_params.segment_sentences = checked_json_bool(json["segment"], "segment");
+            if (json.has("temperature")) ws_params.gen.temperature = static_cast<float>(json["temperature"].d());
+            if (json.has("top_p")) ws_params.gen.top_p = static_cast<float>(json["top_p"].d());
+            if (json.has("top_k")) ws_params.gen.top_k = checked_json_i32(json["top_k"]);
+            if (json.has("seed")) ws_params.gen.seed = checked_json_fish_seed(json["seed"]);
             if (json.has("repetition_penalty")) ws_params.gen.repetition_penalty = static_cast<float>(json["repetition_penalty"].d());
             if (json.has("repetition_window")) ws_params.gen.repetition_window = checked_json_i32(json["repetition_window"]);
             if (json.has("multi_turn_history")) ws_params.multi_turn_history = checked_json_i32(json["multi_turn_history"]);
-            if (json.has("threads"))          ws_params.gen.n_threads = checked_json_i32(json["threads"]);
+            if (json.has("threads")) ws_params.gen.n_threads = checked_json_i32(json["threads"]);
             if (json.has("max_tokens") && json.has("max_new_tokens")) {
                 const int32_t a = checked_json_i32(json["max_tokens"]);
                 const int32_t b = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
@@ -1764,48 +2494,21 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             } else if (json.has("max_new_tokens")) {
                 ws_params.gen.max_new_tokens = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
             }
-            if (json.has("max_seg_tokens"))   ws_params.max_tokens_per_segment = checked_json_i32(json["max_seg_tokens"]);
-            if (json.has("reference_audio"))  ws_params.prompt_audio_path = json["reference_audio"].s();
-            if (json.has("codec_chunk"))      ws_params.codec_chunk_frames = checked_json_i32(json["codec_chunk"]);
-            if (json.has("codec_overlap"))    ws_params.codec_overlap_frames = checked_json_i32(json["codec_overlap"]);
-            if (json.has("min_seg_chars"))    ws_params.min_seg_chars = checked_json_i32(json["min_seg_chars"]);
+            if (json.has("max_seg_tokens")) ws_params.max_tokens_per_segment = checked_json_i32(json["max_seg_tokens"]);
+            if (json.has("reference_audio")) ws_params.prompt_audio_path = json["reference_audio"].s();
+            if (json.has("codec_chunk")) ws_params.codec_chunk_frames = checked_json_i32(json["codec_chunk"]);
+            if (json.has("codec_overlap")) ws_params.codec_overlap_frames = checked_json_i32(json["codec_overlap"]);
+            if (json.has("min_seg_chars")) ws_params.min_seg_chars = checked_json_i32(json["min_seg_chars"]);
             if (json.has("chunk_length")) ws_params.chunk_length = checked_json_i32(json["chunk_length"]);
             if (json.has("min_chunk_length")) ws_params.min_chunk_length = checked_json_i32(json["min_chunk_length"]);
-            if (json.has("condition_on_previous_chunks")) {
-                const auto & v = json["condition_on_previous_chunks"];
-                if (v.t() != crow::json::type::True && v.t() != crow::json::type::False)
-                    throw std::invalid_argument("condition_on_previous_chunks must be a boolean");
-                ws_params.condition_on_previous_chunks = v.b();
-            }
-            if (json.has("latency")) {
-                const std::string latency = json["latency"].s();
-                if (latency != "normal")
-                    throw std::invalid_argument("latency modes balanced/low are not implemented; use normal");
-            }
-            if (json.has("prosody")) {
-                const auto & pr = json["prosody"];
-                if (pr.t() != crow::json::type::Object) throw std::invalid_argument("prosody must be an object");
-                if (pr.has("speed")) {
-                    if (pr["speed"].t() != crow::json::type::Number) throw std::invalid_argument("prosody.speed must be a number");
-                    const double speed = pr["speed"].d();
-                    if (!std::isfinite(speed) || speed < 0.5 || speed > 2.0) throw std::invalid_argument("prosody.speed must be between 0.5 and 2.0");
-                    if (std::abs(speed - 1.0) > 1e-12) throw std::invalid_argument("prosody.speed other than 1.0 is not implemented without pitch-preserving time stretch");
-                }
-                if (pr.has("volume")) {
-                    if (pr["volume"].t() != crow::json::type::Number) throw std::invalid_argument("prosody.volume must be a number");
-                    const double volume = pr["volume"].d();
-                    if (!std::isfinite(volume) || volume < -20.0 || volume > 20.0) throw std::invalid_argument("prosody.volume must be between -20 and 20 dB");
-                    ws_params.prosody_volume_db = static_cast<float>(volume);
-                }
-                if (pr.has("normalize_loudness")) throw std::invalid_argument("prosody.normalize_loudness is not implemented");
-            }
-            if (json.has("min_end_tokens"))   ws_params.gen.min_tokens_before_end = checked_json_i32(json["min_end_tokens"]);
-            if (json.has("ras_window"))       ws_params.gen.ras_window_size = checked_json_i32(json["ras_window"]);
-            if (json.has("ras_temp"))         ws_params.gen.ras_high_temp = static_cast<float>(json["ras_temp"].d());
-            if (json.has("ras_top_p"))        ws_params.gen.ras_high_top_p = static_cast<float>(json["ras_top_p"].d());
-            if (json.has("prompt_text"))      ws_params.prompt_text = json["prompt_text"].s();
-            const bool has_reference_id =
-                json.has("reference_id") && json["reference_id"].t() != crow::json::type::Null;
+            if (json.has("condition_on_previous_chunks"))
+                ws_params.condition_on_previous_chunks = checked_json_bool(json["condition_on_previous_chunks"], "condition_on_previous_chunks");
+            if (json.has("min_end_tokens")) ws_params.gen.min_tokens_before_end = checked_json_i32(json["min_end_tokens"]);
+            if (json.has("ras_window")) ws_params.gen.ras_window_size = checked_json_i32(json["ras_window"]);
+            if (json.has("ras_temp")) ws_params.gen.ras_high_temp = static_cast<float>(json["ras_temp"].d());
+            if (json.has("ras_top_p")) ws_params.gen.ras_high_top_p = static_cast<float>(json["ras_top_p"].d());
+            if (json.has("prompt_text")) ws_params.prompt_text = json["prompt_text"].s();
+            const bool has_reference_id = json.has("reference_id") && json["reference_id"].t() != crow::json::type::Null;
             if (json.has("voice") && has_reference_id) {
                 const std::string a = json["voice"].s();
                 const std::string b = json["reference_id"].s();
@@ -1816,62 +2519,138 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             } else if (has_reference_id) {
                 ws_params.voice_id = json["reference_id"].s();
             }
-            if (json.has("trim_silence"))     ws_params.trim_silence = json["trim_silence"].b();
-            if (json.has("stream_stride"))    ws_params.stream_decode_stride_frames = checked_json_i32(json["stream_stride"]);
+            if (json.has("trim_silence")) ws_params.trim_silence = checked_json_bool(json["trim_silence"], "trim_silence");
+            if (json.has("stream_stride")) ws_params.stream_decode_stride_frames = checked_json_i32(json["stream_stride"]);
+
+            // Do not silently downgrade an explicit low-latency request to the
+            // segment-buffered path. Speed/loudness/non-native resampling need
+            // the complete segment today; a stateful incremental postprocessor
+            // would be required to preserve an explicit frame cadence exactly.
+            bool explicit_tight_latency = false;
+            if (json.has("latency")) {
+                std::string latency = json["latency"].s();
+                std::transform(latency.begin(), latency.end(), latency.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                explicit_tight_latency = latency == "balanced" || latency == "low";
+            }
+            const bool explicit_frame_cadence = json.has("stream_stride") &&
+                                                ws_params.stream_decode_stride_frames >= 0;
+            const bool needs_segment_postprocess =
+                std::fabs(ws_params.prosody_speed - 1.0f) > 1e-6f ||
+                ws_params.normalize_loudness ||
+                (ws_params.output_sample_rate > 0 && ws_params.output_sample_rate != pipeline.sample_rate());
+            if (needs_segment_postprocess && (explicit_tight_latency || explicit_frame_cadence)) {
+                throw std::invalid_argument(
+                    "latency=balanced/low or stream_stride>=0 cannot be combined with prosody.speed != 1, "
+                    "prosody.normalize_loudness=true, or a non-native sample_rate; these require whole-segment postprocessing");
+            }
 
             std::string validation_error;
             if (!validate_pipeline_params(ws_params, validation_error, true)) {
                 crow::json::wvalue err;
                 err["error"] = validation_error;
-                safe_send_text(err.dump());
+                ws_send_text(conn, state, err.dump());
                 return;
             }
 
             int32_t segment_count = 0;
-            s2::StreamCallback cb = [&](const int16_t* pcm, size_t n_samples, bool is_last) -> bool {
-                try {
-                    if (!alive->load(std::memory_order_relaxed)) return false;
-                    if ((n_samples > 0 && pcm == nullptr) ||
-                        n_samples > (std::numeric_limits<size_t>::max() - 2u) / 2u) return false;
-                    uint16_t flags = is_last ? 1u : 0u;
-                    std::string msg(2 + n_samples * 2, '\0');
-                    msg[0] = static_cast<char>(flags & 0xFF);
-                    msg[1] = static_cast<char>((flags >> 8) & 0xFF);
-                    if (n_samples > 0) std::memcpy(msg.data() + 2, pcm, n_samples * 2);
-                    conn.send_binary(msg);
-                    return true;
-                } catch (...) {
-                    return false;
-                }
+            s2::StreamCallback cb = [&](const int16_t * pcm, size_t n_samples, bool is_last) -> bool {
+                if (!state->alive.load(std::memory_order_relaxed)) return false;
+                if ((n_samples > 0 && pcm == nullptr) ||
+                    n_samples > (std::numeric_limits<size_t>::max() - 2u) / 2u) return false;
+                const uint16_t flags = is_last ? 1u : 0u;
+                std::string msg(2u + n_samples * 2u, '\0');
+                msg[0] = static_cast<char>(flags & 0xffu);
+                msg[1] = static_cast<char>((flags >> 8) & 0xffu);
+                if (n_samples > 0) std::memcpy(msg.data() + 2, pcm, n_samples * 2u);
+                return ws_send_binary(conn, state, msg);
             };
 
             bool ok = false;
+            int32_t stream_sample_rate = 0;
             {
-                std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex);
-                s2::CancelCallback should_continue = [alive]() -> bool {
-                    return alive->load(std::memory_order_relaxed);
+                auto lease = pipeline_pool.acquire(&state->alive);
+                if (!lease) return; // disconnected while waiting for a model worker
+                stream_sample_rate = lease->output_sample_rate(ws_params);
+                s2::CancelCallback should_continue = [state]() -> bool {
+                    return state->alive.load(std::memory_order_relaxed);
                 };
-                ok = pipeline.synthesize_streaming(ws_params, cb, &segment_count, should_continue);
+                ok = lease->synthesize_streaming(ws_params, cb, &segment_count, should_continue);
             }
+            if (!state->alive.load(std::memory_order_relaxed)) return;
 
             crow::json::wvalue done_msg;
             if (ok) {
                 done_msg["done"] = true;
                 done_msg["segments"] = segment_count;
-                done_msg["sample_rate"] = pipeline.sample_rate();
+                done_msg["sample_rate"] = stream_sample_rate;
             } else {
                 done_msg["error"] = "synthesis failed (check requested voice/reference and server log)";
                 done_msg["segments"] = segment_count;
             }
-            safe_send_text(done_msg.dump());
+            ws_send_text(conn, state, done_msg.dump());
         } catch (const std::bad_alloc &) {
-            safe_send_text("{\"error\": \"server ran out of memory\"}");
+            ws_send_text(conn, state, "{\"error\": \"server ran out of memory\"}");
         } catch (const std::exception & e) {
             crow::json::wvalue err;
             err["error"] = std::string("invalid request: ") + e.what();
-            safe_send_text(err.dump());
+            ws_send_text(conn, state, err.dump());
         } catch (...) {
-            safe_send_text("{\"error\": \"invalid request\"}");
+            ws_send_text(conn, state, "{\"error\": \"invalid request\"}");
+        }
+    };
+
+    CROW_WEBSOCKET_ROUTE(app, "/ws/tts")
+    .onopen([&](crow::websocket::connection& conn) {
+        auto state = std::make_shared<WsConnectionState>();
+        {
+            std::lock_guard<std::mutex> lock(ws_state_mutex);
+            ws_states[&conn] = std::move(state);
+        }
+        std::cout << "[WS] Client connected: " << conn.get_remote_ip() << "\n";
+    })
+    .onclose([&](crow::websocket::connection& conn, const std::string& reason, uint16_t) {
+        mark_ws_closed(conn);
+        std::cout << "[WS] Client disconnected: " << reason << "\n";
+    })
+    .onmessage([&](crow::websocket::connection& conn,
+                   const std::string& data,
+                   bool is_binary) {
+        std::shared_ptr<WsConnectionState> state;
+        {
+            std::lock_guard<std::mutex> lock(ws_state_mutex);
+            auto it = ws_states.find(&conn);
+            if (it != ws_states.end()) state = it->second;
+        }
+        if (!state || !state->alive.load(std::memory_order_relaxed)) return;
+        if (is_binary) {
+            ws_send_text(&conn, state, "{\"error\": \"expected JSON text message\"}");
+            return;
+        }
+        if (data.size() > MAX_JSON_REQUEST_BYTES) {
+            ws_send_text(&conn, state, "{\"error\": \"JSON request body too large\"}");
+            return;
+        }
+        bool expected = false;
+        if (!state->busy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            ws_send_text(&conn, state, "{\"error\": \"a synthesis is already active on this WebSocket connection\"}");
+            return;
+        }
+
+        std::string owned_data;
+        try { owned_data = data; }
+        catch (...) {
+            state->busy.store(false, std::memory_order_release);
+            ws_send_text(&conn, state, "{\"error\": \"server could not queue request\"}");
+            return;
+        }
+        crow::websocket::connection * conn_ptr = &conn;
+        const bool queued = ws_tasks->submit([&, conn_ptr, state, owned_data = std::move(owned_data)]() mutable {
+            process_ws_message(conn_ptr, state, std::move(owned_data));
+        });
+        if (!queued) {
+            state->busy.store(false, std::memory_order_release);
+            ws_send_text(&conn, state, "{\"error\": \"WebSocket synthesis queue is full\"}");
         }
     })
     .onerror([&](crow::websocket::connection& conn, const std::string& error_message) {
@@ -1881,6 +2660,7 @@ Run the README's complete CLI/API reference for examples and detailed backend no
 
     std::cout << "\nEndpoints:\n"
               << "  POST /v1/tts           (Fish Audio compatible)\n"
+              << "  POST /v1/tts/batch     (batch synthesis; up to 32 items)\n"
               << "  POST /synthesize       (legacy)\n"
               << "  POST /v1/audio/speech  (OpenAI compatible)\n"
               << "  GET  /v1/models\n"
@@ -1892,17 +2672,25 @@ Run the README's complete CLI/API reference for examples and detailed backend no
               << "  GET  /v1/health\n"
               << "  WS   /ws/tts           (streaming -- minimum latency)\n\n";
 
-    if (bind_host != "127.0.0.1" && bind_host != "::1") {
+    if (resolved_bind_host != "127.0.0.1" && resolved_bind_host != "::1") {
         std::cerr << "[Security warning] Server is binding to " << bind_host
                   << ". API requests can reference local audio paths; expose this only to trusted clients.\n";
     }
-    std::cout << "Server listening on " << bind_host << ":" << port << "...\n";
+    std::cout << "Server listening on " << bind_host;
+    if (resolved_bind_host != bind_host) std::cout << " (" << resolved_bind_host << ")";
+    std::cout << ":" << port << "...\n";
     try {
-        app.bindaddr(bind_host).port(static_cast<uint16_t>(port)).multithreaded().run();
+        app.bindaddr(resolved_bind_host).port(static_cast<uint16_t>(port)).multithreaded().run();
+        mark_all_ws_closed();
+        ws_tasks->shutdown();
     } catch (const std::exception & e) {
+        mark_all_ws_closed();
+        ws_tasks->shutdown();
         std::cerr << "Server startup/runtime error: " << e.what() << "\n";
         return 1;
     } catch (...) {
+        mark_all_ws_closed();
+        ws_tasks->shutdown();
         std::cerr << "Server startup/runtime error: unknown exception\n";
         return 1;
     }

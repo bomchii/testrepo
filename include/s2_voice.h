@@ -34,6 +34,7 @@ public:
     std::vector<std::string> list() const;
 
     const std::string & storage_dir() const { return storage_dir_; }
+    std::string path_for(const std::string & voice_id) const { return get_path(voice_id); }
 
 private:
     std::string storage_dir_ = "./voices";

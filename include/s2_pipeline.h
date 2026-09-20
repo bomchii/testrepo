@@ -16,6 +16,11 @@
 
 namespace s2 {
 
+struct InlineReference {
+    std::vector<uint8_t> audio;
+    std::string text;
+};
+
 struct PipelineParams {
     std::string model_path;
     std::string tokenizer_path;
@@ -48,9 +53,17 @@ struct PipelineParams {
     int32_t min_chunk_length       = 0;
     bool    condition_on_previous_chunks = true;
 
-    // Fish prosody volume is a post-decode dB gain. Speed is intentionally not
-    // represented until a pitch-preserving time-stretch implementation exists.
+    // Fish-compatible postprocessing controls.
     float   prosody_volume_db      = 0.0f;
+    float   prosody_speed          = 1.0f;
+    bool    normalize_loudness     = false;
+    bool    normalize_text         = false;
+    int32_t output_sample_rate     = 0; // 0 = codec-native
+    bool    output_rf64            = false;
+
+    // Inline Fish reference audio. Saved voice/reference_id has higher priority.
+    std::vector<InlineReference> inline_references;
+    bool    reference_memory_cache = true;
 
     // Conversational VQ history. 0 preserves V7.4 for ordinary mono-speaker
     // requests; multi-speaker requests without an external reference retain at
@@ -77,7 +90,9 @@ struct VoiceCache {
     int32_t              T_prompt = 0;
     uintmax_t             source_size = 0;
     int64_t               source_mtime_ns = 0;
+    uint64_t              source_hash = 0;
     bool                  has_fingerprint = false;
+    std::string           transcript;
 };
 
 // Callback para synthesize_streaming().
@@ -127,6 +142,9 @@ public:
                               CancelCallback should_continue = {});
 
     int32_t sample_rate()    const { return codec_.sample_rate(); }
+    int32_t output_sample_rate(const PipelineParams & p) const {
+        return p.output_sample_rate > 0 ? p.output_sample_rate : codec_.sample_rate();
+    }
     int32_t num_codebooks()  const { return model_.hparams().num_codebooks; }
     int32_t codebook_size()  const { return model_.hparams().codebook_size; }
 
@@ -158,8 +176,8 @@ private:
     // Convierte float32 → int16 (clipping a [-1,1])
     static void float_to_int16(const std::vector<float> & in, std::vector<int16_t> & out);
 
-    // Apply post-processing (trim silence) to an audio buffer.
-    void postprocess_audio(std::vector<float> & audio, const PipelineParams & params) const;
+    // Apply post-processing to an audio buffer.
+    void postprocess_audio(std::vector<float> & audio, const PipelineParams & params, bool trim_tail = true) const;
 
 private:
     Tokenizer   tokenizer_;
@@ -179,6 +197,8 @@ private:
     static constexpr size_t VOICE_CACHE_MAX = 8;
     std::unordered_map<std::string, VoiceCache> voice_cache_;
     std::vector<std::string>                    voice_cache_order_;
+    std::unordered_map<std::string, VoiceCache> inline_voice_cache_;
+    std::vector<std::string>                    inline_voice_cache_order_;
 
     VoiceProfileManager voice_mgr_;
 };

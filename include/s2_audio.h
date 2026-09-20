@@ -21,6 +21,12 @@ bool audio_write_wav(const std::string & path, const float * data, size_t n_samp
 // Resample mono float32 audio from src_rate to dst_rate (linear interpolation).
 std::vector<float> audio_resample(const float * data, size_t n_samples, int32_t src_rate, int32_t dst_rate);
 
+// Pitch-preserving-ish WSOLA time stretch. speed > 1 is faster/shorter.
+std::vector<float> audio_time_stretch(const float * data, size_t n_samples, int32_t sample_rate, float speed);
+
+// Normalize RMS loudness to target dBFS while preventing clipping.
+void audio_normalize_loudness(std::vector<float> & audio, float target_dbfs = -18.0f);
+
 // Trim trailing silence from audio.
 std::vector<float> audio_trim_trailing_silence(const float * data, size_t n_samples,
                                                int32_t sample_rate,

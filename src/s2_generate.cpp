@@ -29,6 +29,7 @@ GenerateResult generate(
         !std::isfinite(params.top_p) || params.top_p <= 0.0f || params.top_p > 1.0f ||
         params.top_k < 0 || params.top_k > 1000000 ||
         params.min_tokens_before_end < 0 ||
+        !std::isfinite(params.early_stop_threshold) || (params.early_stop_threshold != -1.0f && params.early_stop_threshold != 1.0f) ||
         params.ras_window_size < 0 || params.ras_window_size > 32768 ||
         !std::isfinite(params.repetition_penalty) || params.repetition_penalty < 1.0f || params.repetition_penalty > 10.0f ||
         params.repetition_window < 0 || params.repetition_window > 32768 ||
@@ -108,6 +109,7 @@ GenerateResult generate(
         }
         return biased;
     };
+
 
     // Apply semantic mask/repetition penalty and sample from the request-local RNG.
     auto apply_mask_and_sample = [&](const std::vector<float> & logits,
@@ -330,6 +332,7 @@ GenerateResult generate_streaming(
         !std::isfinite(params.top_p) || params.top_p <= 0.0f || params.top_p > 1.0f ||
         params.top_k < 0 || params.top_k > 1000000 ||
         params.min_tokens_before_end < 0 ||
+        !std::isfinite(params.early_stop_threshold) || (params.early_stop_threshold != -1.0f && params.early_stop_threshold != 1.0f) ||
         params.ras_window_size < 0 || params.ras_window_size > 32768 ||
         !std::isfinite(params.repetition_penalty) || params.repetition_penalty < 1.0f || params.repetition_penalty > 10.0f ||
         params.repetition_window < 0 || params.repetition_window > 32768 ||
@@ -393,6 +396,7 @@ GenerateResult generate_streaming(
             biased[static_cast<size_t>(im_end_id)] = -std::numeric_limits<float>::infinity();
         return biased;
     };
+
 
     auto apply_mask_and_sample = [&](const std::vector<float> & logits, bool block_im_end) -> int32_t {
         std::vector<float> biased = build_biased(logits, block_im_end);

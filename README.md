@@ -252,7 +252,7 @@ That is enough for a basic server. The [HTTP server](#http-server) section below
 
 ### One-shot WAV instead of a server
 
-Add `--text` and `--output`. `--output` switches the program to one-shot mode, writes a WAV, and exits.
+Add `--text` and `--output`. `--output` switches the program to one-shot mode, writes PCM16 RIFF/WAV by default (or RF64 with `--rf64`), and exits.
 
 ```powershell
 .\s2-windows-cuda-x86-64.exe `
@@ -340,9 +340,9 @@ The long-form path is disk-backed. Only the current chunk needs to exist as floa
 
 `condition_on_previous_chunks` is on by default. It keeps a **bounded** amount of VQ/acoustic context between chunks so the voice does not restart from scratch, without letting history grow with the whole document. Use `--no-condition-on-previous-chunks` if you want each chunk to be independent.
 
-`prosody.volume` / `--prosody-volume` applies `-20..20` dB after final silence trimming. Fish-style `prosody.speed` is accepted only at `1.0` for now. Other values are rejected rather than faked with naive resampling that would also change pitch/timbre.
+`prosody.volume` / `--prosody-volume` applies `-20..20` dB after final silence trimming. `prosody.speed` / `--prosody-speed` supports `0.5..2.0` with a WSOLA-style time stretch for normal speech-length output; exceptionally short clips use a safe interpolation fallback. `prosody.normalize_loudness` / `--normalize-loudness` applies deterministic output loudness normalization before the final gain.
 
-Classic RIFF/WAV has a roughly 4 GiB data limit. RF64 is not implemented, so the writer rejects output that would exceed the RIFF limit.
+Classic RIFF/WAV has a roughly 4 GiB data limit. Use HTTP `format: "rf64"` or CLI `--rf64` for the RF64 container when that limit matters. RF64 keeps 64-bit sizes in its `ds64` chunk while preserving PCM16 audio.
 
 ## Text, languages, speakers, and segmentation
 
@@ -406,7 +406,8 @@ Use `--host 0.0.0.0` only when you intentionally want LAN access. There is no bu
 | Method | Path | What it does |
 |---|---|---|
 | `POST` | `/v1/tts` | Fish-style synthesis endpoint |
-| `POST` | `/v1/audio/speech` | OpenAI-style alias (`input`, `response_format`) |
+| `POST` | `/v1/tts/batch` | Batch synthesis; returns one base64 audio result per request |
+| `POST` | `/v1/audio/speech` | OpenAI-style subset (`model`, `input`, local `voice`, `response_format`, `speed`) |
 | `POST` | `/synthesize` | Legacy synthesis alias |
 | `GET` | `/v1/models` | Local model entry |
 | `GET` | `/v1/voices` | List saved voices |
@@ -418,9 +419,9 @@ Use `--host 0.0.0.0` only when you intentionally want LAN access. There is no bu
 | `GET` | `/` | Basic service status |
 | `WS` | `/ws/tts` | Incremental PCM streaming |
 
-The Fish/OpenAI compatibility layer only covers behavior this server implements. Fields that would change synthesis but are not supported are rejected instead of being silently ignored.
+The Fish/OpenAI compatibility layer only covers behavior this server implements. Supported Fish fields are validated and applied rather than silently ignored.
 
-Only WAV and raw PCM output are implemented over HTTP. MP3/Opus requests are rejected rather than returning WAV bytes under the wrong format name.
+HTTP supports WAV, raw PCM, RF64, MP3, and Ogg/Opus. WAV/PCM/RF64 are native. MP3/Opus are encoded by an external `ffmpeg` executable configured with `--ffmpeg` or `S2_FFMPEG`; if ffmpeg is unavailable, only MP3/Opus requests fail and the native formats remain self-contained.
 
 ### Check that the server is up
 
@@ -439,6 +440,28 @@ curl -X POST http://127.0.0.1:8080/v1/tts \
   -d '{"text":"Hello from s2.cpp.","format":"wav"}' \
   -o output.wav
 ```
+
+### MP3, Opus, RF64, and batch requests
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"MP3 example.","format":"mp3","mp3_bitrate":128}' \
+  -o output.mp3
+
+curl -X POST http://127.0.0.1:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Large WAV container.","format":"rf64"}' \
+  -o output.rf64.wav
+
+curl -X POST http://127.0.0.1:8080/v1/tts/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"requests":[{"text":"First.","format":"wav"},{"text":"Second.","format":"opus","opus_bitrate":64}]}'
+```
+
+Batch results are JSON objects containing `status`, `format`, and `audio_base64` for successful items. With `--workers N`, up to N items/requests can run model inference at once.
+
+Batching is request-level concurrency, not one tensor-batched transformer forward pass. The server caps concurrent batch tasks at the number of available pipeline workers and preserves the 32-item request limit.
 
 ### Windows PowerShell / `curl.exe`
 
@@ -486,10 +509,12 @@ Raw PCM is mono signed 16-bit little-endian. The response header `X-Sample-Rate`
 
 ### OpenAI-style and legacy aliases
 
+OpenAI `speed` is mapped to the same `prosody.speed` implementation used by the native/Fish routes. The `model` field is optional for this local subset, but when present it must be `s2-pro-local`, the same ID returned by `/v1/models`; built-in OpenAI model names are not silently remapped. `voice` selects a locally saved s2.cpp voice/reference ID. `instructions` and `stream_format` are not implemented and are rejected explicitly rather than ignored. `stream=true` is also rejected on this buffered HTTP subset; use `/ws/tts` for incremental PCM instead.
+
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"input":"OpenAI-style request.","response_format":"wav"}' \
+  -d '{"model":"s2-pro-local","input":"OpenAI-style request.","response_format":"wav"}' \
   -o output.wav
 
 curl -X POST http://127.0.0.1:8080/synthesize \
@@ -589,6 +614,7 @@ A normal request can stay small:
 | `text` / `input` | HTTP + WS | Text to synthesize. At least one is required. If both are sent they must match. Max 1 MiB. |
 | `voice` / `reference_id` | HTTP + WS | Saved `.s2voice` ID, max 128 chars: ASCII letters, digits, `_`, `-`. If both are sent they must match. `reference_id: null` means no saved reference. |
 | `reference_audio` | HTTP + WS | Server-local WAV/MP3 path (max 32768 bytes) for direct cloning. Requires `prompt_text`; decoded reference max 30 s. |
+| `references` | HTTP + WS | Fish inline references. Each entry has canonical base64 `audio` plus non-empty UTF-8 `text`; max 8 entries and bounded decoded size. `reference_id`/`voice` takes priority. |
 | `prompt_text` | HTTP + WS | Exact transcript for `reference_audio`, max 1 MiB. |
 | `segment` | HTTP + WS | Override sentence segmentation for this request. |
 | `temperature` | HTTP + WS | Sampling temperature, `0..10`; `0` is greedy. |
@@ -602,26 +628,37 @@ A normal request can stay small:
 | `max_tokens` / `max_new_tokens` | HTTP + WS | Generation budget `1..32768`. If both are sent they must agree. Fish `max_new_tokens: 0` means no explicit Fish limit and is still context-clamped. |
 | `max_seg_tokens` | HTTP + WS | Per-segment generation cap `1..32768` when sentence segmentation is active. |
 | `min_end_tokens` | HTTP + WS | `0..32768`; minimum generated tokens before EOS and must remain below effective generation budget. |
+| `early_stop_threshold` | HTTP + WS | Legacy compatibility: `-1` (local disabled sentinel) or `1.0` (neutral/all-finished) are accepted. Effectful fractional thresholds require true multi-sample tensor batching and are rejected rather than given invented single-sample EOS semantics. |
 | `ras_window` | HTTP + WS | RAS recent-token window `0..32768`; `0` disables the window. |
 | `ras_temp` | HTTP + WS | RAS resample temperature `0..10`. |
 | `ras_top_p` | HTTP + WS | RAS resample top-p `(0,1]`. |
 | `min_seg_chars` | HTTP + WS | Minimum visible characters used when merging sentence pieces, `0..1000000`. |
-| `chunk_length` | HTTP + WS | Long-form chunk target: `0` off, otherwise `100..300` visible Unicode characters. |
+| `chunk_length` | HTTP + WS | Long-form chunk target: `0` off, otherwise `100..1000` visible Unicode characters. |
 | `min_chunk_length` | HTTP + WS | Long-form minimum `0..100`; nonzero requires `chunk_length`. |
 | `condition_on_previous_chunks` | HTTP + WS | Keep bounded automatic VQ/acoustic context between long-form chunks. |
 | `prosody.volume` | HTTP + WS | Output gain `-20..20` dB, applied after final trim. |
-| `prosody.speed` | HTTP + WS | Only `1.0` is currently implemented. Other values are rejected. |
-| `latency` | HTTP + WS | Only `"normal"` is currently implemented; `balanced`/`low` are rejected. |
+| `prosody.speed` | HTTP + WS | WSOLA-style tempo change, `0.5..2.0`; `1.0` leaves duration unchanged. Very short clips use interpolation fallback. |
+| `prosody.normalize_loudness` | HTTP + WS | Boolean deterministic loudness normalization before final volume gain. |
+| `normalize` | HTTP + WS | Boolean local normalization that trims/collapses Unicode whitespace before segmentation/tokenization. It does not implement Fish cloud number/lexical normalization. |
+| `sample_rate` | HTTP + WS | `0`/omitted = codec native rate; otherwise `8000..192000` for PCM/WAV/RF64. MP3 accepts only 8/11.025/12/16/22.05/24/32/44.1/48 kHz; Opus is 48 kHz. |
+| `use_memory_cache` | HTTP + WS | Fish-compatible `"on"`/`"off"` or boolean control for reference encoding caches. |
+| `latency` | HTTP + WS | HTTP accepts `normal` only because it is buffered. WebSocket accepts `normal`, `balanced`, or `low`; explicit values map to 8/4/2 codec-frame cadence unless `stream_stride` overrides it. |
 | `codec_chunk` | HTTP + WS | Codec decode frame cap, `>=0`; `0` = automatic. |
-| `codec_overlap` | HTTP + WS | Codec history/holdback override, `>=0`; `0` = automatic. |
+| `codec_overlap` | HTTP + WS | Codec left-history override, `>=0`; `0` = automatic. |
 | `trim_silence` | HTTP + WS | Trim only the real final trailing silence. |
 | `streaming` | HTTP + WS | Route-consistency flag: HTTP accepts omitted/`false`; WS accepts omitted/`true`. Other route combinations are rejected. |
-| `format` / `response_format` | HTTP only | `wav` or `pcm`, default `wav`. If both are sent they must agree. |
+| `format` / `response_format` | HTTP only | `wav`, `pcm`, `rf64`, `mp3`, or `opus`; default `wav`. If both are sent they must agree. |
+| `mp3_bitrate` | HTTP only | MP3 bitrate in kbps: `64`, `128`, or `192`; valid only with `format=mp3`. |
+| `opus_bitrate` | HTTP only | Opus bitrate in kbps: `-1000` (automatic), `24`, `32`, `48`, or `64`; valid only with `format=opus`. |
 | `stream_stride` | WS only | `-1` = segment-boundary streaming, `0` = automatic 4-frame cadence, `1..32768` = explicit frame cadence. |
 
-Fish fields that would change output but are not implemented are rejected instead of ignored. This includes non-empty `references`, `early_stop_threshold`, `normalize`, `sample_rate`, `mp3_bitrate`, `opus_bitrate`, `use_memory_cache`, `prosody.normalize_loudness`, `latency` modes `balanced`/`low`, and `prosody.speed` values other than `1.0`.
+For Fish-flavor HTTP and WebSocket requests, `normalize` defaults to `true` unless the server operator explicitly selected `--normalize`/`--no-normalize`; an explicit request field still overrides that value. `use_memory_cache` defaults to `off` for each Fish request and can be enabled explicitly with `"on"`/`true`. These Fish defaults do not silently change the historical CLI/legacy/OpenAI defaults.
 
-WebSocket always returns framed PCM, so `format`/`response_format` are rejected there. Buffered HTTP does not use `stream_stride`, so that field is rejected on HTTP.
+WebSocket always returns framed PCM, so `format`/`response_format`, `mp3_bitrate`, and `opus_bitrate` are rejected there. Buffered HTTP does not use `stream_stride`, so that field is rejected on HTTP.
+
+For WebSocket requests, `prosody.speed != 1`, `prosody.normalize_loudness=true`, or a non-native `sample_rate` require whole-segment postprocessing. Those fields remain supported, but an explicitly requested `latency=balanced/low` or `stream_stride>=0` is rejected in combination with them instead of silently degrading the requested frame cadence. `stream_stride=-1` remains compatible because it already means segment-boundary emission.
+
+For compressed HTTP output, the encoder validates the actual container instead of returning WAV bytes under another name. MP3 accepts 64/128/192 kbps and sample rates 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, or 48000 Hz. Opus accepts `-1000` (automatic), 24/32/48/64 kbps and is emitted at 48000 Hz, as required by the Opus output path.
 
 </details>
 
@@ -671,7 +708,7 @@ Binary messages use:
 
 `segments` counts text segments, not PCM packets.
 
-Streaming decode keeps left context and a small right-edge holdback so it does not decode each stride as an unrelated clip. The final holdback is flushed at the end.
+Exact streaming decode keeps a bounded **left-history** window, so it does **not** re-decode the entire confirmed prefix on every update and does not wait for a future/right-edge holdback before committing new PCM. It still re-decodes the bounded left-context overlap because the current codec API is stateless between decode calls; a truly stateful/incremental codec decoder would be required to remove that remaining structural work. When `latency` is explicitly supplied, `normal`/`balanced`/`low` select 8/4/2 codec-frame cadence unless `stream_stride` is supplied. The generic `stream_stride=0` auto mode remains 4 frames.
 
 Useful controls:
 
@@ -679,7 +716,7 @@ Useful controls:
 |---|---:|---|
 | `--stream-decode-stride` / `stream_stride` | `0` | `0` = auto (4 frames), `-1` = no stride streaming, positive = explicit cadence |
 | `--codec-chunk` / `codec_chunk` | `0` | `0` = automatic bounded window; positive = cap codec frames per decode |
-| `--codec-overlap` / `codec_overlap` | `0` | `0` = automatic codec history/holdback; positive = manual override |
+| `--codec-overlap` / `codec_overlap` | `0` | `0` = automatic codec left history; positive = manual override |
 
 Smaller codec windows can reduce peak memory, but going too small can hurt continuity at chunk boundaries.
 
@@ -715,16 +752,25 @@ The common modes are simple:
 | Argument | Default | Meaning |
 |---|---|---|
 | `-p <N>`, `--port <N>` | `8080` | TCP port `1..65535` |
-| `--host <IP>` | `127.0.0.1` | IPv4/IPv6 address literal; hostnames are not accepted |
+| `--host <host>` | `127.0.0.1` | Server-only IPv4/IPv6 literal or resolvable DNS hostname; resolved once when the server starts |
+| `--workers <N>` | `1` | Server-only independent model/codec/KV replicas, `1..16`; values >1 enable parallel inference with roughly proportional memory use |
+| `--ffmpeg <path>` | `S2_FFMPEG` or `ffmpeg` | Server-only ffmpeg executable used for HTTP MP3/Opus encoding |
+
+Server/network options are not resolved or validated in one-shot `--output` or save-only `--save-voice` mode; those modes do not start Crow.
 
 ### Input/output
 
 | Argument | Default | Meaning |
 |---|---|---|
 | `--text <text>` | empty | One-shot text, max 1 MiB |
-| `-o <path>`, `--output <path>` | none | Write WAV and exit instead of starting the server |
+| `-o <path>`, `--output <path>` | none | Write PCM16 RIFF/WAV (or RF64 with `--rf64`) and exit instead of starting the server |
 | `--trim-silence` | off | Trim trailing silence at the real end of the request |
 | `--no-trim-silence` | off | Explicitly disable trailing trim |
+| `--prosody-speed <F>` | `1.0` | WSOLA-style tempo change, `0.5..2.0`; tiny clips use interpolation fallback |
+| `--normalize` / `--no-normalize` | off | Trim/collapse Unicode whitespace before tokenization |
+| `--normalize-loudness` / `--no-normalize-loudness` | off | Enable/disable deterministic output loudness normalization |
+| `--sample-rate <N>` | `0` | `0` native or `8000..192000` output rate |
+| `--rf64` / `--no-rf64` | off | Select RF64 vs classic RIFF/WAV for one-shot/file output; buffered HTTP still defaults to WAV unless the request asks for `format: "rf64"` |
 
 ### Voice/reference
 
@@ -746,7 +792,7 @@ The common modes are simple:
 | `--segment` | off | Unicode-aware sentence segmentation |
 | `--max-seg-tokens <N>` | `300` | Segment budget, `1..32768` |
 | `--min-seg-chars <N>` | `0` | Merge very short segments, `0..1000000` |
-| `--chunk-length <N>` | `0` | Long-form chunks; `0` off, otherwise `100..300` visible characters |
+| `--chunk-length <N>` | `0` | Long-form chunks; `0` off, otherwise `100..1000` visible characters |
 | `--min-chunk-length <N>` | `0` | Minimum long-form chunk, `0..100`; requires chunking |
 | `--condition-on-previous-chunks` | on | Keep bounded automatic context between chunks |
 | `--no-condition-on-previous-chunks` | off | Disable automatic chunk-to-chunk context |
@@ -760,6 +806,7 @@ The common modes are simple:
 | `--top-p <F>` | `0.7` | `(0,1]` |
 | `--top-k <N>` | `30` | `0..1000000` |
 | `--min-end-tokens <N>` | `64` | Minimum tokens before EOS, `0..32768`, less than `--max-tokens` |
+| `--early-stop-threshold <F>` | `-1` | Legacy compatibility: `-1` disabled or `1.0` neutral; effectful fractional thresholds require true multi-sample tensor batching and are rejected |
 | `--seed <uint64>` | `0` | `0` random; nonzero reproducible |
 | `--repetition-penalty <F>` | `1.0` | `1.0..10.0`; `1.0` disables it |
 | `--repetition-window <N>` | `64` | Recent-token window, `0..32768` |
@@ -800,10 +847,10 @@ A few option interactions are worth knowing:
 - `--save-voice` needs `--voice`, `--prompt-audio`, and `--prompt-text`.
 - `--min-end-tokens` must be lower than `--max-tokens`.
 - `--codec-vulkan -2` follows the transformer device.
-- `--host` accepts IP address literals, not DNS names.
+- `--host` accepts IPv4/IPv6 literals and DNS hostnames; names are resolved once at startup.
 - Floating-point sampling options reject NaN/Inf.
 - `--list-voices` does not load the model, codec, or GPU backend.
-- `--output` always writes WAV. Raw PCM is only exposed by HTTP/WebSocket.
+- `--output` writes PCM16 RIFF/WAV by default and RF64 when `--rf64` is enabled. Raw headerless PCM is only exposed by HTTP/WebSocket.
 
 </details>
 
@@ -844,7 +891,7 @@ Run `s2 --help` for the same option reference directly from the binary.
 
 ## Concurrency and network safety
 
-Crow handles network connections concurrently, but model inference is serialized around the shared model/codec/KV state. Two TTS requests can be connected at once, but they do not run inference through the same mutable pipeline at the same time.
+With the default `--workers 1`, inference is serialized through one model/codec/KV pipeline exactly as before. `--workers N` creates N independent `Pipeline` replicas and schedules HTTP, WebSocket, voice-encoding, and batch work across them, so up to N inference jobs can execute in parallel. Because weights/codec/KV state are replicated, memory/VRAM use grows roughly with the worker count; increase it only when the machine has enough capacity.
 
 The server binds to localhost because reference/voice endpoints can read paths from the machine running `s2`. If you bind to another interface, add authentication/access control in front of it before exposing it to an untrusted network.
 
@@ -864,6 +911,7 @@ You need:
 - NVIDIA driver + CUDA toolkit for CUDA builds
 - AMD ROCm/HIP SDK for ROCm builds
 - Xcode command-line tools for Metal builds
+- optional ffmpeg at runtime only when HTTP MP3/Opus output is requested
 
 For Crow, either install a CMake package that provides `Crow::Crow`, or use the same header-only path supported by CI:
 
@@ -947,7 +995,7 @@ A few implementation details are useful when debugging backend-specific problems
 - Codec K-quant conversion is limited to operations that need it. Supported linear/attention tensors stay quantized.
 - Metal uses an explicit finite F32 causal mask when the active backend is Metal, avoiding the unsupported `DIAG_MASK_INF` path.
 - Codec/model fallback logs report the backend that initialized.
-- Streaming and offline chunked decode keep left context, right-edge holdback, exact frame-to-sample geometry, and a final flush.
+- Streaming decode keeps bounded causal left context with exact frame-to-sample geometry; it does not require a future/right-edge holdback. Offline chunked decode retains its own overlap handling.
 - `--codec-overlap 0` means automatic codec-derived history, not “no overlap”.
 
 ## Validation
@@ -970,12 +1018,9 @@ These checks are useful, but they are not the same thing as running every native
 
 - Still alpha software.
 - Fish Audio/OpenAI API compatibility is partial, not drop-in.
-- No batch inference.
-- One shared inference pipeline means TTS requests are serialized.
-- HTTP WAV/PCM is returned after synthesis finishes. Use WebSocket for incremental playback.
+- Buffered HTTP audio is returned after synthesis finishes; use `/ws/tts` for incremental PCM playback.
 - Voice quality depends heavily on reference quality and transcript accuracy.
 - Very aggressive quantization, tiny codec history, or tiny codec chunks can save memory at the cost of quality.
-- Classic RIFF limits incremental WAV output to about 4 GiB of audio data. RF64 is not implemented.
 - Backends and drivers can behave differently across machines. Test the hardware you intend to deploy.
 
 ## Project layout

@@ -8,8 +8,8 @@ def must(cond: bool, msg: str) -> None:
     if not cond:
         raise SystemExit("HTTP_ERROR_SEMANTICS_FAIL: " + msg)
 
-must(s.count("return handle_synthesis_request(req);") == 3,
-     "all three synthesis HTTP routes must use the strict wrapper")
+must(s.count("return handle_synthesis_request(req, ApiFlavor::") == 3,
+     "all three synthesis HTTP routes must use the strict wrapper with an explicit API flavor")
 helper = s[s.index("auto handle_synthesis_request"):s.index("// Route Fish Audio")]
 must("load_json_strict(req.body)" in helper, "strict JSON normalization must live inside wrapper try/catch")
 must("Invalid JSON request:" in helper, "wrapper must map strict JSON exceptions to client errors")
@@ -31,4 +31,7 @@ must("bool request_validated = false;" in voice, "voice stage flag missing")
 must("request_validated = true;" in voice, "voice stage transition missing")
 must(voice.count("request_validated ? 500 : 400") >= 3,
      "voice invalid_argument/std::exception/unknown catches must all be phase-aware")
-print("HTTP_ERROR_SEMANTICS_PASS routes=3 staged_voice_errors=1 missing_voice_404=1")
+voice_impl = Path("src/s2_voice.cpp").read_text(encoding="utf-8")
+must('!fs::exists(path) || !fs::is_regular_file(path)' in voice_impl,
+     "voice DELETE must not remove a directory masquerading as <id>.s2voice")
+print("HTTP_ERROR_SEMANTICS_PASS routes=3 staged_voice_errors=1 missing_voice_404=1 delete_regular_file=1")
