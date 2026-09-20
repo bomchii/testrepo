@@ -29,8 +29,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Validate workflow with pinned actionlint 1.7.12
@@ -44,22 +45,24 @@ jobs:
           echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/$archive" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/actionlint"
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/actionlint" actionlint
-          "$RUNNER_TEMP/actionlint/actionlint" -shellcheck= -pyflakes= .github/workflows/build-all-backends.yml
+          "$RUNNER_TEMP/actionlint/actionlint" -shellcheck= -pyflakes= .github/workflows/*.yml
 
       - name: Extract every workflow run command
         shell: bash
         run: |
           set -euo pipefail
           rm -rf .ci-run-blocks
-          python3 tools/ci/extract-workflow-run-blocks.py .github/workflows/build-all-backends.yml .ci-run-blocks
-          find .ci-run-blocks -maxdepth 1 -type f -print | LC_ALL=C sort
+          mkdir -p .ci-run-blocks/build .ci-run-blocks/security
+          python3 tools/ci/extract-workflow-run-blocks.py .github/workflows/build-all-backends.yml .ci-run-blocks/build
+          python3 tools/ci/extract-workflow-run-blocks.py .github/workflows/security.yml .ci-run-blocks/security
+          find .ci-run-blocks -type f -print | LC_ALL=C sort
 
       - name: Parse PowerShell scripts and every pwsh run block
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $targets = @('patch-cmake.ps1', 'patch-cmake-cuda.ps1')
-          $targets += @(Get-ChildItem .ci-run-blocks -Filter 'pwsh-run-*.ps1' -File | Sort-Object Name | ForEach-Object FullName)
+          $targets += @(Get-ChildItem .ci-run-blocks -Filter 'pwsh-run-*.ps1' -File -Recurse | Sort-Object FullName | ForEach-Object FullName)
           foreach ($file in $targets) {
               $tokens = $null
               $parseErrors = $null
@@ -80,7 +83,7 @@ jobs:
           done < <(find tools/ci -type f -name '*.sh' -print0)
           while IFS= read -r -d '' file; do
             bash -n "$file"
-          done < <(find .ci-run-blocks -maxdepth 1 -type f -name 'bash-run-*.sh' -print0)
+          done < <(find .ci-run-blocks -type f -name 'bash-run-*.sh' -print0)
           echo BASH_PARSE_PASS
 
       - name: Run workflow/repository consistency guards
@@ -90,6 +93,7 @@ jobs:
           python3 tools/check_cli_parser_sync.py
           python3 tools/check_docs_api_sync.py
           python3 tools/check_ci_invariants.py
+          python3 tools/check_security_invariants.py
 
   build:
     name: Windows Server 2025 - VS 2026 - Vulkan
@@ -101,8 +105,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Verificar toolchain VS 2026
@@ -173,7 +178,7 @@ jobs:
       # causando una discrepancia entre el .hpp y el .cpp.
 
       - name: Cache Crow/Asio headers
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             build/_deps/crow-include
@@ -369,7 +374,7 @@ jobs:
           if ($f.Length -le 0) { throw "Direct artifact is empty: $($f.FullName)" }
 
       - name: Subir artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-windows-vulkan-x86-64.exe
           path: release/s2-windows-vulkan-x86-64.exe
@@ -384,7 +389,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-vulkan-diagnostics
           path: ci-logs/
@@ -399,8 +404,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Assemble pinned CUDA 13.2 toolkit from NVIDIA redistributable archives
@@ -573,7 +579,7 @@ jobs:
           Write-Host "CUDA_NINJA_PROBE_PASS host=$cl nvcc=$nvcc"
 
       - name: Cache Crow/Asio headers
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             build/_deps/crow-include
@@ -750,7 +756,7 @@ jobs:
           if ($f.Length -le 0) { throw "Direct artifact is empty: $($f.FullName)" }
 
       - name: Upload CUDA artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-windows-cuda-x86-64.exe
           path: release-cuda/s2-windows-cuda-x86-64.exe
@@ -765,7 +771,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-cuda-diagnostics
           path: ci-logs/
@@ -780,8 +786,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Verificar toolchain VS 2026
@@ -807,7 +814,7 @@ jobs:
           Write-Host "cl version=$($cl.VersionInfo.FileVersion)"
 
       - name: Cache Crow/Asio headers
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             build/_deps/crow-include
@@ -902,7 +909,7 @@ jobs:
           if ($f.Length -le 0) { throw "Direct artifact is empty: $($f.FullName)" }
 
       - name: Upload CPU artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-windows-cpu-x86-64.exe
           path: release-cpu/s2-windows-cpu-x86-64.exe
@@ -921,7 +928,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-cpu-diagnostics
           path: ci-logs/
@@ -936,8 +943,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Reclaim runner disk space
@@ -977,7 +985,7 @@ jobs:
           test -s s2-linux-cpu-x86-64
 
       - name: Upload Linux CPU artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-linux-cpu-x86-64
           path: s2-linux-cpu-x86-64
@@ -992,7 +1000,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-cpu-diagnostics
           path: ci-logs/
@@ -1007,8 +1015,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Reclaim runner disk space
@@ -1054,7 +1063,7 @@ jobs:
           test -s s2-linux-vulkan-x86-64
 
       - name: Upload Linux Vulkan artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-linux-vulkan-x86-64
           path: s2-linux-vulkan-x86-64
@@ -1069,7 +1078,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-vulkan-diagnostics
           path: ci-logs/
@@ -1084,8 +1093,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Reclaim runner disk space
@@ -1139,7 +1149,7 @@ jobs:
           test -s s2-linux-cuda-x86-64
 
       - name: Upload Linux CUDA artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-linux-cuda-x86-64
           path: s2-linux-cuda-x86-64
@@ -1154,7 +1164,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-cuda-diagnostics
           path: ci-logs/
@@ -1169,8 +1179,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Pin Xcode 16.4
@@ -1288,7 +1299,7 @@ jobs:
           test -s release-metal/s2-macos-metal-arm64
 
       - name: Upload Metal artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-macos-metal-arm64
           path: release-metal/s2-macos-metal-arm64
@@ -1303,7 +1314,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-metal-diagnostics
           path: ci-logs/
@@ -1318,8 +1329,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Verify Windows ROCm runner image
@@ -1335,7 +1347,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "ninja --version failed" }
 
       - name: Setup Python 3.12 for ROCm wheels
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
           check-latest: false
@@ -1622,7 +1634,7 @@ jobs:
           if ($f.Length -le 0) { throw "Direct artifact is empty: $($f.FullName)" }
 
       - name: Upload Windows AMD artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-windows-amd-x86-64.exe
           path: release-amd/s2-windows-amd-x86-64.exe
@@ -1637,7 +1649,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-amd-diagnostics
           path: ci-logs/
@@ -1666,8 +1678,9 @@ jobs:
           rm -rf /var/lib/apt/lists/*
 
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Prepare pinned Linux Crow/Asio dependencies
@@ -1930,7 +1943,7 @@ jobs:
           test -s s2-linux-amd-x86-64
 
       - name: Upload Linux AMD artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-linux-amd-x86-64
           path: s2-linux-amd-x86-64
@@ -1945,7 +1958,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-amd-diagnostics
           path: ci-logs/
@@ -1960,8 +1973,9 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Pin Xcode 16.4
@@ -2045,7 +2059,7 @@ jobs:
           test -s release-macos-intel-cpu/s2-macos-cpu-x86-64
 
       - name: Upload macOS Intel CPU artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: s2-macos-cpu-x86-64
           path: release-macos-intel-cpu/s2-macos-cpu-x86-64
@@ -2060,7 +2074,7 @@ jobs:
 
       - name: Upload concise failure diagnostics
         if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-intel-cpu-diagnostics
           path: ci-logs/
@@ -2074,65 +2088,68 @@ jobs:
     runs-on: windows-2025-vs2026
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     timeout-minutes: 45
 
     steps:
       - name: Download Windows Vulkan artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-windows-vulkan-x86-64.exe
           path: artifacts/windows-vulkan
 
       - name: Download Windows CUDA artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-windows-cuda-x86-64.exe
           path: artifacts/windows-cuda
 
       - name: Download Windows CPU artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-windows-cpu-x86-64.exe
           path: artifacts/windows-cpu
 
       - name: Download Windows AMD artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-windows-amd-x86-64.exe
           path: artifacts/windows-amd
 
       - name: Download Linux CPU artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-linux-cpu-x86-64
           path: artifacts/linux-cpu
 
       - name: Download Linux Vulkan artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-linux-vulkan-x86-64
           path: artifacts/linux-vulkan
 
       - name: Download Linux CUDA artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-linux-cuda-x86-64
           path: artifacts/linux-cuda
 
       - name: Download Linux AMD artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-linux-amd-x86-64
           path: artifacts/linux-amd
 
       - name: Download macOS Metal artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-macos-metal-arm64
           path: artifacts/macos-metal
 
       - name: Download macOS Intel CPU artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: s2-macos-cpu-x86-64
           path: artifacts/macos-cpu
@@ -2159,8 +2176,23 @@ jobs:
             $entries = @(Get-ChildItem $dir -File)
             if ($entries.Count -ne 1) { throw "Artifact must contain exactly one executable: ${dir}: $($entries.Name -join ', ')" }
           }
+
+      - name: Attest exact release executables
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/windows-vulkan/s2-windows-vulkan-x86-64.exe
+            artifacts/windows-cuda/s2-windows-cuda-x86-64.exe
+            artifacts/windows-cpu/s2-windows-cpu-x86-64.exe
+            artifacts/windows-amd/s2-windows-amd-x86-64.exe
+            artifacts/linux-cpu/s2-linux-cpu-x86-64
+            artifacts/linux-vulkan/s2-linux-vulkan-x86-64
+            artifacts/linux-cuda/s2-linux-cuda-x86-64
+            artifacts/linux-amd/s2-linux-amd-x86-64
+            artifacts/macos-metal/s2-macos-metal-arm64
+            artifacts/macos-cpu/s2-macos-cpu-x86-64
       - name: Publish GitHub Release assets
-        uses: softprops/action-gh-release@v3.0.3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           fail_on_unmatched_files: true
           files: |

@@ -22,6 +22,7 @@
 #else
 #  include <unistd.h>
 #  include <fcntl.h>
+#  include <sys/stat.h>
 #endif
 
 namespace fs = ghc::filesystem;
@@ -36,7 +37,17 @@ static FILE * open_profile_file(const std::string & path, bool write) {
     const std::wstring wp = fs::path(path).wstring();
     return _wfopen(wp.c_str(), write ? L"wb" : L"rb");
 #else
-    return std::fopen(path.c_str(), write ? "wb" : "rb");
+    if (!write) return std::fopen(path.c_str(), "rb");
+    int flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    const int fd = ::open(path.c_str(), flags, S_IRUSR | S_IWUSR);
+    if (fd < 0) return nullptr;
+    if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) { ::close(fd); return nullptr; }
+    FILE * f = ::fdopen(fd, "wb");
+    if (!f) { ::close(fd); return nullptr; }
+    return f;
 #endif
 }
 
@@ -241,6 +252,9 @@ bool VoiceProfileManager::save(const std::string & voice_id, const VoiceProfile 
     fs::path dir(storage_dir_);
     if (!fs::exists(dir)) fs::create_directories(dir);
     if (!fs::is_directory(dir)) return false;
+#ifndef _WIN32
+    if (::chmod(dir.string().c_str(), S_IRWXU) != 0) return false;
+#endif
     return profile.save(path);
 }
 

@@ -1,0 +1,12 @@
+name: "s2.cpp first-party C/C++"
+
+# The public repository vendors GGML and several single-header libraries. They
+# are tracked separately in SECURITY_DEPENDENCIES.md; CodeQL here focuses on
+# the code this project owns so third-party findings do not bury actionable
+# first-party alerts. This filtering is supported with build-mode: none.
+paths:
+  - src
+  - include
+paths-ignore:
+  - src/tokenizer_data.cpp
+  - 'src/test_*.cpp'

@@ -100,7 +100,7 @@ must('websocket_max_payload' in main,
      'server must configure the Crow WebSocket frame payload limit')
 must('Crow 1.3.4' in readme and 'complete reassembled message' in readme and 'fragmented messages' in readme,
      'README must document Crow 1.3.4 cumulative WebSocket payload enforcement')
-must('Crow 1.3.4' in help_text and 'complete reassembled' in help_text and 'fragmented messages' in help_text,
+must('Crow 1.3.4' in help_text and 'complete' in help_text and 'reassembled message' in help_text and 'fragmented messages' in help_text,
      '--help must document Crow 1.3.4 cumulative WebSocket payload enforcement')
 must('s2-pro-local' in readme and 'instructions' in readme and 'stream_format' in readme,
      'README must document the implemented OpenAI model/unsupported-field subset')
@@ -114,6 +114,10 @@ must('normalize` defaults to `true`' in readme and '`use_memory_cache` defaults 
      'README must state Fish normalize/cache defaults')
 must('Fish requests default normalize=true' in help_text and 'use_memory_cache defaults off' in help_text,
      '--help must state Fish normalize/cache defaults')
+must('--allow-remote' in readme and '--allow-remote' in help_text and
+     'Localhost does not require this flag or a token' in help_text and
+     'Purely local use requires no token' in readme,
+     'README/--help must explain zero-config localhost and explicit remote opt-in')
 
 # All inline curl JSON examples must remain valid JSON. This catches quoting edits
 # that look fine in Markdown/help but fail when copied into a shell.

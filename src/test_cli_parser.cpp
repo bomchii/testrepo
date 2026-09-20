@@ -138,8 +138,9 @@ static float parse_float_arg(const char * raw) {
 
 // Returns 0 = parsed OK, 1 = error/exit, 2 = --help.
 int parse_args(int argc, char** argv,
-               PipelineParams& params, int& port, std::string& bind_host, bool& list_voices,
-               int& server_workers, std::string& ffmpeg_bin) {
+               PipelineParams& params, int& port, std::string& bind_host, bool& allow_remote, bool& list_voices,
+               int& server_workers, int& request_rate_per_minute, int& request_burst,
+               int& max_http_inflight, int& max_ws_connections, std::string& ffmpeg_bin) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         // std::stoi / std::stof throw std::invalid_argument on non-numeric input
@@ -224,8 +225,18 @@ int parse_args(int argc, char** argv,
             port = parse_int_arg(argv[++i]);
         } else if (arg == "--host" && i + 1 < argc) {
             bind_host = argv[++i];
+        } else if (arg == "--allow-remote") {
+            allow_remote = true;
         } else if (arg == "--workers" && i + 1 < argc) {
             server_workers = parse_int_arg(argv[++i]);
+        } else if (arg == "--request-rate" && i + 1 < argc) {
+            request_rate_per_minute = parse_int_arg(argv[++i]);
+        } else if (arg == "--request-burst" && i + 1 < argc) {
+            request_burst = parse_int_arg(argv[++i]);
+        } else if (arg == "--max-http-inflight" && i + 1 < argc) {
+            max_http_inflight = parse_int_arg(argv[++i]);
+        } else if (arg == "--max-ws-connections" && i + 1 < argc) {
+            max_ws_connections = parse_int_arg(argv[++i]);
         } else if (arg == "--ffmpeg" && i + 1 < argc) {
             ffmpeg_bin = argv[++i];
         } else if ((arg == "-threads" || arg == "--threads") && i + 1 < argc) {
@@ -293,8 +304,13 @@ struct RunResult {
     PipelineParams params;
     int          port = 8080;
     std::string  bind_host = "127.0.0.1";
+    bool         allow_remote = false;
     bool         list_voices = false;
     int          server_workers = 1;
+    int          request_rate_per_minute = 240;
+    int          request_burst = 60;
+    int          max_http_inflight = 16;
+    int          max_ws_connections = 64;
     std::string  ffmpeg_bin = "ffmpeg";
     std::string  err;                  // captured std::cerr
 };
@@ -314,7 +330,7 @@ static RunResult run(const std::vector<std::string>& args) {
     RunResult r;
     std::ostringstream capture;
     std::streambuf* old = std::cerr.rdbuf(capture.rdbuf());
-    r.rc = parse_args((int)argv.size(), argv.data(), r.params, r.port, r.bind_host, r.list_voices, r.server_workers, r.ffmpeg_bin);
+    r.rc = parse_args((int)argv.size(), argv.data(), r.params, r.port, r.bind_host, r.allow_remote, r.list_voices, r.server_workers, r.request_rate_per_minute, r.request_burst, r.max_http_inflight, r.max_ws_connections, r.ffmpeg_bin);
     std::cerr.rdbuf(old);
     r.err = capture.str();
     return r;
@@ -381,7 +397,12 @@ int main() {
     { RunResult r = run({"-p","9090"});                  ok(r.rc==0 && r.port==9090, "-p sets port"); }
     { RunResult r = run({"--port","8000"});              ok(r.rc==0 && r.port==8000, "--port sets port"); }
     { RunResult r = run({"--host","localhost"});          ok(r.rc==0 && r.bind_host=="localhost", "--host accepts hostname text for startup resolution"); }
+    { RunResult r = run({"--allow-remote"});              ok(r.rc==0 && r.allow_remote, "--allow-remote explicitly enables remote-bind intent"); }
     { RunResult r = run({"--workers","3"});               ok(r.rc==0 && r.server_workers==3, "--workers sets server worker count"); }
+    { RunResult r = run({"--request-rate","600"});        ok(r.rc==0 && r.request_rate_per_minute==600, "--request-rate sets process request budget"); }
+    { RunResult r = run({"--request-burst","120"});       ok(r.rc==0 && r.request_burst==120, "--request-burst sets token-bucket burst"); }
+    { RunResult r = run({"--max-http-inflight","32"});    ok(r.rc==0 && r.max_http_inflight==32, "--max-http-inflight sets HTTP concurrency cap"); }
+    { RunResult r = run({"--max-ws-connections","128"});  ok(r.rc==0 && r.max_ws_connections==128, "--max-ws-connections sets WS connection cap"); }
     { RunResult r = run({"--ffmpeg","/usr/bin/ffmpeg"}); ok(r.rc==0 && r.ffmpeg_bin=="/usr/bin/ffmpeg", "--ffmpeg sets encoder executable"); }
     { RunResult r = run({"--threads","8"});              ok(r.rc==0 && r.params.gen.n_threads==8, "--threads sets gen.n_threads"); }
     { RunResult r = run({"-threads","6"});               ok(r.rc==0 && r.params.gen.n_threads==6, "-threads (single-dash alias) sets gen.n_threads"); }
@@ -427,8 +448,8 @@ int main() {
         "-v","--vulkan","--codec-vulkan","--codec-chunk","--codec-overlap",
         "--min-seg-chars","--top-k","--min-end-tokens","--repetition-window",
         "--multi-turn-history","--ras-window","--max-seg-tokens","-p","--port",
-        "--threads","-threads","--max-tokens","--workers","--sample-rate",
-        "--stream-decode-stride"
+        "--threads","-threads","--max-tokens","--workers","--request-rate","--request-burst",
+        "--max-http-inflight","--max-ws-connections","--sample-rate","--stream-decode-stride"
     };
     for (const char* f : int_flags)
         expect_rc({f, "abc"}, 1, std::string("int flag ") + f + " rejects non-numeric");
@@ -541,7 +562,8 @@ int main() {
            && r.params.multi_turn_history==4
            && r.params.warmup==true
            && r.port==8080
-           && r.bind_host=="127.0.0.1",
+           && r.bind_host=="127.0.0.1"
+           && r.allow_remote==false,
            "full optimal Vulkan command line parses with all fields correct");
     }
     // A full voice-cloning CLI line exercising -pa/-pt/-o together.
@@ -570,7 +592,7 @@ int main() {
     std::cout << "[group] no arguments\n";
     {
         RunResult r = run({});
-        ok(r.rc==0 && r.port==8080 && r.bind_host=="127.0.0.1" && r.list_voices==false
+        ok(r.rc==0 && r.port==8080 && r.bind_host=="127.0.0.1" && r.allow_remote==false && r.list_voices==false
            && r.params.vulkan_device==-1 && r.params.codec_vulkan_device==-2
            && r.params.segment_sentences==false && r.params.max_tokens_per_segment==300,
            "no args -> rc 0 with defaults intact");

@@ -60,15 +60,27 @@ for job in ['build', 'build-cuda', 'build-cpu', 'build-linux-cpu', 'build-linux-
     if not m or 'needs: preflight' not in m.group(1):
         errors.append(f'{job} must need preflight')
 
-for token, label in [
-    ('actions/checkout@v7', 'checkout major'),
-    ('actions/cache@v6', 'cache major'),
-    ('actions/upload-artifact@v7', 'upload-artifact major'),
-    ('actions/download-artifact@v8', 'download-artifact major'),
-    ('softprops/action-gh-release@v3.0.3', 'release action pin'),
-    ("FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'", 'Node 24 Actions runtime'),
-]:
-    req(token, label)
+ACTION_PINS = {
+    'actions/checkout': ('3d3c42e5aac5ba805825da76410c181273ba90b1', 'v7.0.1'),
+    'actions/cache': ('55cc8345863c7cc4c66a329aec7e433d2d1c52a9', 'v6.1.0'),
+    'actions/upload-artifact': ('043fb46d1a93c77aae656e7c1c64a875d1fc6a0a', 'v7.0.1'),
+    'actions/download-artifact': ('3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c', 'v8.0.1'),
+    'actions/setup-python': ('5fda3b95a4ea91299a34e894583c3862153e4b97', 'v7.0.0'),
+    'softprops/action-gh-release': ('efb35369e0ad2afab669f228072c1b0d510eae64', 'v3.0.3'),
+    'actions/attest': ('1e69f48acb82d1966a394da916b4c1698aa569d6', 'v4.2.2'),
+}
+for action, (sha, version) in ACTION_PINS.items():
+    req(f'{action}@{sha} # {version}', f'immutable {action} pin')
+for match in re.finditer(r'^\s*uses:\s+([^\s#]+)', text, re.M):
+    ref = match.group(1)
+    if ref.startswith('./'): continue
+    if '@' not in ref:
+        errors.append(f'action without ref: {ref}')
+        continue
+    action, revision = ref.rsplit('@', 1)
+    if action in ACTION_PINS and not re.fullmatch(r'[0-9a-f]{40}', revision):
+        errors.append(f'{action} must be pinned to a full 40-hex commit SHA, got {revision!r}')
+req("FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'", 'Node 24 Actions runtime')
 forbid('FORCE_JAVASCRIPT_ACTIONS_TO_NODE20', 'Node 20 override')
 if text.count('if-no-files-found: error') != 10:
     errors.append('all ten backend uploads must use if-no-files-found: error')
@@ -79,7 +91,7 @@ if text.count('if-no-files-found: error') != 10:
 forbid('upload_artifacts:', 'manual artifact-upload input; uploads must be automatic')
 forbid("inputs.upload_artifacts", 'conditional manual artifact upload gate')
 forbid("startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch'", 'conditional success-artifact upload gate')
-if text.count('uses: actions/upload-artifact@v7') != 20:
+if text.count('uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1') != 20:
     errors.append('expected ten success artifact uploads plus ten diagnostic uploads')
 if text.count('retention-days: 7') != 10:
     errors.append('only the ten failure diagnostics should force 7-day retention')
@@ -100,11 +112,13 @@ for token, label in [
     ('actionlint_${version}_linux_amd64.tar.gz', 'actionlint Linux amd64 asset name'),
     ('-shellcheck= -pyflakes=', 'actionlint external-linter disable flags'),
     ('tools/ci/extract-workflow-run-blocks.py', 'all run-command extractor'),
+    ('.github/workflows/security.yml .ci-run-blocks/security', 'security workflow run-block extraction'),
     ('System.Management.Automation.Language.Parser', 'real PowerShell parser'),
     ('bash -n "$file"', 'real Bash parser'),
     ('python3 tools/check_cli_parser_sync.py', 'CLI sync guard in preflight'),
     ('python3 tools/check_docs_api_sync.py', 'docs/API guard in preflight'),
     ('python3 tools/check_ci_invariants.py', 'CI invariant guard in preflight'),
+    ('python3 tools/check_security_invariants.py', 'security invariant guard in preflight'),
 ]:
     req(token, label)
 if not (ROOT / 'tools/ci/extract-workflow-run-blocks.py').is_file():
@@ -118,7 +132,7 @@ req('inline run step must declare shell: bash or pwsh', 'explicit shell guard fo
 for token, label in [
     ("group: ${{ github.workflow }}-${{ github.ref }}", 'workflow concurrency group'),
     ("cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}", 'do not cancel tagged releases'),
-    ("actions/setup-python@v7", 'pinned Windows Python 3.12 setup for ROCm wheels'),
+    ("actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0", 'pinned Windows Python 3.12 setup for ROCm wheels'),
     ("python-version: '3.12'", 'ROCm wheel Python version'),
 ]:
     req(token, label)
@@ -172,6 +186,16 @@ req('LD_LIBRARY_PATH="$scan_path" ldd', 'ROCm transitive closure SDK resolver')
 req("'librocm_kpack.so*'", 'Linux ROCm dynamically loaded kpack runtime')
 req('Expected exactly one %s kernel data directory', 'Linux ROCm kernel-data layout guard')
 forbid('tar -tzf s2-linux-x86_64-rocm.tar.gz | head', 'pipefail/SIGPIPE-prone ROCm tar preview')
+
+linux_single = (ROOT / 'tools/ci/make-linux-singlefile.sh').read_text(encoding='utf-8')
+for token, label in [
+    ('.s2-manifest.sha256', 'Linux runtime content manifest'),
+    ('S2_MANIFEST_SHA', 'embedded Linux manifest SHA'),
+    ('sha256sum -c --status .s2-manifest.sha256', 'per-file Linux cache verification'),
+    ('chmod 700', 'private Linux runtime cache directory'),
+]:
+    req(token, label, linux_single)
+
 
 # The old-Intel macOS build exists specifically for machines without Metal and
 # without modern x86 extensions. These explicit OFF values prevent GGML's
@@ -468,7 +492,7 @@ public_names = [
 ]
 for name in public_names:
     req(name, 'canonical public executable name')
-if text.count('uses: actions/upload-artifact@v7') < 20:
+if text.count('uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1') < 20:
     errors.append('expected ten success uploads plus ten diagnostic uploads')
 
 # Release fan-in and exact ten outputs.

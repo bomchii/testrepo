@@ -1,30 +1,56 @@
 # s2.cpp
 
-Run **Fish Audio S2 Pro** locally with C++17 and GGML.
+Run **Fish Audio S2 Pro** locally from a small C++/GGML runtime.
 
-`s2.cpp` can synthesize from the command line, run an HTTP/WebSocket server, clone voices from reference audio, save reusable `.s2voice` profiles, and run on CPU, Vulkan, CUDA, or Metal.
+`s2.cpp` can generate speech from the command line, run a local HTTP/WebSocket server, clone a voice from reference audio, save reusable `.s2voice` profiles, and use CPU, Vulkan, CUDA, ROCm/HIP, or Metal depending on the build you download.
 
-> [!WARNING]
-> This project is still alpha software. It has a lot of validation around malformed input and GGUF files, but it should not be treated as a security boundary. Test the backend you plan to use on the actual machine you plan to run it on.
+This is still an alpha project. The main goal right now is to make S2 Pro practical to run locally without hiding the rough edges: different backends really do behave differently, model files are large, and some Fish/OpenAI API features are only partially compatible. Start locally, use the backend that matches your hardware, and test the exact setup you plan to keep using.
 
-This fork is based on [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp). The main focus here is a practical local server, lower peak memory use, stable long-form synthesis, better Unicode handling, and keeping the four hardware backends isolated from each other.
+This fork started from [rodrigomatta/s2.cpp](https://github.com/rodrigomatta/s2.cpp). Most of the work here has gone into a usable local server, lower peak memory use, long-form synthesis, Unicode/text handling, voice reuse, streaming, and keeping the CPU/GPU backends isolated instead of trying to squeeze everything into one giant binary.
 
 Fish Audio S2 Pro model weights use the **Fish Audio Research License**. See [LICENSE.md](LICENSE.md) before redistributing models or using them commercially.
 
+## Contents
+
+- [Features](#features)
+- [Backends](#backends)
+- [Models](#models)
+- [Quick start](#quick-start)
+- [Device selection](#device-selection)
+- [Voice cloning](#voice-cloning)
+- [Long text and low-memory synthesis](#long-text-and-low-memory-synthesis)
+- [Text, languages, speakers, and segmentation](#text-languages-speakers-and-segmentation)
+- [HTTP server](#http-server)
+- [WebSocket streaming](#websocket-streaming)
+- [CLI reference](#cli-reference)
+- [CLI examples](#a-few-useful-cli-examples)
+- [Concurrency](#concurrency)
+- [Running it safely](#running-it-safely)
+- [Build](#build)
+- [Backend notes](#backend-notes)
+- [What has been tested](#what-has-been-tested)
+- [Known limitations](#known-limitations)
+- [Project layout](#project-layout)
+- [License](#license)
+
+GitHub also shows its own outline from these headings, so you can use either one to jump around.
+
 ## Features
 
-- CLI synthesis to WAV
-- HTTP synthesis with `/v1/tts`, `/v1/audio/speech`, and `/synthesize`
-- WebSocket PCM streaming
-- Reference-audio voice cloning
-- Saved `.s2voice` profiles
-- Long-form synthesis with bounded context and incremental WAV writing
-- Multi-speaker text with `<|speaker:N|>` tags
-- Expression instructions such as `[whisper]` or `[professional broadcast tone]`
-- UTF-8 text across CJK, Arabic, Hebrew, Cyrillic, Indic scripts, Armenian, Greek, Tibetan, and more
-- Separate CPU, Vulkan, CUDA, AMD (ROCm/HIP), and Metal builds
+The short version:
 
-There is no universal CPU+Vulkan+CUDA+AMD+Metal binary. Each backend is built separately on purpose.
+- synthesize directly from the CLI to WAV/RF64
+- run a local HTTP server with Fish-style, OpenAI-style, and legacy routes
+- stream PCM over WebSocket
+- clone a voice from WAV/MP3 reference audio
+- save and reuse `.s2voice` profiles
+- synthesize long text without keeping the whole output in RAM
+- use `<|speaker:N|>` tags for multi-speaker text
+- pass expression/style instructions such as `[whisper]` or `[professional broadcast tone]`
+- handle UTF-8 text across CJK, Arabic, Hebrew, Cyrillic, Indic scripts, Armenian, Greek, Tibetan, emoji, and more
+- choose a separate CPU, Vulkan, CUDA, AMD ROCm/HIP, or Metal build
+
+There is intentionally **no** universal CPU+Vulkan+CUDA+AMD+Metal executable. Each backend is built on its own so one toolchain does not quietly break another.
 
 ## Backends
 
@@ -399,14 +425,22 @@ A server with long-form defaults and a different port:
   --port 8081
 ```
 
-Use `--host 0.0.0.0` only when you intentionally want LAN access. There is no built-in authentication. If the server is reachable by untrusted clients, put authentication/access control and a real HTTP body limit in a reverse proxy in front of it.
+Local use stays zero-configuration: the default `127.0.0.1` bind does **not** require a token or any remote-access flag. Setting `S2_API_TOKEN` on loopback is optional and enables Bearer authentication if you want extra local protection. To expose s2 beyond localhost, you must opt in explicitly with `--allow-remote` **and** choose a non-loopback `--host`; remote binds additionally require `S2_API_TOKEN` (16..4096 visible non-space bytes), and HTTP/WebSocket clients must send `Authorization: Bearer <token>`. Browser-originated HTTP/WebSocket requests are accepted only when `Origin` is same-origin with `Host`; JSON POST routes require `Content-Type: application/json`. For LAN/public deployments, still put TLS, rate limiting, and a true pre-buffer HTTP body limit in a trusted reverse proxy.
+
+Example LAN launch/client (Bash):
+
+```bash
+export S2_API_TOKEN='replace-with-a-long-random-token'
+./s2-linux-cpu-x86-64 --model model.gguf --model-codec codec.gguf --allow-remote --host 0.0.0.0
+curl http://192.168.1.10:8080/v1/health -H "Authorization: Bearer $S2_API_TOKEN"
+```
 
 ### Endpoints
 
 | Method | Path | What it does |
 |---|---|---|
 | `POST` | `/v1/tts` | Fish-style synthesis endpoint |
-| `POST` | `/v1/tts/batch` | Batch synthesis; returns one base64 audio result per request |
+| `POST` | `/v1/tts/batch` | Batch synthesis; returns one Base64-encoded complete audio output per batch item inside JSON |
 | `POST` | `/v1/audio/speech` | OpenAI-style subset (`model`, `input`, local `voice`, `response_format`, `speed`) |
 | `POST` | `/synthesize` | Legacy synthesis alias |
 | `GET` | `/v1/models` | Local model entry |
@@ -459,9 +493,9 @@ curl -X POST http://127.0.0.1:8080/v1/tts/batch \
   -d '{"requests":[{"text":"First.","format":"wav"},{"text":"Second.","format":"opus","opus_bitrate":64}]}'
 ```
 
-Batch results are JSON objects containing `status`, `format`, and `audio_base64` for successful items. With `--workers N`, up to N items/requests can run model inference at once.
+`/v1/tts/batch` returns JSON because one batch can contain multiple independent synthesis results. For every successful item, `audio_base64` contains the **complete audio output bytes for that item**. Decode that Base64 value and, for `wav`, `rf64`, `mp3`, or `opus`, the result can be saved directly as the corresponding audio file (Opus is returned in an Ogg/Opus container). For `pcm`, the decoded value is raw mono PCM16 audio bytes rather than a self-describing container file. A batch with 10 requests therefore returns up to 10 independent audio outputs, in request order.
 
-Batching is request-level concurrency, not one tensor-batched transformer forward pass. The server caps concurrent batch tasks at the number of available pipeline workers and preserves the 32-item request limit.
+With `--workers N`, up to N items/requests can run model inference at once. Batching is request-level concurrency, not one tensor-batched transformer forward pass. Batch items run through one **global bounded worker pool** shared by all batch requests, so simultaneous batches cannot create an unbounded number of `std::async` threads. The 32-item request limit, aggregate token budget, and 128 MiB Base64-output budget still apply; queue saturation returns an item-level `503`.
 
 ### Windows PowerShell / `curl.exe`
 
@@ -624,7 +658,7 @@ A normal request can stay small:
 | `repetition_penalty` | HTTP + WS | Explicit repetition penalty `1.0..10.0`; `1.0` disables it. |
 | `repetition_window` | HTTP + WS | Recent-token window `0..32768`. |
 | `multi_turn_history` | HTTP + WS | Explicit prior text→VQ turns to retain, `0..1024`. |
-| `threads` | HTTP + WS | CPU thread count `1..256`. |
+| `threads` | HTTP + WS | CPU thread count; `1..256` syntactically, but a request cannot exceed the server startup `--threads` value (default `4`). |
 | `max_tokens` / `max_new_tokens` | HTTP + WS | Generation budget `1..32768`. If both are sent they must agree. Fish `max_new_tokens: 0` means no explicit Fish limit and is still context-clamped. |
 | `max_seg_tokens` | HTTP + WS | Per-segment generation cap `1..32768` when sentence segmentation is active. |
 | `min_end_tokens` | HTTP + WS | `0..32768`; minimum generated tokens before EOS and must remain below effective generation budget. |
@@ -669,8 +703,12 @@ The main synthesis routes use these status classes:
 - `200`: synthesis succeeded
 - `400`: malformed JSON, wrong field type/range, incompatible aliases, unsupported format/semantic field, invalid voice ID, etc.
 - `404`: a syntactically valid saved voice ID does not exist
-- `413`: JSON request body exceeds 8 MiB
-- `500`: model/codec/storage/runtime failure after request validation, including corrupt/unreadable saved voice data
+- `401`: Bearer token missing/incorrect when `S2_API_TOKEN` is active
+- `403`: browser `Origin` is not same-origin with the request `Host`
+- `413`: JSON request body exceeds 8 MiB or a bounded batch output/generation budget
+- `415`: JSON POST route was called without `Content-Type: application/json`
+- `503`: bounded batch/streaming work queue is temporarily full
+- `500`: model/codec/storage/runtime failure after request validation; internal exception/path details remain server-side
 
 ### Request-size note
 
@@ -678,7 +716,7 @@ JSON bodies/messages above 8 MiB are rejected, and `text`/`prompt_text` are each
 
 Crow 1.3.4 has already buffered the HTTP body by the time the route-level 8 MiB check runs. If you expose the server outside localhost and need a real pre-buffer HTTP body limit, put a reverse proxy in front of it and enforce the limit there.
 
-For WebSocket, Crow 1.3.4 enforces `websocket_max_payload` against the complete reassembled message, including fragmented messages. The application also checks the delivered JSON message size as defense in depth. Use a trusted reverse proxy/gateway for authentication and any stricter edge-level resource limits.
+For WebSocket, Crow 1.3.4 enforces `websocket_max_payload` against the complete reassembled message, including fragmented messages. s2 also checks the delivered JSON message size before parsing it. WebSocket upgrades use the same Bearer-token and browser-Origin checks as HTTP. Use a trusted reverse proxy/gateway for TLS, rate limiting, and any stricter edge-level resource limits.
 
 The server enables `CROW_ENFORCE_WS_SPEC`, so normal RFC 6455 client masking rules are enforced.
 
@@ -753,7 +791,12 @@ The common modes are simple:
 |---|---|---|
 | `-p <N>`, `--port <N>` | `8080` | TCP port `1..65535` |
 | `--host <host>` | `127.0.0.1` | Server-only IPv4/IPv6 literal or resolvable DNS hostname; resolved once when the server starts |
+| `--allow-remote` | off | Explicitly permits a non-loopback bind; remote binds also require `S2_API_TOKEN` |
 | `--workers <N>` | `1` | Server-only independent model/codec/KV replicas, `1..16`; values >1 enable parallel inference with roughly proportional memory use |
+| `--request-rate <N>` | `240` | Process-wide accepted HTTP/WS-message budget per minute, `1..100000` |
+| `--request-burst <N>` | `60` | Process-wide token-bucket burst capacity, `1..10000` |
+| `--max-http-inflight <N>` | `16` | Maximum simultaneous synthesis/voice-save HTTP requests, `1..4096`; excess work gets HTTP 503 |
+| `--max-ws-connections <N>` | `64` | Maximum accepted WebSocket connections, `1..4096`; excess handshakes get HTTP 503 |
 | `--ffmpeg <path>` | `S2_FFMPEG` or `ffmpeg` | Server-only ffmpeg executable used for HTTP MP3/Opus encoding |
 
 Server/network options are not resolved or validated in one-shot `--output` or save-only `--save-voice` mode; those modes do not start Crow.
@@ -889,13 +932,39 @@ s2 --model model.gguf --model-codec codec.gguf \
 
 Run `s2 --help` for the same option reference directly from the binary.
 
-## Concurrency and network safety
+## Concurrency
 
-With the default `--workers 1`, inference is serialized through one model/codec/KV pipeline exactly as before. `--workers N` creates N independent `Pipeline` replicas and schedules HTTP, WebSocket, voice-encoding, and batch work across them, so up to N inference jobs can execute in parallel. Because weights/codec/KV state are replicated, memory/VRAM use grows roughly with the worker count; increase it only when the machine has enough capacity.
+`--workers 1` keeps the old behavior: one model/codec/KV pipeline and one inference job at a time. `--workers N` creates N independent pipelines, so up to N inference jobs can run in parallel. That also means model/codec/KV memory is replicated, so RAM/VRAM use grows roughly with the worker count.
 
-The server binds to localhost because reference/voice endpoints can read paths from the machine running `s2`. If you bind to another interface, add authentication/access control in front of it before exposing it to an untrusted network.
+A request may lower its CPU `threads`, but it cannot raise that value above the server's startup `--threads` setting. The server also has process-wide request, in-flight HTTP, batch, and WebSocket limits so a burst of work does not turn into an unbounded number of threads or queued jobs.
 
-For public or LAN-facing deployments, a reverse proxy is also the right place to enforce a true pre-buffer HTTP body limit.
+The network-facing details are in [Running it safely](#running-it-safely).
+
+## Running it safely
+
+For normal local use, there is not much to configure. **Purely local use requires no token**: the server binds to `127.0.0.1` by default and works as-is. If you set `S2_API_TOKEN` yourself, Bearer authentication is also required on localhost.
+
+Remote access is deliberately harder to enable by accident. A non-loopback bind needs both `--allow-remote` and `S2_API_TOKEN`. Browser requests also go through Host/Origin checks, JSON routes require `Content-Type: application/json`, and the server has process-wide request, HTTP in-flight, WebSocket, batch, input-size, generation, and reference-audio limits.
+
+Those limits are useful guard rails, not an Internet edge. If you expose s2 to a LAN or the public Internet, put it behind a reverse proxy/gateway that handles TLS, **per-client/IP** rate and connection limits, access policy, and a request-body limit before Crow buffers the request.
+
+The repository also runs a few automated checks around this:
+
+- C/C++ CodeQL with the `security-extended` queries
+- libFuzzer smoke tests under ASan/UBSan for Base64, JSON, audio, and `.s2voice` parsing
+- Dependency Review on pull requests
+- immutable SHA pins for third-party GitHub Actions
+- artifact attestations for the same ten executables published in releases
+
+The vendored/runtime dependencies that GitHub cannot reliably discover from package metadata are listed in [`SECURITY_DEPENDENCIES.md`](SECURITY_DEPENDENCIES.md). Updates are still reviewed manually because this project is experimental and a harmless-looking dependency bump can break CUDA, ROCm, Vulkan, packaging, or older systems.
+
+If you downloaded a release from GitHub, you can verify that GitHub's workflow produced it:
+
+```bash
+gh attestation verify ./s2-linux-cpu-x86-64 --repo bomchii/testrepo
+```
+
+That verification is useful evidence about where the file came from. It does not replace normal code review, hashes, sandboxing, or testing on your own hardware.
 
 ## Build
 
@@ -921,7 +990,7 @@ cmake -S . -B build-cpu \
   -DS2_ASIO_INCLUDE_DIR=/path/to/asio/include
 ```
 
-The release workflow currently uses Crow 1.3.4 (security-fix release) and standalone Asio 1.30.2.
+The release workflow currently pins an immutable Crow commit whose CMake version is 1.3.4, plus standalone Asio 1.30.2. The dependency versions used by the release build, plus notes on why they are pinned, live in [`SECURITY_DEPENDENCIES.md`](SECURITY_DEPENDENCIES.md).
 
 Clone with submodules:
 
@@ -998,39 +1067,48 @@ A few implementation details are useful when debugging backend-specific problems
 - Streaming decode keeps bounded causal left context with exact frame-to-sample geometry; it does not require a future/right-edge holdback. Offline chunked decode retains its own overlap handling.
 - `--codec-overlap 0` means automatic codec-derived history, not “no overlap”.
 
-## Validation
+## What has been tested
 
-The source tree used for the V7.5 package was checked locally with:
+Before packaging the current tree, I run a fairly broad local test pass instead of relying only on “it compiled once”: 
 
-- strict C++17 warning/syntax passes for CPU, Vulkan, CUDA, and Metal variants
+- strict C++17 warning builds with GCC and Clang
 - Clang Static Analyzer on model/codec/pipeline code
-- ASan + UBSan regression tests for sampler, Unicode splitting, JSON surrogate handling, WAV I/O, prompt history, and tokenizer behavior
-- tokenizer differential tests across multilingual/emoji/RTL cases
-- root CMake plus both Windows-generated CMake files
-- strict YAML parsing and CI invariant checks
+- ASan + UBSan regression tests for sampling, Unicode splitting, JSON surrogate handling, WAV I/O, prompt history, tokenizer behavior, and server limits
+- multilingual/emoji/RTL tokenizer checks
+- root CMake plus the generated Windows CMake paths
+- YAML parsing and CI invariant checks
 - CUDA launcher/bundler manifest tests
-- README/`--help` CLI/API/route/cURL synchronization checks
-- clean ZIP re-extraction and byte/hash comparison
+- README/`--help`/route/cURL synchronization checks
+- checks for immutable Action pins, CodeQL, Dependency Review, fuzz targets, and release attestations
+- libFuzzer + ASan + UBSan runs for Base64, JSON Unicode, audio, and `.s2voice` parsers
+- clean ZIP extraction followed by byte/hash/permission comparison
 
-These checks are useful, but they are not the same thing as running every native compiler/driver combination. GitHub Actions and real Windows/Linux/macOS hardware are still the final check for MSVC, CUDA, Vulkan, Metal, driver behavior, ABI compatibility, and numerical output.
+That still does **not** replace the hosted matrix or real hardware. MSVC, CUDA, Vulkan, ROCm, Metal, drivers, ABI compatibility, and numerical behavior ultimately need the actual Windows/Linux/macOS jobs and the machines you care about.
 
 ## Known limitations
 
-- Still alpha software.
-- Fish Audio/OpenAI API compatibility is partial, not drop-in.
-- Buffered HTTP audio is returned after synthesis finishes; use `/ws/tts` for incremental PCM playback.
-- Voice quality depends heavily on reference quality and transcript accuracy.
-- Very aggressive quantization, tiny codec history, or tiny codec chunks can save memory at the cost of quality.
-- Backends and drivers can behave differently across machines. Test the hardware you intend to deploy.
+A few things are worth knowing before you build around this:
+
+- The project is still alpha and the API may keep moving.
+- Fish Audio/OpenAI compatibility is useful but not drop-in parity. Unsupported fields are rejected instead of being silently ignored where possible.
+- Buffered HTTP audio is returned after that request finishes. Use `/ws/tts` when you want incremental PCM playback.
+- Voice cloning quality depends a lot on the reference clip and how accurate its transcript is.
+- Very aggressive quantization, very small codec history, or very small codec chunks can save memory at the cost of quality.
+- GPU backends depend on drivers and vendor toolchains, so two machines with “the same GPU family” can still behave differently. Test the machine you actually plan to use.
 
 ## Project layout
 
+If you want to poke around the source, the useful places are:
+
 ```text
 include/                         Public C++ headers
-src/                             Tokenizer, model, codec, generation, pipeline, server/CLI
+src/                             Tokenizer, model, codec, generation, pipeline, server/CLI + limit tests
 third_party/                     Header-only/support dependencies
 ggml/                            GGML submodule
-.github/workflows/               Multi-backend CI
+.github/workflows/               Backend build/release CI + the separate CodeQL/fuzz workflow
+.github/codeql-config.yml        CodeQL scope for first-party C/C++ code
+fuzz/                            libFuzzer targets for Base64, JSON, audio and .s2voice parsing
+SECURITY_DEPENDENCIES.md         Notes on security-relevant vendored/runtime dependencies
 patch-cmake.ps1                  Windows CPU/Vulkan CI CMake preparation
 patch-cmake-cuda.ps1             Windows CUDA CI CMake preparation
 tools/ci/prepare-linux-deps.sh       Pinned Linux Crow/Asio/Vulkan build inputs

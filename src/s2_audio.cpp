@@ -93,6 +93,10 @@ static bool validate_riff_layout_memory(const unsigned char * data, size_t size)
         if (declared_total - pos < 8ull) return false;
         const auto * h = data + static_cast<size_t>(pos);
         const uint64_t chunk_size = read_le32_audio(h + 4);
+        // PCM/ADPCM WAV format chunks have a mandatory 16-byte base header.
+        // Reject undersized fmt chunks before dr_wav sees them. Besides being
+        // malformed, these have triggered upstream parser/fuzzer findings.
+        if (std::memcmp(h, "fmt ", 4) == 0 && chunk_size < 16ull) return false;
         uint64_t next = pos + 8ull + chunk_size;
         if (next < pos || next > declared_total) return false;
         if (chunk_size & 1u) {
@@ -181,6 +185,7 @@ static bool validate_riff_layout_file(const std::string & path) {
         if (declared_total - pos < 8ull || !seek_audio_file(f, pos) ||
             std::fread(chunk, 1, sizeof(chunk), f) != sizeof(chunk)) return false;
         const uint64_t chunk_size = read_le32_audio(chunk + 4);
+        if (std::memcmp(chunk, "fmt ", 4) == 0 && chunk_size < 16ull) return false;
         uint64_t next = pos + 8ull + chunk_size;
         if (next < pos || next > declared_total) return false;
         if (chunk_size & 1u) {
@@ -194,9 +199,10 @@ static bool validate_riff_layout_file(const std::string & path) {
 }
 
 static bool append_downmixed(const float * interleaved, size_t frames, unsigned int channels,
-                             AudioData & out) {
+                             AudioData & out, size_t max_frames = MAX_DECODED_MONO_FRAMES) {
+    max_frames = std::min(max_frames, MAX_DECODED_MONO_FRAMES);
     if (!interleaved || channels == 0 || channels > MAX_AUDIO_CHANNELS ||
-        frames > MAX_DECODED_MONO_FRAMES - out.samples.size()) return false;
+        out.samples.size() > max_frames || frames > max_frames - out.samples.size()) return false;
     const size_t old = out.samples.size();
     out.samples.resize(old + frames);
     if (channels == 1) {
@@ -221,10 +227,16 @@ static bool append_downmixed(const float * interleaved, size_t frames, unsigned 
     return true;
 }
 
-static bool decode_wav_stream(drwav & wav, AudioData & out) {
+static size_t decode_frame_limit(unsigned int sample_rate, int32_t max_seconds) noexcept {
+    if (max_seconds <= 0) return MAX_DECODED_MONO_FRAMES;
+    const uint64_t requested = static_cast<uint64_t>(sample_rate) * static_cast<uint64_t>(max_seconds);
+    return static_cast<size_t>(std::min<uint64_t>(requested, MAX_DECODED_MONO_FRAMES));
+}
+
+static bool decode_wav_stream(drwav & wav, AudioData & out, int32_t max_seconds = 0) {
+    const size_t max_frames = decode_frame_limit(wav.sampleRate, max_seconds);
     if (wav.channels == 0 || wav.channels > MAX_AUDIO_CHANNELS || wav.sampleRate < 1000u ||
-        wav.sampleRate > 768000u ||
-        wav.totalPCMFrameCount > MAX_DECODED_MONO_FRAMES) return false;
+        wav.sampleRate > 768000u || wav.totalPCMFrameCount > max_frames) return false;
     out.sample_rate = static_cast<int32_t>(wav.sampleRate);
     out.samples.clear();
     out.samples.reserve(static_cast<size_t>(wav.totalPCMFrameCount));
@@ -235,16 +247,17 @@ static bool decode_wav_stream(drwav & wav, AudioData & out) {
             AUDIO_DECODE_CHUNK_FRAMES, wav.totalPCMFrameCount - total);
         const drwav_uint64 got = drwav_read_pcm_frames_f32(&wav, want, chunk.data());
         if (got == 0) break;
-        if (!append_downmixed(chunk.data(), static_cast<size_t>(got), wav.channels, out)) return false;
+        if (!append_downmixed(chunk.data(), static_cast<size_t>(got), wav.channels, out, max_frames)) return false;
         total += got;
     }
     return total == wav.totalPCMFrameCount;
 }
 
-static bool decode_mp3_stream(drmp3 & mp3, AudioData & out) {
+static bool decode_mp3_stream(drmp3 & mp3, AudioData & out, int32_t max_seconds = 0) {
+    const size_t max_frames = decode_frame_limit(mp3.sampleRate, max_seconds);
     if (mp3.channels == 0 || mp3.channels > MAX_AUDIO_CHANNELS || mp3.sampleRate < 1000u ||
         mp3.sampleRate > 768000u) return false;
-    if (mp3.totalPCMFrameCount != DRMP3_UINT64_MAX && mp3.totalPCMFrameCount > MAX_DECODED_MONO_FRAMES)
+    if (mp3.totalPCMFrameCount != DRMP3_UINT64_MAX && mp3.totalPCMFrameCount > max_frames)
         return false;
     out.sample_rate = static_cast<int32_t>(mp3.sampleRate);
     out.samples.clear();
@@ -254,13 +267,13 @@ static bool decode_mp3_stream(drmp3 & mp3, AudioData & out) {
     for (;;) {
         const drmp3_uint64 got = drmp3_read_pcm_frames_f32(&mp3, AUDIO_DECODE_CHUNK_FRAMES, chunk.data());
         if (got == 0) break;
-        if (!append_downmixed(chunk.data(), static_cast<size_t>(got), mp3.channels, out)) return false;
+        if (!append_downmixed(chunk.data(), static_cast<size_t>(got), mp3.channels, out, max_frames)) return false;
     }
     return !out.samples.empty();
 }
 } // namespace
 
-bool audio_read(const std::string & path, AudioData & out) {
+static bool audio_read_impl(const std::string & path, AudioData & out, int32_t max_seconds) {
     out.samples.clear();
     out.sample_rate = 0;
     if (path.empty()) return false;
@@ -285,7 +298,7 @@ bool audio_read(const std::string & path, AudioData & out) {
         wav_open = drwav_init_file(&wav, path.c_str(), nullptr) != 0;
 #endif
         if (wav_open) {
-            const bool ok = decode_wav_stream(wav, out);
+            const bool ok = decode_wav_stream(wav, out, max_seconds);
             drwav_uninit(&wav);
             if (!ok) { out = {}; return false; }
             return true;
@@ -299,7 +312,7 @@ bool audio_read(const std::string & path, AudioData & out) {
         mp3_open = drmp3_init_file(&mp3, path.c_str(), nullptr) != 0;
 #endif
         if (mp3_open) {
-            const bool ok = decode_mp3_stream(mp3, out);
+            const bool ok = decode_mp3_stream(mp3, out, max_seconds);
             drmp3_uninit(&mp3);
             if (!ok) { out = {}; return false; }
             return true;
@@ -314,7 +327,7 @@ bool audio_read(const std::string & path, AudioData & out) {
     return false;
 }
 
-bool audio_read_from_memory(const void * in_data, size_t in_data_size, AudioData & out) {
+static bool audio_read_from_memory_impl(const void * in_data, size_t in_data_size, AudioData & out, int32_t max_seconds) {
     out.samples.clear();
     out.sample_rate = 0;
     if (!in_data || in_data_size == 0 || in_data_size > MAX_AUDIO_MEMORY_INPUT) return false;
@@ -322,7 +335,7 @@ bool audio_read_from_memory(const void * in_data, size_t in_data_size, AudioData
     try {
         drwav wav{};
         if (drwav_init_memory(&wav, in_data, in_data_size, nullptr)) {
-            const bool ok = decode_wav_stream(wav, out);
+            const bool ok = decode_wav_stream(wav, out, max_seconds);
             drwav_uninit(&wav);
             if (!ok) { out = {}; return false; }
             return true;
@@ -330,7 +343,7 @@ bool audio_read_from_memory(const void * in_data, size_t in_data_size, AudioData
 
         drmp3 mp3{};
         if (drmp3_init_memory(&mp3, in_data, in_data_size, nullptr)) {
-            const bool ok = decode_mp3_stream(mp3, out);
+            const bool ok = decode_mp3_stream(mp3, out, max_seconds);
             drmp3_uninit(&mp3);
             if (!ok) { out = {}; return false; }
             return true;
@@ -342,6 +355,14 @@ bool audio_read_from_memory(const void * in_data, size_t in_data_size, AudioData
 
     std::fprintf(stderr, "[s2_audio] failed to decode audio from memory\n");
     return false;
+}
+
+bool audio_read(const std::string & path, AudioData & out) {
+    return audio_read_impl(path, out, 0);
+}
+
+static bool audio_read_from_memory(const void * data, size_t bytes, AudioData & out) {
+    return audio_read_from_memory_impl(data, bytes, out, 0);
 }
 
 bool audio_write_wav(const std::string & path, const float * data, size_t n_samples, int32_t sample_rate) {
@@ -621,6 +642,35 @@ bool load_audio_from_memory(const void * data, size_t bytes, AudioData & out, in
     if (target_sample_rate > 0 && out.sample_rate != target_sample_rate) {
         auto resampled = audio_resample(out.samples.data(), out.samples.size(), out.sample_rate, target_sample_rate);
         if (resampled.empty()) return false;
+        out.samples = std::move(resampled);
+        out.sample_rate = target_sample_rate;
+    }
+    return true;
+}
+
+bool load_audio_limited(const std::string & path, AudioData & out, int32_t target_sample_rate, int32_t max_seconds) {
+    if (max_seconds <= 0 || target_sample_rate < 0 || target_sample_rate > 768000 ||
+        (target_sample_rate != 0 && target_sample_rate < 1000)) return false;
+    if (!audio_read_impl(path, out, max_seconds) || out.sample_rate <= 0 || out.samples.empty()) return false;
+    if (target_sample_rate > 0 && out.sample_rate != target_sample_rate) {
+        auto resampled = audio_resample(out.samples.data(), out.samples.size(), out.sample_rate, target_sample_rate);
+        const uint64_t max_out = static_cast<uint64_t>(target_sample_rate) * static_cast<uint64_t>(max_seconds);
+        if (resampled.empty() || static_cast<uint64_t>(resampled.size()) > max_out) return false;
+        out.samples = std::move(resampled);
+        out.sample_rate = target_sample_rate;
+    }
+    return true;
+}
+
+bool load_audio_from_memory_limited(const void * data, size_t bytes, AudioData & out,
+                                    int32_t target_sample_rate, int32_t max_seconds) {
+    if (max_seconds <= 0 || target_sample_rate < 0 || target_sample_rate > 768000 ||
+        (target_sample_rate != 0 && target_sample_rate < 1000)) return false;
+    if (!audio_read_from_memory_impl(data, bytes, out, max_seconds) || out.sample_rate <= 0 || out.samples.empty()) return false;
+    if (target_sample_rate > 0 && out.sample_rate != target_sample_rate) {
+        auto resampled = audio_resample(out.samples.data(), out.samples.size(), out.sample_rate, target_sample_rate);
+        const uint64_t max_out = static_cast<uint64_t>(target_sample_rate) * static_cast<uint64_t>(max_seconds);
+        if (resampled.empty() || static_cast<uint64_t>(resampled.size()) > max_out) return false;
         out.samples = std::move(resampled);
         out.sample_rate = target_sample_rate;
     }

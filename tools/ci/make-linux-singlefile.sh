@@ -13,9 +13,20 @@ case "$cache_tag" in (*[!A-Za-z0-9._-]*|'') echo "unsafe cache tag: $cache_tag" 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 archive="$work/payload.tar.gz"
+stage="$work/stage"
+mkdir -p "$stage"
+cp -a "$payload_dir/." "$stage/"
+(
+  cd "$stage"
+  : > .s2-manifest.sha256
+  while IFS= read -r -d '' file; do
+    sha256sum "$file" >> .s2-manifest.sha256
+  done < <(find . -mindepth 1 ! -name '.s2-manifest.sha256' \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
+)
+manifest_sha="$(sha256sum "$stage/.s2-manifest.sha256" | awk '{print $1}')"
 # Deterministic archive. GNU tar on the CI baselines accepts these options.
 (
-  cd "$payload_dir"
+  cd "$stage"
   find . -mindepth 1 -print0 | LC_ALL=C sort -z | \
     tar --null --no-recursion --owner=0 --group=0 --numeric-owner \
         --mtime='1970-01-01 00:00:00 UTC' -T - -cf "$work/payload.tar"
@@ -29,6 +40,7 @@ cat > "$output" <<EOF_HEADER
 set -euo pipefail
 S2_PAYLOAD_SHA='$payload_sha'
 S2_PAYLOAD_SIZE='$payload_size'
+S2_MANIFEST_SHA='$manifest_sha'
 S2_CORE_NAME='$core_name'
 S2_CACHE_TAG='$cache_tag'
 marker='__S2_EMBEDDED_RUNTIME_BELOW__'
@@ -39,8 +51,12 @@ complete="\$cache/.complete"
 payload_line="\$(awk -v m="\$marker" '\$0==m {print NR+1; exit}' "\$self")"
 [[ -n "\$payload_line" ]] || { echo 's2 launcher: embedded runtime marker missing' >&2; exit 111; }
 verify_cache() {
-  [[ -d "\$cache" && -x "\$cache/\$S2_CORE_NAME" && -f "\$complete" ]] || return 1
+  [[ -d "\$cache" && -x "\$cache/\$S2_CORE_NAME" && -f "\$complete" && -f "\$cache/.s2-manifest.sha256" ]] || return 1
   [[ "\$(cat "\$complete" 2>/dev/null || true)" == "\$S2_PAYLOAD_SHA" ]] || return 1
+  local manifest_actual
+  manifest_actual="\$(sha256sum "\$cache/.s2-manifest.sha256" 2>/dev/null | awk '{print \$1}')" || return 1
+  [[ "\$manifest_actual" == "\$S2_MANIFEST_SHA" ]] || return 1
+  (cd "\$cache" && sha256sum -c --status .s2-manifest.sha256) || return 1
 }
 if [[ "\${1:-}" == '--runtime-info' ]]; then
   printf 'bundle_sha256: %s\\ncache: %s\\npayload_size: %s\\ncache_valid: %s\\n' "\$S2_PAYLOAD_SHA" "\$cache" "\$S2_PAYLOAD_SIZE" "\$(verify_cache && echo yes || echo no)"
@@ -52,6 +68,7 @@ if [[ "\${1:-}" == '--clean-runtime' ]]; then
   exit 0
 fi
 mkdir -p "\$cache_base"
+chmod 700 "\$cache_base" 2>/dev/null || true
 lock="\$cache.lock"
 for _ in \$(seq 1 300); do
   if mkdir "\$lock" 2>/dev/null; then
@@ -61,6 +78,7 @@ for _ in \$(seq 1 300); do
       tmp="\$cache.tmp.\$\$"
       rm -rf -- "\$tmp"
       mkdir -p "\$tmp"
+      chmod 700 "\$tmp" 2>/dev/null || true
       packed="\$tmp.payload.tar.gz"
       tail -n +"\$payload_line" "\$self" > "\$packed"
       actual="\$(sha256sum "\$packed" | awk '{print \$1}')"

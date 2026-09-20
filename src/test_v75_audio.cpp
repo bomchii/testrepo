@@ -59,5 +59,14 @@ int main(){
    assert(!s2::base64_decode(bad, decoded));
  }
 
+ // Security regression: reject an undersized RIFF fmt chunk before invoking
+ // dr_wav. A valid WAV fmt base header is at least 16 bytes.
+ const unsigned char bad_fmt_wav[] = {
+   'R','I','F','F', 12,0,0,0, 'W','A','V','E',
+   'f','m','t',' ', 0,0,0,0
+ };
+ s2::AudioData malformed;
+ assert(!s2::load_audio_from_memory_limited(bad_fmt_wav, sizeof(bad_fmt_wav), malformed, 44100, 30));
+
  std::cout<<"AUDIO_WRITE_TEST_PASS\n";
 }

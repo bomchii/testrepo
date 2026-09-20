@@ -27,8 +27,9 @@ crow_commit="ae0fef0ee67eec897e401321b99b6dd7cfbdc155"
 asio_sha256="755bd7f85a4b269c67ae0ea254907c078d408cce8e1a352ad2ed664d233780e8"
 
 if [[ ! -f "$deps/crow/include/crow.h" ]]; then
-  # Crow 1.3.4 fixes the fragmented-WebSocket payload-limit bypass and other
-  # security issues. Use the immutable release commit rather than a movable tag.
+  # This immutable Crow commit reports VERSION 1.3.4 and includes the
+  # WebSocket payload/accounting fixes relied on by the server. Pin the commit
+  # itself rather than a movable branch/tag.
   fetch_tar \
     "https://github.com/CrowCpp/Crow/archive/${crow_commit}.tar.gz" \
     "$deps/crow.tar.gz" "$deps/crow-src"

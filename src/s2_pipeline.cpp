@@ -519,7 +519,7 @@ bool Pipeline::init(const PipelineParams & params) {
         AudioData ra;
         std::vector<int32_t> rc;
         int32_t Tp = 0;
-        if (load_audio(ref_wav, ra, codec_.sample_rate()) &&
+        if (load_audio_limited(ref_wav, ra, codec_.sample_rate(), MAX_REFERENCE_AUDIO_SECONDS) &&
             reference_audio_within_limit(ra, codec_.sample_rate()) &&
             ra.samples.size() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()) &&
             codec_.encode(ra.samples.data(), static_cast<int32_t>(ra.samples.size()),
@@ -858,7 +858,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         }
 
         AudioData ra;
-        if (!load_audio(params.prompt_audio_path, ra, codec_.sample_rate()) || ra.samples.empty()) {
+        if (!load_audio_limited(params.prompt_audio_path, ra, codec_.sample_rate(), MAX_REFERENCE_AUDIO_SECONDS) || ra.samples.empty()) {
             std::cerr << "[VoiceCache] Error loading audio: " << params.prompt_audio_path << "\n";
             return false;
         }
@@ -1032,7 +1032,7 @@ bool Pipeline::get_ref_codes(const PipelineParams & params,
         std::string transcript;
         for (const auto & ref : params.inline_references) {
             AudioData ra;
-            if (!load_audio_from_memory(ref.audio.data(), ref.audio.size(), ra, codec_.sample_rate()) || ra.samples.empty() ||
+            if (!load_audio_from_memory_limited(ref.audio.data(), ref.audio.size(), ra, codec_.sample_rate(), MAX_REFERENCE_AUDIO_SECONDS) || ra.samples.empty() ||
                 !reference_audio_within_limit(ra, codec_.sample_rate()) ||
                 ra.samples.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
                 std::cerr << "[Voice] Invalid/too-long inline reference audio.\n"; return false;

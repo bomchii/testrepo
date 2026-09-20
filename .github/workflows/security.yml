@@ -1,0 +1,143 @@
+name: Security - CodeQL, fuzzing, dependency review
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  codeql:
+    name: CodeQL C/C++
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          languages: c-cpp
+          build-mode: none
+          config-file: ./.github/codeql-config.yml
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          category: /language:c-cpp
+
+  fuzz-smoke:
+    name: Sanitizer fuzz smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Build fuzz targets with libFuzzer + ASan + UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-fuzz corpus/base64 corpus/json corpus/audio corpus/voice fuzz-artifacts/{base64,json,audio,voice}
+          common=(-std=c++17 -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined -Wall -Wextra -Wpedantic -Werror)
+          clang++ "${common[@]}" fuzz/base64_fuzz.cpp -o build-fuzz/base64_fuzz
+          clang++ "${common[@]}" fuzz/json_fuzz.cpp src/s2_json.cpp -o build-fuzz/json_fuzz
+          clang++ "${common[@]}" fuzz/audio_fuzz.cpp src/s2_audio.cpp -o build-fuzz/audio_fuzz
+          clang++ "${common[@]}" -pthread fuzz/voice_fuzz.cpp src/s2_voice.cpp -o build-fuzz/voice_fuzz
+          clang++ -std=c++17 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined \
+            -Wall -Wextra -Wpedantic -Werror -pthread \
+            src/test_server_limits.cpp -o build-fuzz/test_server_limits
+
+      - name: Run bounded fuzz smoke corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'SGVsbG8=' > corpus/base64/valid.txt
+          printf '{"text":"hello","emoji":"\\uD83D\\uDE00"}' > corpus/json/valid.json
+          printf 'RIFF' > corpus/audio/riff.bin
+          python3 - <<'PY_SEED'
+          import struct
+          with open('corpus/voice/valid.s2voice', 'wb') as f:
+              transcript = b'hello\0'
+              codes = struct.pack('<i', 0)
+              f.write(b'S2VOICE\0')
+              f.write(struct.pack('<IiiiiQQ', 1, 1, 1, 44100, 4096, len(transcript), len(codes)))
+              f.write(transcript)
+              f.write(codes)
+          PY_SEED
+          build-fuzz/test_server_limits
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+            build-fuzz/base64_fuzz corpus/base64 -runs=10000 -max_len=1048576 -timeout=5 -artifact_prefix=fuzz-artifacts/base64/
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+            build-fuzz/json_fuzz corpus/json -runs=10000 -max_len=1048576 -timeout=5 -artifact_prefix=fuzz-artifacts/json/
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+            build-fuzz/audio_fuzz corpus/audio -runs=5000 -max_len=2097152 -timeout=5 -artifact_prefix=fuzz-artifacts/audio/
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+            build-fuzz/voice_fuzz corpus/voice -runs=3000 -max_len=1048576 -timeout=5 -artifact_prefix=fuzz-artifacts/voice/
+
+      - name: Run extended scheduled fuzzing
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ASAN_OPTIONS=detect_leaks=1:halt_on_error=1
+          export UBSAN_OPTIONS=halt_on_error=1
+          build-fuzz/base64_fuzz corpus/base64 -max_total_time=30 -max_len=1048576 -timeout=5 -artifact_prefix=fuzz-artifacts/base64/
+          build-fuzz/json_fuzz corpus/json -max_total_time=30 -max_len=1048576 -timeout=5 -artifact_prefix=fuzz-artifacts/json/
+          build-fuzz/audio_fuzz corpus/audio -max_total_time=30 -max_len=2097152 -timeout=5 -artifact_prefix=fuzz-artifacts/audio/
+          build-fuzz/voice_fuzz corpus/voice -max_total_time=30 -max_len=1048576 -timeout=5 -artifact_prefix=fuzz-artifacts/voice/
+
+      - name: Upload fuzz crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-fuzz-crash-reproducers
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          license-check: false
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 120

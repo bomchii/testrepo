@@ -36,6 +36,11 @@ std::vector<float> audio_trim_trailing_silence(const float * data, size_t n_samp
 // Helper wrappers used by the pipeline
 bool load_audio(const std::string & path, AudioData & out, int32_t target_sample_rate = 0);
 bool load_audio_from_memory(const void * data, size_t bytes, AudioData & out, int32_t target_sample_rate = 0);
+// Reference-audio variants that enforce duration while decoding, before a
+// compressed input can expand into an oversized PCM allocation.
+bool load_audio_limited(const std::string & path, AudioData & out, int32_t target_sample_rate, int32_t max_seconds);
+bool load_audio_from_memory_limited(const void * data, size_t bytes, AudioData & out,
+                                    int32_t target_sample_rate, int32_t max_seconds);
 bool save_audio(const std::string & path, const std::vector<float> & data, int32_t sample_rate,
                 bool trim_silence = false, bool normalize_peak = false);
 

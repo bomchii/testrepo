@@ -2,6 +2,7 @@
 #include "s2_json.h"
 #include "s2_utf8.h"
 #include "base64.h"
+#include "server_limits.h"
 #if defined(GGML_USE_HIP)
 #  include <hip/hip_runtime.h>
 #elif defined(GGML_USE_CUDA)
@@ -14,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cstring>
 #include <thread>
@@ -33,6 +35,7 @@
 #include <functional>
 #include <utility>
 #include <deque>
+#include <optional>
 #include <cstdlib>
 #include <cerrno>
 
@@ -195,6 +198,102 @@ static bool resolve_bind_host(const std::string & value, std::string & resolved)
     }
     freeaddrinfo(result);
     return ok;
+}
+
+static bool is_loopback_address_literal(const std::string & value) noexcept {
+    in_addr ipv4{};
+    if (inet_pton(AF_INET, value.c_str(), &ipv4) == 1) {
+        return reinterpret_cast<const unsigned char *>(&ipv4)[0] == 127u;
+    }
+    in6_addr ipv6{};
+    if (inet_pton(AF_INET6, value.c_str(), &ipv6) == 1) {
+        static const unsigned char loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+        return std::memcmp(&ipv6, loopback, sizeof(loopback)) == 0;
+    }
+    return false;
+}
+
+static bool api_token_is_safe(std::string_view value) noexcept {
+    if (value.size() < 16u || value.size() > 4096u) return false;
+    for (unsigned char c : value) if (c <= 0x20u || c == 0x7fu) return false;
+    return true;
+}
+
+static bool constant_time_equal(std::string_view a, std::string_view b) noexcept {
+    const size_t n = std::max(a.size(), b.size());
+    unsigned int diff = static_cast<unsigned int>(a.size() ^ b.size());
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char av = i < a.size() ? static_cast<unsigned char>(a[i]) : 0u;
+        const unsigned char bv = i < b.size() ? static_cast<unsigned char>(b[i]) : 0u;
+        diff |= static_cast<unsigned int>(av ^ bv);
+    }
+    return diff == 0u;
+}
+
+static std::string ascii_lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+static bool request_has_json_content_type(const crow::request & req) {
+    std::string value = req.get_header_value("Content-Type");
+    if (value.empty()) return false;
+    const size_t semi = value.find(';');
+    if (semi != std::string::npos) value.resize(semi);
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+    size_t first = 0;
+    while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first]))) ++first;
+    value.erase(0, first);
+    return ascii_lower_copy(value) == "application/json";
+}
+
+static bool request_has_bearer_token(const crow::request & req, std::string_view expected) noexcept {
+    if (expected.empty()) return true;
+    try {
+        const std::string auth = req.get_header_value("Authorization");
+        constexpr std::string_view prefix = "Bearer ";
+        if (auth.size() <= prefix.size() || auth.compare(0, prefix.size(), prefix.data(), prefix.size()) != 0) return false;
+        return constant_time_equal(std::string_view(auth).substr(prefix.size()), expected);
+    } catch (...) { return false; }
+}
+
+static bool split_authority_host(const std::string & authority, std::string & host) {
+    host.clear();
+    if (authority.empty() || authority.find('@') != std::string::npos) return false;
+    if (authority.front() == '[') {
+        const size_t close = authority.find(']');
+        if (close == std::string::npos) return false;
+        host = authority.substr(1, close - 1);
+        if (close + 1 < authority.size() && authority[close + 1] != ':') return false;
+    } else {
+        const size_t first_colon = authority.find(':');
+        const size_t last_colon = authority.rfind(':');
+        if (first_colon != std::string::npos && first_colon != last_colon) return false;
+        host = authority.substr(0, first_colon);
+    }
+    host = ascii_lower_copy(host);
+    while (!host.empty() && host.back() == '.') host.pop_back();
+    return !host.empty();
+}
+
+static bool request_origin_allowed(const crow::request & req, bool loopback_bind) {
+    const std::string origin = req.get_header_value("Origin");
+    if (origin.empty()) return true;
+    const std::string lower = ascii_lower_copy(origin);
+    size_t start = std::string::npos;
+    if (lower.rfind("http://", 0) == 0) start = 7;
+    else if (lower.rfind("https://", 0) == 0) start = 8;
+    else return false;
+    const size_t end = origin.find('/', start);
+    const std::string authority = origin.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    const std::string request_host = req.get_header_value("Host");
+    if (authority.empty() || request_host.empty() || ascii_lower_copy(authority) != ascii_lower_copy(request_host)) return false;
+    if (!loopback_bind) return true;
+    std::string host;
+    if (!split_authority_host(authority, host)) return false;
+    if (host == "localhost" || host == "::1") return true;
+    in_addr ipv4{};
+    return inet_pton(AF_INET, host.c_str(), &ipv4) == 1 && reinterpret_cast<const unsigned char *>(&ipv4)[0] == 127u;
 }
 
 static float parse_float_arg(const char * raw) {
@@ -880,11 +979,16 @@ int main(int argc, char** argv) {
 
     int port = 8080;
     int server_workers = 1;
+    int request_rate_per_minute = 240;
+    int request_burst = 60;
+    int max_http_inflight = 16;
+    int max_ws_connections = 64;
     std::string ffmpeg_bin = "ffmpeg";
     if (const char * env_ffmpeg = std::getenv("S2_FFMPEG"); env_ffmpeg && *env_ffmpeg) ffmpeg_bin = env_ffmpeg;
     // Crow defaults to 0.0.0.0. This API accepts local filesystem paths for
     // reference audio, so bind to loopback unless the user explicitly opts in.
     std::string bind_host = "127.0.0.1";
+    bool allow_remote = false;
     bool list_voices = false;
     bool normalize_cli_explicit = false;
 
@@ -975,8 +1079,18 @@ int main(int argc, char** argv) {
             port = parse_int_arg(argv[++i]);
         } else if (arg == "--host" && i + 1 < argc) {
             bind_host = argv[++i];
+        } else if (arg == "--allow-remote") {
+            allow_remote = true;
         } else if (arg == "--workers" && i + 1 < argc) {
             server_workers = parse_int_arg(argv[++i]);
+        } else if (arg == "--request-rate" && i + 1 < argc) {
+            request_rate_per_minute = parse_int_arg(argv[++i]);
+        } else if (arg == "--request-burst" && i + 1 < argc) {
+            request_burst = parse_int_arg(argv[++i]);
+        } else if (arg == "--max-http-inflight" && i + 1 < argc) {
+            max_http_inflight = parse_int_arg(argv[++i]);
+        } else if (arg == "--max-ws-connections" && i + 1 < argc) {
+            max_ws_connections = parse_int_arg(argv[++i]);
         } else if (arg == "--ffmpeg" && i + 1 < argc) {
             ffmpeg_bin = argv[++i];
         } else if ((arg == "-threads" || arg == "--threads") && i + 1 < argc) {
@@ -1134,10 +1248,19 @@ ALL COMMAND-LINE OPTIONS:
     -p, --port <N>                Listen port. Default: 8080. Range: 1..65535.
         --host <name-or-IP>       Server-only bind IPv4/IPv6 literal or DNS hostname.
                                   Default: 127.0.0.1. Hostnames resolve at server startup.
-                                  Use 0.0.0.0 only for intentional LAN exposure.
+        --allow-remote            Explicitly permit a non-loopback --host. Remote binds
+                                  also require S2_API_TOKEN + Bearer authentication.
+                                  Localhost does not require this flag or a token.
         --workers <N>             Server-only independent pipeline replicas for
                                   concurrent inference. Default: 1. Range: 1..16. Model/codec
                                   memory usage scales roughly with worker count.
+        --request-rate <N>        Process-wide accepted-request budget per minute.
+                                  Default: 240. Range: 1..100000. Applies to HTTP and WS messages.
+        --request-burst <N>       Token-bucket burst capacity. Default: 60. Range: 1..10000.
+        --max-http-inflight <N>   Maximum simultaneous synthesis/voice-save HTTP requests.
+                                  Default: 16. Range: 1..4096. Excess requests get HTTP 503.
+        --max-ws-connections <N>  Maximum accepted WebSocket connections. Default: 64.
+                                  Range: 1..4096. Excess handshakes get HTTP 503.
         --ffmpeg <path>           Server-only ffmpeg executable used for HTTP MP3/Opus output.
                                   Default: S2_FFMPEG or ffmpeg from PATH.
 
@@ -1280,7 +1403,10 @@ SERVER ENDPOINTS (default mode):
   GET  /v1/health                Fish Speech-compatible JSON health check.
   GET  /v1/models                Local model service entry.
   POST /v1/tts                   Fish-Audio-style synthesis.
-  POST /v1/tts/batch             Batch synthesis (1..32 items, base64 results).
+  POST /v1/tts/batch             Batch synthesis (1..32 items).
+                                  JSON returns one base64 audio output per item;
+                                  decode to a complete WAV/RF64/MP3/Ogg-Opus file
+                                  (PCM format returns raw mono PCM16 bytes).
   POST /v1/audio/speech          OpenAI-style synthesis subset.
   POST /synthesize               Legacy synthesis alias.
   GET  /v1/voices                List saved voices.
@@ -1359,12 +1485,17 @@ HTTP/WS SYNTHESIS FIELDS:
   Fish requests default normalize=true unless CLI normalization was explicitly
   selected; use_memory_cache defaults off per Fish request.
   Application request/message limit: 8 MiB; text and prompt_text: 1 MiB each.
-  Crow 1.3.4 buffers HTTP bodies before route handlers; for a pre-buffer HTTP
-  limit on non-loopback deployments, enforce a body limit in the reverse proxy.
-  Crow 1.3.4 applies the WebSocket payload limit to the complete reassembled
-  message, including fragmented messages; the app checks JSON size again.
-  There is no built-in authentication. Put authentication/access control in a
-  reverse proxy before exposing a non-loopback bind to untrusted clients.
+  JSON POST routes require Content-Type: application/json. Browser requests with
+  Origin must be same-origin with Host. Localhost needs no token by default. A
+  non-loopback bind requires BOTH --allow-remote and S2_API_TOKEN (16..4096
+  visible non-space bytes); clients must send Authorization: Bearer <token>.
+  Setting S2_API_TOKEN on loopback enables optional Bearer auth there too. Built-in
+  request-rate/in-flight/WebSocket limits are process-wide safety rails, not per-IP
+  fairness controls. Crow buffers HTTP bodies before route handlers, so use a reverse
+  proxy for a true pre-buffer body limit, TLS, and per-client/IP rate/connection
+  limits on LAN/public deployments. Crow 1.3.4 applies the WebSocket payload limit to the complete
+  reassembled message, including fragmented messages; the WebSocket upgrade uses
+  the same auth/Origin policy.
   WebSocket clients must follow RFC 6455 masking; non-conforming clients close.
 
 WEBSOCKET /ws/tts OUTPUT:
@@ -1428,6 +1559,8 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // modes below.
     const bool will_start_server = params.output_path.empty() && !params.save_voice;
     std::string resolved_bind_host = bind_host;
+    bool server_loopback_bind = true;
+    std::string server_api_token;
     if (will_start_server) {
         if (port < 1 || port > 65535) {
             std::cerr << "Error: port must be between 1 and 65535.\n";
@@ -1437,12 +1570,43 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             std::cerr << "Error: --workers must be between 1 and 16.\n";
             return 1;
         }
+        if (request_rate_per_minute < 1 || request_rate_per_minute > 100000) {
+            std::cerr << "Error: --request-rate must be between 1 and 100000 per minute.\n";
+            return 1;
+        }
+        if (request_burst < 1 || request_burst > 10000) {
+            std::cerr << "Error: --request-burst must be between 1 and 10000.\n";
+            return 1;
+        }
+        if (max_http_inflight < 1 || max_http_inflight > 4096) {
+            std::cerr << "Error: --max-http-inflight must be between 1 and 4096.\n";
+            return 1;
+        }
+        if (max_ws_connections < 1 || max_ws_connections > 4096) {
+            std::cerr << "Error: --max-ws-connections must be between 1 and 4096.\n";
+            return 1;
+        }
         if (ffmpeg_bin.empty() || ffmpeg_bin.size() > 32768u) {
             std::cerr << "Error: --ffmpeg path/name must not be empty or excessively long.\n";
             return 1;
         }
         if (!resolve_bind_host(bind_host, resolved_bind_host)) {
             std::cerr << "Error: --host could not be resolved to a bindable IPv4/IPv6 address: " << bind_host << "\n";
+            return 1;
+        }
+        server_loopback_bind = is_loopback_address_literal(resolved_bind_host);
+        const char * token_env = std::getenv("S2_API_TOKEN");
+        if (token_env && *token_env) server_api_token = token_env;
+        if (!server_api_token.empty() && !api_token_is_safe(server_api_token)) {
+            std::cerr << "Error: S2_API_TOKEN must be 16..4096 visible non-space bytes.\n";
+            return 1;
+        }
+        if (!server_loopback_bind && !allow_remote) {
+            std::cerr << "Error: non-loopback --host requires explicit --allow-remote.\n";
+            return 1;
+        }
+        if (!server_loopback_bind && server_api_token.empty()) {
+            std::cerr << "Error: --allow-remote with a non-loopback --host requires S2_API_TOKEN (16+ non-space bytes).\n";
             return 1;
         }
     }
@@ -1722,6 +1886,29 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // JSON-size check as an application-level defense in depth.
     app.websocket_max_payload(MAX_JSON_REQUEST_BYTES);
 
+    const bool server_auth_required = !server_api_token.empty();
+    s2::server::TokenBucketRateLimiter request_rate_limiter(static_cast<size_t>(request_rate_per_minute),
+                                                static_cast<size_t>(request_burst));
+    std::atomic<size_t> active_http_expensive{0};
+    std::atomic<size_t> accepted_ws_connections{0};
+    auto enforce_http_security = [&](const crow::request & req, bool require_json) -> std::optional<crow::response> {
+        if (server_auth_required && !request_has_bearer_token(req, server_api_token)) {
+            crow::response res(401, "Unauthorized");
+            res.set_header("WWW-Authenticate", "Bearer realm=\"s2.cpp\"");
+            return res;
+        }
+        if (!request_origin_allowed(req, server_loopback_bind))
+            return crow::response(403, "Cross-origin browser request rejected");
+        if (require_json && !request_has_json_content_type(req))
+            return crow::response(415, "Content-Type must be application/json");
+        if (!request_rate_limiter.allow()) {
+            crow::response res(429, "Request rate limit exceeded; retry later");
+            res.set_header("Retry-After", "1");
+            return res;
+        }
+        return std::nullopt;
+    };
+
     // Crow invokes onmessage from its I/O context. Never run model inference in
     // that callback: send_binary/send_text post work back to the same context, so
     // blocking it would defeat incremental WebSocket delivery. Each connection
@@ -1729,28 +1916,58 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     struct WsConnectionState {
         std::atomic_bool alive{true};
         std::atomic_bool busy{false};
+        // onaccept reserves one slot before Crow constructs the connection.
+        // This flag makes close/error/shutdown release that reservation exactly once.
+        std::atomic_bool counted_connection{false};
         std::mutex send_mutex;
     };
+    // Crow preserves onaccept userdata on the websocket connection. A sentinel
+    // lets error/close release a connection slot even if the handshake fails
+    // before onopen can register WsConnectionState.
+    static int ws_reserved_slot_sentinel = 0;
     std::mutex ws_state_mutex;
     std::unordered_map<crow::websocket::connection *, std::shared_ptr<WsConnectionState>> ws_states;
     std::unique_ptr<BoundedTaskPool> ws_tasks;
+    std::unique_ptr<BoundedTaskPool> batch_tasks;
     try {
         ws_tasks = std::make_unique<BoundedTaskPool>(pipeline_pool.capacity(), 32u);
+        const size_t batch_queue = std::max<size_t>(32u, pipeline_pool.capacity() * 8u);
+        batch_tasks = std::make_unique<BoundedTaskPool>(pipeline_pool.capacity(), batch_queue);
     } catch (const std::exception & e) {
-        std::cerr << "Failed to initialize WebSocket worker pool: " << e.what() << "\n";
+        std::cerr << "Failed to initialize bounded server worker pools: " << e.what() << "\n";
         return 1;
     }
     auto mark_ws_closed = [&](crow::websocket::connection & conn) {
         std::shared_ptr<WsConnectionState> state;
+        bool reserved_without_state = false;
         {
+            // Serialize registry changes with onopen so a close/error cannot land
+            // between consuming the userdata sentinel and publishing the state.
             std::lock_guard<std::mutex> lock(ws_state_mutex);
             auto it = ws_states.find(&conn);
-            if (it != ws_states.end()) { state = it->second; ws_states.erase(it); }
+            if (it != ws_states.end()) {
+                state = it->second;
+                ws_states.erase(it);
+                conn.userdata(nullptr);
+            } else if (conn.userdata() == &ws_reserved_slot_sentinel) {
+                conn.userdata(nullptr);
+                reserved_without_state = true;
+            }
         }
         if (state) {
-            std::lock_guard<std::mutex> send_lock(state->send_mutex);
-            state->alive.store(false, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> send_lock(state->send_mutex);
+                state->alive.store(false, std::memory_order_relaxed);
+            }
+            if (state->counted_connection.exchange(false, std::memory_order_acq_rel))
+                accepted_ws_connections.fetch_sub(1u, std::memory_order_acq_rel);
+            return;
         }
+        // onaccept may have reserved a slot immediately before a handshake error.
+        // Crow stores this pointer on the connection before start(), so release it
+        // exactly once even when onopen never registered state.
+        if (reserved_without_state)
+            accepted_ws_connections.fetch_sub(1u, std::memory_order_acq_rel);
     };
     auto mark_all_ws_closed = [&]() {
         std::vector<std::shared_ptr<WsConnectionState>> states;
@@ -1767,6 +1984,8 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             if (!state) continue;
             std::lock_guard<std::mutex> send_lock(state->send_mutex);
             state->alive.store(false, std::memory_order_relaxed);
+            if (state->counted_connection.exchange(false, std::memory_order_acq_rel))
+                accepted_ws_connections.fetch_sub(1u, std::memory_order_acq_rel);
         }
     };
 
@@ -1834,7 +2053,12 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             if (json.has("repetition_penalty")) synth_params.gen.repetition_penalty = static_cast<float>(json["repetition_penalty"].d());
             if (json.has("repetition_window")) synth_params.gen.repetition_window = checked_json_i32(json["repetition_window"]);
             if (json.has("multi_turn_history")) synth_params.multi_turn_history = checked_json_i32(json["multi_turn_history"]);
-            if (json.has("threads")) synth_params.gen.n_threads = checked_json_i32(json["threads"]);
+            if (json.has("threads")) {
+                const int32_t requested_threads = checked_json_i32(json["threads"]);
+                if (requested_threads > params.gen.n_threads)
+                    throw std::invalid_argument("threads cannot exceed the server --threads limit");
+                synth_params.gen.n_threads = requested_threads;
+            }
             if (json.has("max_tokens") && json.has("max_new_tokens")) {
                 const int32_t a = checked_json_i32(json["max_tokens"]);
                 const int32_t b = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
@@ -1980,8 +2204,11 @@ Run the README's complete CLI/API reference for examples and detailed backend no
         } catch (const std::bad_alloc &) {
             return crow::response(500, "Server ran out of memory while preparing the response");
         } catch (const std::exception & e) {
-            const int status = request_validated ? 500 : 400;
-            return crow::response(status, std::string(request_validated ? "Synthesis failed: " : "Invalid request: ") + e.what());
+            if (request_validated) {
+                std::cerr << "[HTTP] Synthesis internal error: " << e.what() << "\n";
+                return crow::response(500, "Synthesis failed internally");
+            }
+            return crow::response(400, std::string("Invalid request: ") + e.what());
         } catch (...) {
             return crow::response(request_validated ? 500 : 400, request_validated ? "Synthesis failed" : "Invalid request");
         }
@@ -1991,6 +2218,9 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // malformed UTF-16 surrogate escapes). Convert all client parse/type failures
     // into 4xx here instead of letting them escape the route callback.
     auto handle_synthesis_request = [&](const crow::request & req, ApiFlavor flavor) -> crow::response {
+        if (auto blocked = enforce_http_security(req, true)) return std::move(*blocked);
+        s2::server::AtomicPermit inflight(active_http_expensive, static_cast<size_t>(max_http_inflight));
+        if (!inflight) return crow::response(503, "Too many simultaneous synthesis requests; retry later");
         if (req.body.size() > MAX_JSON_REQUEST_BYTES) {
             return crow::response(413, "JSON request body too large");
         }
@@ -2021,6 +2251,9 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     CROW_ROUTE(app, "/v1/tts/batch")
     .methods("POST"_method)
     ([&](const crow::request & req) -> crow::response {
+        if (auto blocked = enforce_http_security(req, true)) return std::move(*blocked);
+        s2::server::AtomicPermit inflight(active_http_expensive, static_cast<size_t>(max_http_inflight));
+        if (!inflight) return crow::response(503, "Too many simultaneous synthesis requests; retry later");
         if (req.body.size() > MAX_JSON_REQUEST_BYTES) return crow::response(413, "JSON request body too large");
         try {
             auto root = load_json_strict(req.body);
@@ -2073,21 +2306,21 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             }
 
             std::vector<std::unique_ptr<crow::response>> responses(count);
-            std::atomic<size_t> next_job{0};
             std::atomic<size_t> batch_base64_bytes{0};
-            const size_t task_count = std::min(count, pipeline_pool.capacity());
-            std::vector<std::future<void>> tasks;
-            tasks.reserve(task_count);
-            for (size_t t = 0; t < task_count; ++t) {
-                tasks.emplace_back(std::async(std::launch::async, [&] {
-                    for (;;) {
-                        const size_t i = next_job.fetch_add(1, std::memory_order_relaxed);
-                        if (i >= count) return;
+            std::mutex batch_wait_mutex;
+            std::condition_variable batch_wait_cv;
+            std::atomic<size_t> batch_remaining{count};
+            auto finish_batch_item = [&]() noexcept {
+                batch_remaining.fetch_sub(1u, std::memory_order_release);
+                batch_wait_cv.notify_one();
+            };
+            for (size_t i = 0; i < count; ++i) {
+                const bool queued = batch_tasks->submit([&, i] {
+                    try {
                         auto response = std::make_unique<crow::response>(do_synthesize(items[i], ApiFlavor::Fish));
                         if (response->code >= 200 && response->code < 300) {
                             size_t encoded_bytes = 0;
-                            bool reserved = base64_encoded_size(response->body.size(), encoded_bytes) &&
-                                            encoded_bytes <= MAX_BATCH_BASE64_BYTES;
+                            bool reserved = base64_encoded_size(response->body.size(), encoded_bytes) && encoded_bytes <= MAX_BATCH_BASE64_BYTES;
                             size_t observed = batch_base64_bytes.load(std::memory_order_relaxed);
                             while (reserved) {
                                 if (observed > MAX_BATCH_BASE64_BYTES - encoded_bytes) { reserved = false; break; }
@@ -2095,16 +2328,33 @@ Run the README's complete CLI/API reference for examples and detailed backend no
                                                                             std::memory_order_relaxed,
                                                                             std::memory_order_relaxed)) break;
                             }
-                            if (!reserved) {
-                                response = std::make_unique<crow::response>(413,
-                                    "Batch aggregate base64 audio payload exceeds 128 MiB");
-                            }
+                            if (!reserved) response = std::make_unique<crow::response>(413, "Batch aggregate base64 audio payload exceeds 128 MiB");
                         }
                         responses[i] = std::move(response);
+                    } catch (...) {
+                        // Keep this path allocation/iostream-free: finish_batch_item() must
+                        // always run so the request cannot wait forever during low-memory
+                        // or other exceptional worker failures. Details stay server-side.
+                        std::fputs("[Batch] Worker failed while processing an item\n", stderr);
                     }
-                }));
+                    finish_batch_item();
+                });
+                if (!queued) {
+                    // Do not let allocation failure here escape while already-submitted
+                    // tasks still reference this handler's stack. Mark completion first
+                    // even if the best-effort 503 response cannot be allocated.
+                    try {
+                        responses[i] = std::make_unique<crow::response>(503, "Batch worker queue is full; retry later");
+                    } catch (...) {
+                        std::fputs("[Batch] Could not allocate queue-full response\n", stderr);
+                    }
+                    finish_batch_item();
+                }
             }
-            for (auto & task : tasks) task.get();
+            {
+                std::unique_lock<std::mutex> lock(batch_wait_mutex);
+                batch_wait_cv.wait(lock, [&] { return batch_remaining.load(std::memory_order_acquire) == 0; });
+            }
 
             crow::json::wvalue out;
             out["object"] = "tts.batch";
@@ -2156,7 +2406,8 @@ Run the README's complete CLI/API reference for examples and detailed backend no
         } catch (const std::bad_alloc &) {
             return crow::response(500, "Server ran out of memory while processing batch");
         } catch (const std::system_error & e) {
-            return crow::response(500, std::string("Batch worker startup/runtime failure: ") + e.what());
+            std::cerr << "[Batch] Runtime failure: " << e.what() << "\n";
+            return crow::response(500, "Batch worker runtime failure");
         } catch (const std::exception & e) {
             return crow::response(400, std::string("Invalid batch request: ") + e.what());
         }
@@ -2185,7 +2436,8 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // ================================================================
     CROW_ROUTE(app, "/v1/models")
     .methods("GET"_method)
-    ([&]() {
+    ([&](const crow::request & req) {
+        if (auto blocked = enforce_http_security(req, false)) return std::move(*blocked);
         crow::json::wvalue resp;
         resp["object"] = "list";
         crow::json::wvalue model;
@@ -2203,7 +2455,8 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // GET /v1/voices -- list all saved voice profiles
     CROW_ROUTE(app, "/v1/voices")
     .methods("GET"_method)
-    ([&]() {
+    ([&](const crow::request & req) {
+        if (auto blocked = enforce_http_security(req, false)) return std::move(*blocked);
         try {
             std::lock_guard<std::mutex> storage_lock(voice_storage_mutex);
             s2::VoiceProfileManager mgr;
@@ -2223,7 +2476,8 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             resp["count"] = static_cast<int64_t>(ids.size());
             return crow::response(200, resp);
         } catch (const std::exception & e) {
-            return crow::response(500, std::string("Failed to list voices: ") + e.what());
+            std::cerr << "[HTTP] Failed to list voices: " << e.what() << "\n";
+            return crow::response(500, "Failed to list voices");
         }
     });
 
@@ -2232,6 +2486,9 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     CROW_ROUTE(app, "/v1/voices/<string>")
     .methods("POST"_method)
     ([&](const crow::request& req, const std::string & voice_id) {
+        if (auto blocked = enforce_http_security(req, true)) return std::move(*blocked);
+        s2::server::AtomicPermit inflight(active_http_expensive, static_cast<size_t>(max_http_inflight));
+        if (!inflight) return crow::response(503, "Too many simultaneous synthesis requests; retry later");
         bool request_validated = false;
         try {
             if (req.body.size() > MAX_JSON_REQUEST_BYTES) return crow::response(413, "JSON request body too large");
@@ -2295,17 +2552,13 @@ Run the README's complete CLI/API reference for examples and detailed backend no
         } catch (const std::bad_alloc &) {
             return crow::response(500, "Server ran out of memory while creating the voice profile");
         } catch (const std::invalid_argument & e) {
-            const int status = request_validated ? 500 : 400;
-            const char * prefix = request_validated
-                ? "Failed to create voice profile: "
-                : "Invalid voice request: ";
-            return crow::response(status, std::string(prefix) + e.what());
+            if (!request_validated) return crow::response(400, std::string("Invalid voice request: ") + e.what());
+            std::cerr << "[HTTP] Voice profile creation failed: " << e.what() << "\n";
+            return crow::response(500, "Failed to create voice profile");
         } catch (const std::exception & e) {
-            const int status = request_validated ? 500 : 400;
-            const char * prefix = request_validated
-                ? "Failed to create voice profile: "
-                : "Invalid voice request: ";
-            return crow::response(status, std::string(prefix) + e.what());
+            if (!request_validated) return crow::response(400, std::string("Invalid voice request: ") + e.what());
+            std::cerr << "[HTTP] Voice profile creation failed: " << e.what() << "\n";
+            return crow::response(500, "Failed to create voice profile");
         } catch (...) {
             return crow::response(request_validated ? 500 : 400,
                                   request_validated ? "Failed to create voice profile"
@@ -2316,7 +2569,8 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // GET /v1/voices/<id> -- get metadata for a single voice profile
     CROW_ROUTE(app, "/v1/voices/<string>")
     .methods("GET"_method)
-    ([&](const std::string & voice_id) {
+    ([&](const crow::request & req, const std::string & voice_id) {
+        if (auto blocked = enforce_http_security(req, false)) return std::move(*blocked);
         try {
             std::lock_guard<std::mutex> storage_lock(voice_storage_mutex);
             s2::VoiceProfileManager mgr;
@@ -2341,14 +2595,16 @@ Run the README's complete CLI/API reference for examples and detailed backend no
         } catch (const std::exception & e) {
             // A profile that exists but cannot be parsed/read is a server-side
             // storage error, not a missing resource.
-            return crow::response(500, std::string("Failed to load voice profile: ") + e.what());
+            std::cerr << "[HTTP] Failed to load voice profile: " << e.what() << "\n";
+            return crow::response(500, "Failed to load voice profile");
         }
     });
 
     // DELETE /v1/voices/<id> -- delete a saved voice profile
     CROW_ROUTE(app, "/v1/voices/<string>")
     .methods("DELETE"_method)
-    ([&](const std::string & voice_id) {
+    ([&](const crow::request & req, const std::string & voice_id) {
+        if (auto blocked = enforce_http_security(req, false)) return std::move(*blocked);
         try {
             std::lock_guard<std::mutex> storage_lock(voice_storage_mutex);
             s2::VoiceProfileManager mgr;
@@ -2365,14 +2621,16 @@ Run the README's complete CLI/API reference for examples and detailed backend no
         } catch (const std::invalid_argument & e) {
             return crow::response(400, std::string("Invalid voice id: ") + e.what());
         } catch (const std::exception & e) {
-            return crow::response(500, std::string("Failed to delete voice: ") + e.what());
+            std::cerr << "[HTTP] Failed to delete voice: " << e.what() << "\n";
+            return crow::response(500, "Failed to delete voice");
         }
     });
 
     // ================================================================
     CROW_ROUTE(app, "/health")
     .methods("GET"_method)
-    ([]() {
+    ([&](const crow::request & req) {
+        if (auto blocked = enforce_http_security(req, false)) return std::move(*blocked);
         return crow::response(200, "OK");
     });
 
@@ -2380,14 +2638,16 @@ Run the README's complete CLI/API reference for examples and detailed backend no
     // the historical alias so existing s2.cpp deployments do not break.
     CROW_ROUTE(app, "/v1/health")
     .methods("GET"_method)
-    ([]() {
+    ([&](const crow::request & req) {
+        if (auto blocked = enforce_http_security(req, false)) return std::move(*blocked);
         crow::json::wvalue status;
         status["status"] = "ok";
         return crow::response(200, status);
     });
 
     CROW_ROUTE(app, "/")
-    ([&port, &bind_host]() {
+    ([&](const crow::request & req) {
+        if (auto blocked = enforce_http_security(req, false)) return std::move(*blocked);
         crow::json::wvalue info;
         info["status"] = "running";
         info["host"] = bind_host;
@@ -2483,7 +2743,12 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             if (json.has("repetition_penalty")) ws_params.gen.repetition_penalty = static_cast<float>(json["repetition_penalty"].d());
             if (json.has("repetition_window")) ws_params.gen.repetition_window = checked_json_i32(json["repetition_window"]);
             if (json.has("multi_turn_history")) ws_params.multi_turn_history = checked_json_i32(json["multi_turn_history"]);
-            if (json.has("threads")) ws_params.gen.n_threads = checked_json_i32(json["threads"]);
+            if (json.has("threads")) {
+                const int32_t requested_threads = checked_json_i32(json["threads"]);
+                if (requested_threads > params.gen.n_threads)
+                    throw std::invalid_argument("threads cannot exceed the server --threads limit");
+                ws_params.gen.n_threads = requested_threads;
+            }
             if (json.has("max_tokens") && json.has("max_new_tokens")) {
                 const int32_t a = checked_json_i32(json["max_tokens"]);
                 const int32_t b = checked_json_fish_max_new_tokens(json["max_new_tokens"]);
@@ -2590,24 +2855,60 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             }
             ws_send_text(conn, state, done_msg.dump());
         } catch (const std::bad_alloc &) {
-            ws_send_text(conn, state, "{\"error\": \"server ran out of memory\"}");
-        } catch (const std::exception & e) {
+            std::fputs("[WS] Synthesis request ran out of memory\n", stderr);
+            ws_send_text(conn, state, "{\"error\": \"server error\"}");
+        } catch (const std::invalid_argument & e) {
             crow::json::wvalue err;
             err["error"] = std::string("invalid request: ") + e.what();
             ws_send_text(conn, state, err.dump());
+        } catch (const std::out_of_range & e) {
+            crow::json::wvalue err;
+            err["error"] = std::string("invalid request: ") + e.what();
+            ws_send_text(conn, state, err.dump());
+        } catch (const std::exception & e) {
+            std::cerr << "[WS] Internal synthesis failure: " << e.what() << "\n";
+            ws_send_text(conn, state, "{\"error\": \"server error\"}");
         } catch (...) {
-            ws_send_text(conn, state, "{\"error\": \"invalid request\"}");
+            std::fputs("[WS] Unknown internal synthesis failure\n", stderr);
+            ws_send_text(conn, state, "{\"error\": \"server error\"}");
         }
     };
 
     CROW_WEBSOCKET_ROUTE(app, "/ws/tts")
-    .onopen([&](crow::websocket::connection& conn) {
-        auto state = std::make_shared<WsConnectionState>();
-        {
-            std::lock_guard<std::mutex> lock(ws_state_mutex);
-            ws_states[&conn] = std::move(state);
+    .onaccept([&](const crow::request & req, std::optional<crow::response> & res, void ** userdata) {
+        if (auto blocked = enforce_http_security(req, false)) { res = std::move(*blocked); return; }
+        if (!s2::server::try_increment_bounded(accepted_ws_connections,
+                                               static_cast<size_t>(max_ws_connections))) {
+            res = crow::response(503, "WebSocket connection limit reached; retry later");
+            return;
         }
-        std::cout << "[WS] Client connected: " << conn.get_remote_ip() << "\n";
+        *userdata = &ws_reserved_slot_sentinel;
+    })
+    .onopen([&](crow::websocket::connection& conn) {
+        try {
+            auto state = std::make_shared<WsConnectionState>();
+            {
+                // Keep the reservation sentinel intact until the map insertion
+                // succeeds. mark_ws_closed() takes the same mutex, so failure and
+                // close/error paths cannot leak or double-release the slot.
+                std::lock_guard<std::mutex> lock(ws_state_mutex);
+                if (conn.userdata() != &ws_reserved_slot_sentinel)
+                    throw std::runtime_error("WebSocket reservation disappeared before onopen");
+                const auto inserted = ws_states.emplace(&conn, state).second;
+                if (!inserted) throw std::runtime_error("duplicate WebSocket connection state");
+                state->counted_connection.store(true, std::memory_order_relaxed);
+                conn.userdata(nullptr);
+            }
+            std::cout << "[WS] Client connected: " << conn.get_remote_ip() << "\n";
+        } catch (const std::exception & e) {
+            std::cerr << "[WS] Failed to initialize connection state: " << e.what() << "\n";
+            mark_ws_closed(conn);
+            try { conn.close("server unavailable"); } catch (...) {}
+        } catch (...) {
+            std::fputs("[WS] Failed to initialize connection state\n", stderr);
+            mark_ws_closed(conn);
+            try { conn.close("server unavailable"); } catch (...) {}
+        }
     })
     .onclose([&](crow::websocket::connection& conn, const std::string& reason, uint16_t) {
         mark_ws_closed(conn);
@@ -2623,6 +2924,10 @@ Run the README's complete CLI/API reference for examples and detailed backend no
             if (it != ws_states.end()) state = it->second;
         }
         if (!state || !state->alive.load(std::memory_order_relaxed)) return;
+        if (!request_rate_limiter.allow()) {
+            ws_send_text(&conn, state, "{\"error\": \"request rate limit exceeded; retry later\"}");
+            return;
+        }
         if (is_binary) {
             ws_send_text(&conn, state, "{\"error\": \"expected JSON text message\"}");
             return;
@@ -2660,7 +2965,7 @@ Run the README's complete CLI/API reference for examples and detailed backend no
 
     std::cout << "\nEndpoints:\n"
               << "  POST /v1/tts           (Fish Audio compatible)\n"
-              << "  POST /v1/tts/batch     (batch synthesis; up to 32 items)\n"
+              << "  POST /v1/tts/batch     (batch; up to 32 items, one base64 audio output/item)\n"
               << "  POST /synthesize       (legacy)\n"
               << "  POST /v1/audio/speech  (OpenAI compatible)\n"
               << "  GET  /v1/models\n"
@@ -2672,9 +2977,11 @@ Run the README's complete CLI/API reference for examples and detailed backend no
               << "  GET  /v1/health\n"
               << "  WS   /ws/tts           (streaming -- minimum latency)\n\n";
 
-    if (resolved_bind_host != "127.0.0.1" && resolved_bind_host != "::1") {
-        std::cerr << "[Security warning] Server is binding to " << bind_host
-                  << ". API requests can reference local audio paths; expose this only to trusted clients.\n";
+    if (!server_loopback_bind) {
+        std::cerr << "[Security] Remote exposure explicitly enabled with --allow-remote on " << bind_host
+                  << "; Authorization: Bearer <S2_API_TOKEN> is required. Built-in limits are process-wide; TLS, per-IP rate limiting and ingress body limits still belong in a trusted reverse proxy.\n";
+    } else if (server_auth_required) {
+        std::cerr << "[Security] S2_API_TOKEN is set; Bearer authentication is required on loopback too.\n";
     }
     std::cout << "Server listening on " << bind_host;
     if (resolved_bind_host != bind_host) std::cout << " (" << resolved_bind_host << ")";
@@ -2683,14 +2990,17 @@ Run the README's complete CLI/API reference for examples and detailed backend no
         app.bindaddr(resolved_bind_host).port(static_cast<uint16_t>(port)).multithreaded().run();
         mark_all_ws_closed();
         ws_tasks->shutdown();
+        batch_tasks->shutdown();
     } catch (const std::exception & e) {
         mark_all_ws_closed();
         ws_tasks->shutdown();
+        batch_tasks->shutdown();
         std::cerr << "Server startup/runtime error: " << e.what() << "\n";
         return 1;
     } catch (...) {
         mark_all_ws_closed();
         ws_tasks->shutdown();
+        batch_tasks->shutdown();
         std::cerr << "Server startup/runtime error: unknown exception\n";
         return 1;
     }
