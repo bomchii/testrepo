@@ -16,6 +16,10 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#else
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <sys/stat.h>
 #endif
 
 // dr_libs implementations (header-only, define once)
@@ -118,6 +122,22 @@ static FILE * open_audio_file_utf8(const std::string & path, const char * mode) 
     return _wfopen(wpath.c_str(), wmode.c_str());
 #else
     return std::fopen(path.c_str(), mode);
+#endif
+}
+
+static FILE * open_audio_output_utf8(const std::string & path) {
+#ifdef _WIN32
+    std::wstring wpath;
+    if (!utf8_to_wide(path, wpath)) return nullptr;
+    return _wfopen(wpath.c_str(), L"wb");
+#else
+    if (path.empty()) return nullptr;
+    const int flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC;
+    const int fd = ::open(path.c_str(), flags, S_IRUSR | S_IWUSR);
+    if (fd < 0) return nullptr;
+    FILE * f = ::fdopen(fd, "wb");
+    if (!f) { ::close(fd); return nullptr; }
+    return f;
 #endif
 }
 
@@ -380,14 +400,7 @@ bool audio_write_wav(const std::string & path, const float * data, size_t n_samp
         }
     }
 
-    FILE * fp = nullptr;
-#ifdef _WIN32
-    std::wstring wpath;
-    if (!utf8_to_wide(path, wpath)) return false;
-    fp = _wfopen(wpath.c_str(), L"wb");
-#else
-    fp = std::fopen(path.c_str(), "wb");
-#endif
+    FILE * fp = open_audio_output_utf8(path);
     if (!fp) {
         std::fprintf(stderr, "[s2_audio] failed to open WAV for writing: %s\n", path.c_str());
         return false;
@@ -475,7 +488,8 @@ std::vector<float> audio_time_stretch(const float * data, size_t n_samples, int3
         // Linear duration interpolation is safer than returning nothing.
         std::vector<float> out(expected_out);
         for (size_t i = 0; i < expected_out; ++i) {
-            const double pos = std::min<double>(n_samples - 1, i * speed);
+            const double pos = std::min<double>(static_cast<double>(n_samples - 1),
+                                                static_cast<double>(i) * static_cast<double>(speed));
             const size_t a = static_cast<size_t>(pos);
             const size_t b = std::min(a + 1, n_samples - 1);
             const float f = static_cast<float>(pos - a);
@@ -539,7 +553,9 @@ std::vector<float> audio_time_stretch(const float * data, size_t n_samples, int3
     for (size_t i = 0; i < out.size(); ++i) {
         if (weight[i] > 1e-9f) out[i] /= weight[i];
         else {
-            const size_t src = std::min(n_samples - 1, static_cast<size_t>(std::min<double>(n_samples - 1, i * speed)));
+            const size_t src = std::min(n_samples - 1, static_cast<size_t>(std::min<double>(
+                static_cast<double>(n_samples - 1),
+                static_cast<double>(i) * static_cast<double>(speed))));
             out[i] = data[src];
         }
         if (!std::isfinite(out[i])) out[i] = 0.0f;

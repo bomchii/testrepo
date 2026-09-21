@@ -25,6 +25,8 @@ security = has('.github/workflows/security.yml', 'CodeQL C/C++')
 readme = (ROOT / 'README.md').read_text(encoding='utf-8')
 main = (ROOT / 'src/main.cpp').read_text(encoding='utf-8')
 audio_src = (ROOT / 'src/s2_audio.cpp').read_text(encoding='utf-8', errors='replace')
+pipeline_src = (ROOT / 'src/s2_pipeline.cpp').read_text(encoding='utf-8', errors='replace')
+mp3_src = (ROOT / 'third_party/dr_mp3.h').read_text(encoding='utf-8', errors='replace')
 
 # Every external action in every workflow must be immutable.
 for wf in sorted((ROOT / '.github/workflows').glob('*.yml')):
@@ -131,6 +133,18 @@ need('std::memcmp(h, "fmt ", 4) == 0 && chunk_size < 16ull' in audio_src,
      'memory RIFF fmt minimum pre-validation missing')
 need('std::memcmp(chunk, "fmt ", 4) == 0 && chunk_size < 16ull' in audio_src,
      'file RIFF fmt minimum pre-validation missing')
+
+# Keep the CodeQL fixes that protect arithmetic promotion and restrictive POSIX output creation.
+need(audio_src.count('static_cast<double>(i) * static_cast<double>(speed)') == 2,
+     'time-stretch index arithmetic must be promoted to double before multiplication')
+need('::open(path.c_str(), flags, S_IRUSR | S_IWUSR)' in audio_src and
+     'O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC' in audio_src,
+     'WAV output creation must request user-only POSIX permissions')
+need('::open(path.c_str(), flags, S_IRUSR | S_IWUSR)' in pipeline_src and
+     'O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC' in pipeline_src,
+     'pipeline output creation must request user-only POSIX permissions')
+need('(drmp3_uint64)detectedMP3FrameCount * firstFramePCMFrameCount' in mp3_src,
+     'dr_mp3 PCM frame multiplication must widen before multiplying')
 
 if errors:
     for e in errors:

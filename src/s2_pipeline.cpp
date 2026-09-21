@@ -28,6 +28,7 @@ namespace fs = ghc::filesystem;
 #else
 #  include <unistd.h>
 #  include <fcntl.h>
+#  include <sys/stat.h>
 #endif
 
 namespace s2 {
@@ -49,7 +50,13 @@ static FILE * open_binary_output_utf8(const std::string & path) {
     const std::wstring wp = fs::path(path).wstring();
     return _wfopen(wp.c_str(), L"wb");
 #else
-    return std::fopen(path.c_str(), "wb");
+    if (path.empty()) return nullptr;
+    const int flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC;
+    const int fd = ::open(path.c_str(), flags, S_IRUSR | S_IWUSR);
+    if (fd < 0) return nullptr;
+    FILE * f = ::fdopen(fd, "wb");
+    if (!f) { ::close(fd); return nullptr; }
+    return f;
 #endif
 }
 
