@@ -492,9 +492,15 @@ static ggml_tensor * build_transformer(ggml_context * ctx, ggml_context * ctx_w,
         ggml_tensor * KQV     = mul_mat_checked(ctx, V, KQf, "mul_mat:codec_kqv");
         ggml_tensor * KQVm    = ggml_permute(ctx, KQV, 0, 2, 1, 3);
         ggml_tensor * attn_dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_size, seq_len);
-        if (!same_shape(KQVm, attn_dst))
+        // KQVm is 3D (head_dim, n_head, seq_len) but the merged attention
+        // output is 2D (q_size, seq_len): same 3D -> 2D head merge as the
+        // transformer (see s2_model.cpp). Materialize the permuted view
+        // contiguously and reshape so the heads merge in the order wo
+        // expects (row = head * head_dim + d).
+        ggml_tensor * attn_merged = ggml_reshape_2d(ctx, ggml_cont(ctx, KQVm), q_size, seq_len);
+        if (!same_shape(attn_merged, attn_dst))
             throw std::runtime_error("codec attention output shape mismatch");
-        ggml_tensor * attn_cur = ggml_cpy(ctx, KQVm, attn_dst);
+        ggml_tensor * attn_cur = ggml_cpy(ctx, attn_merged, attn_dst);
         ggml_tensor * attn_out = mul_mat_checked(ctx, wo, attn_cur, "mul_mat:codec_wo");
         ggml_tensor * attn_sc  = scale_channels_cl(ctx, attn_out, attn_gamma);
 
