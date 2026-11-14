@@ -34,15 +34,38 @@ ensure_cmake() {
   for candidate in "$bundled_py" "$(command -v python3 || true)"; do
     if [[ -n "$candidate" && -x "$candidate" ]]; then py="$candidate"; break; fi
   done
-  [[ -n "$py" ]] || { echo "CMake $want required but no bootstrap Python was found" >&2; exit 1; }
-  "$py" -m pip install --disable-pip-version-check --no-cache-dir "cmake==$want" >/dev/null
-  local scripts_dir
-  scripts_dir="$("$py" -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"
-  [[ -n "$scripts_dir" && -d "$scripts_dir" ]] || { echo "cannot resolve Python scripts directory for CMake bootstrap" >&2; exit 1; }
-  # /opt/python puts pip console scripts beside Python; distro Python commonly
-  # puts them in /usr/local/bin. Put both locations first so the pinned wheel
-  # wins over an older system CMake in either layout.
-  export PATH="$scripts_dir:$(dirname "$py"):$PATH"
+  if [[ -n "$py" ]]; then
+    "$py" -m pip install --disable-pip-version-check --no-cache-dir "cmake==$want" >/dev/null
+    local scripts_dir
+    scripts_dir="$("$py" -c 'import sysconfig; print(sysconfig.get_path("scripts"))')"
+    [[ -n "$scripts_dir" && -d "$scripts_dir" ]] || { echo "cannot resolve Python scripts directory for CMake bootstrap" >&2; exit 1; }
+    # /opt/python puts pip console scripts beside Python; distro Python commonly
+    # puts them in /usr/local/bin. Put both locations first so the pinned wheel
+    # wins over an older system CMake in either layout.
+    export PATH="$scripts_dir:$(dirname "$py"):$PATH"
+  else
+    # Sin Python no hay rueda pip: bajar el tarball oficial de Kitware, que
+    # no necesita Python ni libstdc++ (solo glibc >= 2.17, el piso de
+    # manylinux2014; verificado: el binario 4.4.3 pide como mucho GLIBC_2.17).
+    # manylinux2014 ya no trae /opt/python ni python3 en el contenedor, y
+    # por eso el Build #21 fallaba aquí con "no bootstrap Python was found".
+    local tarball="cmake-$want-linux-x86_64.tar.gz"
+    local sha="d6c83076c575bc00b823522ac974bda66d0af05d6ddc30e739c12385cf32c6cc"
+    local url="https://github.com/Kitware/CMake/releases/download/v$want/$tarball"
+    local dest="$root/.ci-cmake"
+    mkdir -p "$dest"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fL --retry 3 --retry-delay 2 "$url" -o "$dest/$tarball"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -q "$url" -O "$dest/$tarball"
+    else
+      echo "CMake $want required but no bootstrap Python, curl or wget was found" >&2
+      exit 1
+    fi
+    echo "$sha  $dest/$tarball" | sha256sum -c -
+    tar -xzf "$dest/$tarball" -C "$dest"
+    export PATH="$dest/cmake-$want-linux-x86_64/bin:$PATH"
+  fi
   have="$(cmake --version | sed -n '1s/^cmake version //p')"
   [[ "$have" == "$want" ]] || { echo "failed to activate CMake $want (got $have)" >&2; exit 1; }
 }

@@ -1,0 +1,94 @@
+name: Build Linux CPU (fast)
+
+# Ciclo rápido de test: solo el binario Linux CPU portable (glibc 2.17),
+# sin esperar a Windows/macOS/Vulkan/CUDA/ROCm del workflow grande.
+# Se dispara en cada push a main/master y a mano (workflow_dispatch).
+# Un push nuevo cancela el run anterior en curso.
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Force JavaScript actions to Node 24, including nested/composite actions that still declare Node 20.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  build-linux-cpu:
+    name: Linux x86_64 - portable CPU (glibc 2.17)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Reclaim runner disk space
+        shell: bash
+        run: bash tools/ci/reclaim-linux-runner-space.sh
+
+      - name: Prepare Crow/Asio/tokenizer
+        shell: bash
+        run: bash tools/ci/prepare-linux-deps.sh common
+
+      - name: Build portable CPU in manylinux2014
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=quay.io/pypa/manylinux2014_x86_64
+          docker pull "$image"
+          docker image inspect "$image" --format 'RepoDigests={{json .RepoDigests}}'
+          python3 tools/ci/run-with-diagnostics.py --label "Linux CPU portable build" --log ci-logs/linux-cpu-build.log -- \
+            docker run --rm --platform linux/amd64 \
+              -e S2_BUILD_JOBS=3 \
+              -v "$PWD:/src" -w /src \
+              "$image" \
+              /bin/bash -lc 'cat /etc/os-release; ldd --version | sed -n '1p'; gcc --version | sed -n '1p'; tar --version | sed -n '1p'; bash tools/ci/build-linux-portable.sh cpu'
+
+      - name: Inspect CPU release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x s2-linux-cpu-x86-64
+          test "$(find . -maxdepth 1 -type f -name 's2-linux-cpu-x86-64' | wc -l | tr -d ' ')" = 1
+          ./s2-linux-cpu-x86-64 --runtime-info
+
+      - name: Verify non-empty direct artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s s2-linux-cpu-x86-64
+
+      - name: Upload Linux CPU artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: s2-linux-cpu-x86-64
+          path: s2-linux-cpu-x86-64
+          if-no-files-found: error
+          archive: false
+
+      - name: Collect robust crash report
+        if: failure()
+        shell: bash
+        run: python3 tools/ci/collect-crash-report.py --label "Linux CPU" --logs ci-logs --output ci-logs/job-crash-report.txt
+
+      - name: Upload concise failure diagnostics
+        if: ${{ failure() && hashFiles('ci-logs/*') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-cpu-diagnostics
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
