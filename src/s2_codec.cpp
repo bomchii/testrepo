@@ -271,7 +271,13 @@ static ggml_tensor * causal_conv_1d(ggml_context * ctx,
                                      ggml_tensor * x, int stride, int dilation) {
     if (!weight || !x || stride <= 0 || dilation <= 0 || x->ne[0] <= 0 || x->ne[1] <= 0)
         throw std::runtime_error("invalid causal convolution inputs");
-    if (weight->type != GGML_TYPE_F32) weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
+    // ggml_conv_1d builds its im2col with a hardcoded F16 output, and the
+    // CPU im2col kernel asserts the kernel is F16 (ggml_compute_forward_
+    // im2col_f16). Casting the weight to F32 here used to abort the whole
+    // process with GGML_ASSERT(src0->type == GGML_TYPE_F16). F16 is also
+    // the natural type: weights were F16 before Q4_K quantization. The
+    // mul_mat after im2col still produces F32 output, so the bias stays F32.
+    if (weight->type != GGML_TYPE_F16) weight = ggml_cast(ctx, weight, GGML_TYPE_F16);
     if (bias   && bias->type   != GGML_TYPE_F32) bias   = ggml_cast(ctx, bias,   GGML_TYPE_F32);
     // Poids potentiellement aplati en 2D [in_ch*kernel, out_ch, 1] par la quantisation GGUF
     // -> reshaper en 3D [kernel, in_ch, out_ch] attendu par ggml_conv_1d
@@ -573,6 +579,9 @@ static ggml_tensor * build_convnext_block(ggml_context * ctx, ggml_context * ctx
     const int extra_dw = static_cast<int>(extra_dw64);
     ggml_tensor * x_lc = cl_to_lc(ctx, x);
     x_lc = ggml_pad_ext(ctx, x_lc, pad_dw, extra_dw, 0, 0, 0, 0, 0, 0);
+    // ggml_conv_1d_dw also hardcodes an F16 im2col output, so its kernel
+    // must be F16 (same GGML_ASSERT as ggml_conv_1d).
+    if (dw_w->type != GGML_TYPE_F16) dw_w = ggml_cast(ctx, dw_w, GGML_TYPE_F16);
     ggml_tensor * y_lc = ggml_conv_1d_dw(ctx, dw_w, x_lc, 1, 0, 1);
     y_lc = add_channel_bias_lc(ctx, y_lc, dw_b);
     ggml_tensor * y = lc_to_cl(ctx, y_lc);
