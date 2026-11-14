@@ -1354,8 +1354,15 @@ bool SlowARModel::eval_cached(const std::vector<int32_t> & flat_tokens,
         ggml_tensor * V       = ggml_cont(ctx0, ggml_permute(ctx0, v_rep, 1, 2, 0, 3));
         ggml_tensor * KQV     = mul_mat_checked(ctx0, V, KQf, "mul_mat:kqv");
         ggml_tensor * KQVm    = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+        // KQVm is 3D (head_dim, n_head, n_tokens) but the merged attention
+        // output is 2D (q_size, n_tokens). Materialize the permuted view
+        // contiguously and reshape so the heads merge in the order
+        // layer.wo expects (row = head * head_dim + d); plain ggml_cpy
+        // would accept the mismatched shapes, but the checked copy requires
+        // identical shapes, so reshape first.
         ggml_tensor * attn_cur = cpy_same_shape_checked(
-            ctx0, KQVm, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens), "cpy:attn");
+            ctx0, ggml_reshape_2d(ctx0, ggml_cont(ctx0, KQVm), q_size, n_tokens),
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens), "cpy:attn");
         ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:wo");
 
         ggml_tensor * h     = add_same_shape_checked(ctx0, x, attn_out, "add:attention_residual");
@@ -1630,8 +1637,11 @@ bool SlowARModel::fast_decode(const std::vector<float> & hidden_in,
         ggml_tensor * V       = ggml_cont(ctx0, ggml_permute(ctx0, v_rep, 1, 2, 0, 3));
         ggml_tensor * KQV     = mul_mat_checked(ctx0, V, KQf, "mul_mat:fast_kqv");
         ggml_tensor * KQVm    = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+        // Same 3D -> 2D head merge as the slow path: KQVm is
+        // (head_dim, n_head, n_tokens), the output is (q_size, n_tokens).
         ggml_tensor * attn_cur = cpy_same_shape_checked(
-            ctx0, KQVm, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens), "cpy:fast_attn");
+            ctx0, ggml_reshape_2d(ctx0, ggml_cont(ctx0, KQVm), q_size, n_tokens),
+            ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, q_size, n_tokens), "cpy:fast_attn");
         ggml_tensor * attn_out = mul_mat_checked(ctx0, layer.wo, attn_cur, "mul_mat:fast_wo");
 
         ggml_tensor * h     = add_same_shape_checked(ctx0, x, attn_out, "add:fast_attention_residual");
