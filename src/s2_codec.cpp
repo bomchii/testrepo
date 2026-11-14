@@ -1130,6 +1130,12 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
 
         auto sane_pos = [](int32_t v, int32_t max) { return v > 0 && v <= max; };
         auto sane_nonneg = [](int32_t v, int32_t max) { return v >= 0 && v <= max; };
+        // GGUF exporters write n_local_heads = -1 for "all heads"
+        // (no local attention). build_transformer() already normalizes
+        // any value < 1 to n_head, so -1 (and 0) are valid here. The
+        // stock S2 Pro codec files (mach9243 q4_k_m / q8_0 / f16) all
+        // use -1 for both transformer n_local_heads fields.
+        auto sane_local_heads = [](int32_t v, int32_t max) { return v >= -1 && v <= max; };
         auto all_between = [](const std::vector<int32_t> & v, int32_t lo, int32_t hi) {
             return std::all_of(v.begin(), v.end(), [&](int32_t x) { return x >= lo && x <= hi; });
         };
@@ -1152,14 +1158,14 @@ bool AudioCodec::load(const std::string & gguf_path, int32_t vulkan_device) {
             sane_pos(impl_->quantizer_semantic_codebook_size, 1000000) &&
             all_between(impl_->quantizer_downsample_factor, 1, 1000000) &&
             sane_pos(impl_->transformer_block_size, 1000000) &&
-            sane_pos(impl_->transformer_n_local_heads, 4096) &&
+            sane_local_heads(impl_->transformer_n_local_heads, 4096) &&
             sane_pos(impl_->transformer_head_dim, 1000000) &&
             std::isfinite(impl_->transformer_rope_base) && impl_->transformer_rope_base > 0.0f &&
             std::isfinite(impl_->transformer_norm_eps) && impl_->transformer_norm_eps > 0.0f &&
             sane_pos(impl_->rvq_transformer_window_size, 1000000) &&
             sane_pos(impl_->rvq_transformer_block_size, 1000000) &&
             sane_nonneg(impl_->rvq_transformer_n_layer, 4096) &&
-            sane_pos(impl_->rvq_transformer_n_local_heads, 4096) &&
+            sane_local_heads(impl_->rvq_transformer_n_local_heads, 4096) &&
             sane_pos(impl_->rvq_transformer_head_dim, 1000000) &&
             sane_pos(impl_->rvq_transformer_dim, 1000000) &&
             std::isfinite(impl_->rvq_transformer_rope_base) && impl_->rvq_transformer_rope_base > 0.0f &&

@@ -462,10 +462,17 @@ bool Pipeline::init(const PipelineParams & params) {
     // The slow model generates exactly one semantic + N residual codebook ids
     // in model codebook space. A mismatched codec would otherwise reinterpret the
     // same buffer with a different row count/size and can read past it.
+    // Note the codebooks do NOT all share one size: in the stock S2 Pro
+    // codec files the semantic codebook is 4096 but each residual codebook
+    // is 1024 (1 semantic + 9 residual = 10 codebooks). The codec's own
+    // decode() enforces those per-codebook limits, so here it is enough
+    // to require the residual size to be positive and no larger than the
+    // model codebook size, instead of demanding it equal 4096.
     const ModelHParams & model_hp = model_.hparams();
     if (codec_.num_codebooks() != model_hp.num_codebooks ||
         codec_.semantic_codebook_size() != model_hp.codebook_size ||
-        codec_.residual_codebook_size() != model_hp.codebook_size) {
+        codec_.residual_codebook_size() <= 0 ||
+        codec_.residual_codebook_size() > model_hp.codebook_size) {
         std::cerr << "Pipeline error: model/codec VQ layout mismatch (model="
                   << model_hp.num_codebooks << "x" << model_hp.codebook_size
                   << ", codec=" << codec_.num_codebooks() << " codebooks, semantic="
