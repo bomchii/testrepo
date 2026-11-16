@@ -1,9 +1,15 @@
 name: Long tests (Actions runner)
 
 # Pruebas largas de TEST-PLAN.md que NO caben en la vida de la VM (~1-2 h):
-#   A10-chunk / A10-chunk-nocond (CLI longform, cap 400, ~2.5-3 h en la VM)
-#   C7-longform (HTTP /v1/tts longform, max_new_tokens 600, ~1.5-2 h en la VM)
+#   A10-chunk / A10-chunk-nocond (CLI longform, cap 400, ~2.5-3 h)
+#   C7-longform (HTTP /v1/tts longform, max_new_tokens 600, ~2.5-3 h)
 # El runner de GitHub vive hasta 6 h por job, asi que aqui si caben.
+#
+# Las 3 pruebas corren en PARALELO (matrix, un job por prueba): juntas
+# suman ~7-9 h y no caben en el limite de 6 h de un solo job. Cada job
+# tiene su propio limite de 6 h y su propio timeout de 14400 s (4 h) por
+# comando — el primer intento con timeout 7200 s mato A10-chunk a mitad
+# del chunk 3 (200/400 tokens, generando normal, sin error).
 #
 # Solo manual (workflow_dispatch). NUNCA en push/PR: no debe dispararse con
 # cada arreglo del ciclo rapido. concurrency cancel-in-progress: false para
@@ -24,10 +30,14 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
-  long-tests:
-    name: A10 + C7 on ubuntu-24.04 runner
+  long-test:
+    name: ${{ matrix.test }} on ubuntu-24.04 runner
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [a10, a10nc, c7]
 
     steps:
       - name: Checkout
@@ -99,16 +109,17 @@ jobs:
 
       # --threads 4: el runner tiene 4 vCPU. La bateria de la VM usa 2, pero
       # el comportamiento bajo prueba (chunking/condicion) no depende de los
-      # hilos (eso lo cubre A11); con 4 hilos las 3 pruebas caben en el
-      # limite de 6 h del job. Mismos caps y flags que en la VM en lo demas.
+      # hilos (eso lo cubre A11); con 4 hilos cada prueba cabe en su job de 6 h.
+      # Mismos caps y flags que en la VM en lo demas.
       - name: A10-chunk (CLI longform, cap 400, condicionado)
+        if: matrix.test == 'a10'
         shell: bash
         run: |
           set -euo pipefail
           cd long-tests
           echo "commit: $(git -C .. rev-parse HEAD)"
           start=$(date +%s)
-          timeout 7200 ../s2-linux-cpu-x86-64 \
+          timeout 14400 ../s2-linux-cpu-x86-64 \
             --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
             --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
             -v -1 --threads 4 --max-tokens 400 \
@@ -117,12 +128,13 @@ jobs:
           echo "A10-chunk rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a a10.log
 
       - name: A10-chunk-nocond (CLI longform, cap 400, sin condicion)
+        if: matrix.test == 'a10nc'
         shell: bash
         run: |
           set -euo pipefail
           cd long-tests
           start=$(date +%s)
-          timeout 7200 ../s2-linux-cpu-x86-64 \
+          timeout 14400 ../s2-linux-cpu-x86-64 \
             --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
             --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
             -v -1 --threads 4 --max-tokens 400 \
@@ -132,6 +144,7 @@ jobs:
           echo "A10-chunk-nocond rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a a10nc.log
 
       - name: C7-longform (HTTP /v1/tts, max_new_tokens 600)
+        if: matrix.test == 'c7'
         shell: bash
         run: |
           set -euo pipefail
@@ -158,7 +171,7 @@ jobs:
           open("c7-payload.json", "w", encoding="utf-8").write(json.dumps(payload))
           PYEOF
           start=$(date +%s)
-          code=$(timeout 7200 curl -sS -X POST "http://127.0.0.1:8081/v1/tts" \
+          code=$(timeout 14400 curl -sS -X POST "http://127.0.0.1:8081/v1/tts" \
             -H "Content-Type: application/json" \
             -d @c7-payload.json -o c7.wav -w "%{http_code}")
           echo "C7-longform http_code=$code elapsed_s=$(( $(date +%s) - start ))" | tee c7.log
@@ -166,35 +179,32 @@ jobs:
           kill $SRV 2>/dev/null || true
           trap - EXIT
 
-      - name: Verify WAVs (duracion, RMS, peak; falla si vacio o silencioso)
+      - name: Verify WAV (duracion, RMS, peak; falla si vacio o silencioso)
         shell: bash
         run: |
           set -euo pipefail
           cd long-tests
-          python3 - <<'PYEOF'
-          import math, struct, wave
-          def check(path):
-              with wave.open(path, "rb") as w:
-                  n = w.getnframes(); rate = w.getframerate()
-                  ch = w.getnchannels(); sw = w.getsampwidth()
-                  frames = w.readframes(n)
-              assert sw == 2, f"{path}: sample width {sw} != 2"
-              vals = struct.unpack(f"<{len(frames)//2}h", frames)
-              rms = math.sqrt(sum(v*v for v in vals) / len(vals)) if vals else 0.0
-              peak = max(abs(v) for v in vals) if vals else 0
-              dur = n / rate
-              print(f"{path}: {n} frames, {dur:.3f} s, {rate} Hz, {ch} ch, RMS {rms:.1f}, peak {peak}")
-              assert n > 0 and rms > 0, f"{path}: empty or silent"
-              return dur
-          d = {}
-          d["a10.wav"] = check("a10.wav")
-          d["a10nc.wav"] = check("a10nc.wav")
-          d["c7.wav"] = check("c7.wav")
+          case "${{ matrix.test }}" in
+            a10)   WAV=a10.wav ;;
+            a10nc) WAV=a10nc.wav ;;
+            c7)    WAV=c7.wav ;;
+          esac
+          python3 - "$WAV" <<'PYEOF'
+          import math, struct, sys, wave
+          path = sys.argv[1]
+          with wave.open(path, "rb") as w:
+              n = w.getnframes(); rate = w.getframerate()
+              ch = w.getnchannels(); sw = w.getsampwidth()
+              frames = w.readframes(n)
+          assert sw == 2, f"{path}: sample width {sw} != 2"
+          vals = struct.unpack(f"<{len(frames)//2}h", frames)
+          rms = math.sqrt(sum(v*v for v in vals) / len(vals)) if vals else 0.0
+          peak = max(abs(v) for v in vals) if vals else 0
+          dur = n / rate
+          print(f"{path}: {n} frames, {dur:.3f} s, {rate} Hz, {ch} ch, RMS {rms:.1f}, peak {peak}")
+          assert n > 0 and rms > 0, f"{path}: empty or silent"
           with open("long-tests-results.txt", "w") as f:
-              f.write("Long tests (Actions runner) — A10-chunk, A10-chunk-nocond, C7-longform\n")
-              for k, v in d.items():
-                  f.write(f"{k}: {v:.3f} s\n")
-              f.write("ALL THREE WAVS VALID, NON-SILENT\n")
+              f.write(f"{path}: {dur:.3f} s, RMS {rms:.1f}, peak {peak}\nVALID, NON-SILENT\n")
           PYEOF
           cat long-tests-results.txt
 
@@ -202,7 +212,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: long-tests-results
+          name: long-tests-${{ matrix.test }}
           path: |
             long-tests/*.wav
             long-tests/*.log
