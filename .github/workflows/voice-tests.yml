@@ -371,3 +371,199 @@ jobs:
             ci-logs/
           if-no-files-found: warn
           retention-days: 30
+
+  jibo-phrases:
+    # 6 saludos en la voz de Jibo (es/ro/nl/de/fr/el), pedidos por el usuario.
+    # Vive como segundo job aqui (no en jibo-phrases.yml) porque GitHub solo
+    # registra workflows que existen en main: un archivo nuevo solo en esta
+    # rama no se puede lanzar por API (404). jibo-phrases.yml queda en el
+    # repo como definicion standalone para cuando se fusione a main.
+    name: 6 greetings in Jibo's voice on ubuntu-24.04 runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Reclaim runner disk space
+        shell: bash
+        run: bash tools/ci/reclaim-linux-runner-space.sh
+
+      - name: Prepare Crow/Asio/tokenizer
+        shell: bash
+        run: bash tools/ci/prepare-linux-deps.sh common
+
+      # Mismos pasos de build que linux-cpu.yml.
+      - name: Build portable CPU in manylinux2014
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=quay.io/pypa/manylinux2014_x86_64
+          docker pull "$image"
+          python3 tools/ci/run-with-diagnostics.py --label "Linux CPU portable build" --log ci-logs/linux-cpu-build.log -- \
+            docker run --rm --platform linux/amd64 \
+              -e S2_BUILD_JOBS=3 \
+              -v "$PWD:/src" -w /src \
+              "$image" \
+              /bin/bash -lc 'cat /etc/os-release; ldd --version | sed -n '1p'; gcc --version | sed -n '1p'; tar --version | sed -n '1p'; bash tools/ci/build-linux-portable.sh cpu'
+          test -x s2-linux-cpu-x86-64
+          ./s2-linux-cpu-x86-64 --runtime-info
+
+      - name: Download stock models (mach9243, HuggingFace)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p models jibo-phrases
+          cd models
+          curl -sSL -o s2-pro-q4_k_m-transformer-only.gguf \
+            "https://huggingface.co/mach9243/s2-pro-gguf/resolve/main/s2-pro-q4_k_m-transformer-only.gguf"
+          curl -sSL -o s2-pro-q4_k_m-codec-only.gguf \
+            "https://huggingface.co/mach9243/s2-pro-gguf/resolve/main/s2-pro-q4_k_m-codec-only.gguf"
+          test "$(stat -c%s s2-pro-q4_k_m-transformer-only.gguf)" -gt 1000000000
+          test "$(stat -c%s s2-pro-q4_k_m-codec-only.gguf)" -gt 100000000
+
+      # Referencia REAL de Jibo: 30.000 s, MP3 mono 48 kHz, subida al repo
+      # con autorizacion expresa del usuario. El pipeline limita la
+      # referencia a 30 s; el audio original de 48.25 s se corto a 30 s.
+      - name: Verify committed Jibo 30 s MP3 reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s voice-tests/jibo-30s.mp3
+          ffprobe -v error -show_entries stream=codec_name,sample_rate,channels \
+            -show_entries format=duration -of default=noprint_wrappers=1 voice-tests/jibo-30s.mp3
+          test "$(stat -c%s voice-tests/jibo-30s.mp3)" -gt 100000
+
+      # --threads 4: el runner tiene 4 vCPU (la bateria de la VM usa 2).
+      # Mismo paso B1 que el job voice-tests.
+      - name: Save voice jibo from the real 30 s reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd jibo-phrases
+          mkdir -p voices
+          start=$(date +%s)
+          ../s2-linux-cpu-x86-64 \
+            --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
+            --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
+            -v -1 --threads 4 --voice-dir voices \
+            --prompt-audio "$PWD/../voice-tests/jibo-30s.mp3" \
+            --prompt-text "Oh, water! Water is the thing I'm probably most afraid of in the world. Alexa, do you like penguins? She's the talking assistant who answers questions and helps out. But just for the record, she can't do this. I think I'll leave the shopping to you. Feel free to buy a penguin. Oh, hello there! It's so good to see a friendly face. I've been hearing some very busy noises lately, like someone is working hard to help me learn new tricks. Thank you for not forgetting about me while we wait for my new brain to finish growing." \
+            --voice jibo --save-voice > b1.log 2>&1
+          echo "B1 rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a b1.log
+          test -s voices/jibo.s2voice
+          ls -la voices/
+
+      # Las frases se escriben a archivos UTF-8 (heredoc con delimitador
+      # entrecomillado: sin expansion de shell) y se pasan al binario por
+      # stdin, que es como el CLI acepta texto UTF-8 (--text se omite).
+      # Asi no hay riesgo con los caracteres no ASCII (ă î ș ț ö ü à ç,
+      # griego) ni con el apostrofe de "aujourd'hui".
+      - name: Write the 6 phrase files (UTF-8)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd jibo-phrases
+          mkdir -p phrases
+          cat > phrases/es.txt <<'PHRASE_EOF'
+          ¡Buenos días! Me alegro de verte. ¿Cómo estás hoy? ¿Quieres jugar un juego conmigo?
+          PHRASE_EOF
+          cat > phrases/ro.txt <<'PHRASE_EOF'
+          Bună dimineața! Mă bucur să te văd. Ce mai faci astăzi? Vrei să ne jucăm un joc împreună?
+          PHRASE_EOF
+          cat > phrases/nl.txt <<'PHRASE_EOF'
+          Goedemorgen! Ik ben blij je te zien. Hoe gaat het vandaag met je? Wil je samen een spelletje spelen?
+          PHRASE_EOF
+          cat > phrases/de.txt <<'PHRASE_EOF'
+          Guten Morgen! Ich freue mich, dich zu sehen. Wie geht es dir heute? Möchtest du ein Spiel mit mir spielen?
+          PHRASE_EOF
+          cat > phrases/fr.txt <<'PHRASE_EOF'
+          Bonjour ! Je suis content de te voir. Comment vas-tu aujourd'hui ? Tu veux jouer à un jeu avec moi ?
+          PHRASE_EOF
+          cat > phrases/el.txt <<'PHRASE_EOF'
+          Καλημέρα! Χαίρομαι που σε βλέπω. Πώς είσαι σήμερα; Θέλεις να παίξουμε ένα παιχνίδι μαζί;
+          PHRASE_EOF
+          python3 - <<'PYEOF'
+          import hashlib
+          for lang in ["es", "ro", "nl", "de", "fr", "el"]:
+              raw = open(f"phrases/{lang}.txt", "rb").read()
+              text = raw.decode("utf-8").strip()
+              print(f"{lang}: {len(raw)} bytes, sha256 {hashlib.sha256(raw).hexdigest()[:12]}, text={text!r}")
+              assert text, f"{lang}: empty phrase file"
+          PYEOF
+
+      # Una invocacion por frase (carga de modelos cada vez); --max-tokens
+      # 256 para que las frases largas no se corten. Si una frase falla,
+      # las demas siguen y el paso falla al final con el recuento.
+      - name: Synthesize the 6 phrases with voice jibo
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd jibo-phrases
+          fail=0
+          for lang in es ro nl de fr el; do
+            start=$(date +%s)
+            if timeout 3600 ../s2-linux-cpu-x86-64 \
+                --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
+                --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
+                -v -1 --threads 4 --max-tokens 256 --voice-dir voices \
+                --voice jibo --output "jibo-${lang}.wav" < "phrases/${lang}.txt" > "jibo-${lang}.log" 2>&1; then
+              echo "${lang} rc=0 elapsed_s=$(( $(date +%s) - start ))" | tee -a "jibo-${lang}.log"
+            else
+              rc=$?
+              echo "${lang} FAILED rc=${rc} elapsed_s=$(( $(date +%s) - start ))" | tee -a "jibo-${lang}.log"
+              fail=1
+            fi
+            if [ ! -s "jibo-${lang}.wav" ]; then
+              echo "${lang}: missing/empty WAV" | tee -a "jibo-${lang}.log"
+              fail=1
+            fi
+          done
+          echo "failures=$fail"
+          test "$fail" = 0
+
+      - name: Verify outputs (WAV non-silent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd jibo-phrases
+          python3 - <<'PYEOF'
+          import math, struct, wave
+          results = []
+          for lang in ["es", "ro", "nl", "de", "fr", "el"]:
+              path = f"jibo-{lang}.wav"
+              with wave.open(path, "rb") as w:
+                  n = w.getnframes(); rate = w.getframerate()
+                  frames = w.readframes(n)
+              vals = struct.unpack(f"<{len(frames)//2}h", frames)
+              rms = math.sqrt(sum(v*v for v in vals) / len(vals)) if vals else 0.0
+              peak = max(abs(v) for v in vals) if vals else 0
+              print(f"{path}: {n} frames, {n/rate:.3f} s, RMS {rms:.1f}, peak {peak}")
+              assert n > 0 and rms > 0, f"{path}: empty or silent"
+              results.append(f"{lang}: {path} {n/rate:.3f} s RMS {rms:.1f} peak {peak}")
+          with open("jibo-phrases-results.txt", "w") as f:
+              f.write("Jibo phrases (Actions runner, real Jibo 30 s voice) — 6 greetings\n")
+              for line in results:
+                  f.write(line + "\n")
+              f.write("ALL SIX PHRASES PASS\n")
+          PYEOF
+          cat jibo-phrases-results.txt
+
+      - name: Upload phrase results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jibo-phrases
+          path: |
+            jibo-phrases/*.wav
+            jibo-phrases/*.log
+            jibo-phrases/jibo-phrases-results.txt
+            jibo-phrases/phrases/*.txt
+            jibo-phrases/voices/jibo.s2voice
+            ci-logs/
+          if-no-files-found: warn
+          retention-days: 30
