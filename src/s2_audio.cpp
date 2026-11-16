@@ -34,6 +34,12 @@ namespace s2 {
 namespace {
 constexpr size_t AUDIO_DECODE_CHUNK_FRAMES = 4096;
 constexpr size_t MAX_DECODED_MONO_FRAMES = 64u * 1024u * 1024u; // 256 MiB float32 mono
+// Container padding tolerance for the decode frame limit: an MP3 at the
+// duration limit carries up to ~2 frames of encoder delay/padding (1152
+// samples/frame) past its real audio, which must not fail the load. Files
+// genuinely over the limit still fail: the tolerance is tiny next to the
+// limit, and the _limited loaders truncate to the limit below.
+constexpr size_t DECODE_PADDING_TOLERANCE_FRAMES = 4096;
 constexpr unsigned int MAX_AUDIO_CHANNELS = 32;
 constexpr size_t MAX_AUDIO_MEMORY_INPUT = 512u * 1024u * 1024u;
 
@@ -250,7 +256,8 @@ static bool append_downmixed(const float * interleaved, size_t frames, unsigned 
 static size_t decode_frame_limit(unsigned int sample_rate, int32_t max_seconds) noexcept {
     if (max_seconds <= 0) return MAX_DECODED_MONO_FRAMES;
     const uint64_t requested = static_cast<uint64_t>(sample_rate) * static_cast<uint64_t>(max_seconds);
-    return static_cast<size_t>(std::min<uint64_t>(requested, MAX_DECODED_MONO_FRAMES));
+    const uint64_t with_tolerance = requested + DECODE_PADDING_TOLERANCE_FRAMES;
+    return static_cast<size_t>(std::min<uint64_t>(with_tolerance, MAX_DECODED_MONO_FRAMES));
 }
 
 static bool decode_wav_stream(drwav & wav, AudioData & out, int32_t max_seconds = 0) {
@@ -668,10 +675,16 @@ bool load_audio_limited(const std::string & path, AudioData & out, int32_t targe
     if (max_seconds <= 0 || target_sample_rate < 0 || target_sample_rate > 768000 ||
         (target_sample_rate != 0 && target_sample_rate < 1000)) return false;
     if (!audio_read_impl(path, out, max_seconds) || out.sample_rate <= 0 || out.samples.empty()) return false;
+    // The decoder may return up to DECODE_PADDING_TOLERANCE_FRAMES past the
+    // limit (MP3 encoder delay/padding). The reference is the real audio up
+    // to the limit; drop the padding instead of failing the load.
+    const uint64_t max_src = static_cast<uint64_t>(out.sample_rate) * static_cast<uint64_t>(max_seconds);
+    if (static_cast<uint64_t>(out.samples.size()) > max_src) out.samples.resize(static_cast<size_t>(max_src));
     if (target_sample_rate > 0 && out.sample_rate != target_sample_rate) {
         auto resampled = audio_resample(out.samples.data(), out.samples.size(), out.sample_rate, target_sample_rate);
+        if (resampled.empty()) return false;
         const uint64_t max_out = static_cast<uint64_t>(target_sample_rate) * static_cast<uint64_t>(max_seconds);
-        if (resampled.empty() || static_cast<uint64_t>(resampled.size()) > max_out) return false;
+        if (static_cast<uint64_t>(resampled.size()) > max_out) resampled.resize(static_cast<size_t>(max_out));
         out.samples = std::move(resampled);
         out.sample_rate = target_sample_rate;
     }
@@ -683,10 +696,15 @@ bool load_audio_from_memory_limited(const void * data, size_t bytes, AudioData &
     if (max_seconds <= 0 || target_sample_rate < 0 || target_sample_rate > 768000 ||
         (target_sample_rate != 0 && target_sample_rate < 1000)) return false;
     if (!audio_read_from_memory_impl(data, bytes, out, max_seconds) || out.sample_rate <= 0 || out.samples.empty()) return false;
+    // See load_audio_limited: drop MP3 encoder delay/padding past the limit
+    // instead of failing the load.
+    const uint64_t max_src = static_cast<uint64_t>(out.sample_rate) * static_cast<uint64_t>(max_seconds);
+    if (static_cast<uint64_t>(out.samples.size()) > max_src) out.samples.resize(static_cast<size_t>(max_src));
     if (target_sample_rate > 0 && out.sample_rate != target_sample_rate) {
         auto resampled = audio_resample(out.samples.data(), out.samples.size(), out.sample_rate, target_sample_rate);
+        if (resampled.empty()) return false;
         const uint64_t max_out = static_cast<uint64_t>(target_sample_rate) * static_cast<uint64_t>(max_seconds);
-        if (resampled.empty() || static_cast<uint64_t>(resampled.size()) > max_out) return false;
+        if (static_cast<uint64_t>(resampled.size()) > max_out) resampled.resize(static_cast<size_t>(max_out));
         out.samples = std::move(resampled);
         out.sample_rate = target_sample_rate;
     }
