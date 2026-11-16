@@ -5,11 +5,10 @@ name: Voice tests (Actions runner)
 # supera el limite del cgroup y el OOM-killer mata el proceso (B1, B2, C8,
 # D5 con la referencia de 30 s). La causa del fallo original era otra: el
 # MP3 de 48 kHz no cargaba (ahora aceptado, fix f8b58db). Aqui se verifica
-# la cadena completa con una referencia equivalente: MP3 48 kHz mono 64 kbps
-# de 30.000 s, generada en el runner con ffmpeg (tono senoidal). El archivo
-# de Jibo del usuario NO se sube al repo; la referencia sintetica ejercita
-# el mismo codigo (drmp3 48 kHz al limite de 30 s -> resample a 44.1 kHz ->
-# encode del codec).
+# la cadena completa con la referencia REAL de Jibo: MP3 48 kHz mono de
+# 30.000 s (voice-tests/jibo-30s.mp3), subida al repo con autorizacion
+# expresa del usuario (2026-11-16). El codigo ejercitado es el mismo
+# (drmp3 48 kHz al limite de 30 s -> resample a 44.1 kHz -> encode del codec).
 #
 # Solo manual (workflow_dispatch). NUNCA en push/PR.
 on:
@@ -85,20 +84,18 @@ jobs:
           test "$(stat -c%s s2-pro-q4_k_m-transformer-only.gguf)" -gt 1000000000
           test "$(stat -c%s s2-pro-q4_k_m-codec-only.gguf)" -gt 100000000
 
-      # Referencia equivalente al MP3 de Jibo: 30.000 s, MP3 mono 48 kHz
-      # 64 kbps. El contenido (tono senoidal) no importa para la ruta bajo
-      # prueba (carga drmp3 -> resample -> encode); lo que importa es el
-      # formato, la tasa y la duracion al limite de 30 s.
-      - name: Create synthetic 48 kHz 30 s MP3 reference
+      # Referencia REAL de Jibo: 30.000 s, MP3 mono 48 kHz, subida al repo
+      # con autorizacion expresa del usuario. El pipeline limita la
+      # referencia a 30 s; el audio original de 48.25 s se corto a 30 s.
+      - name: Verify committed Jibo 30 s MP3 reference
         shell: bash
         run: |
           set -euo pipefail
           cd voice-tests
-          ffmpeg -y -v error -f lavfi -i "sine=frequency=440:duration=30" \
-            -ar 48000 -ac 1 -b:a 64k ref48.mp3
+          test -s jibo-30s.mp3
           ffprobe -v error -show_entries stream=codec_name,sample_rate,channels \
-            -show_entries format=duration -of default=noprint_wrappers=1 ref48.mp3
-          test "$(stat -c%s ref48.mp3)" -gt 100000
+            -show_entries format=duration -of default=noprint_wrappers=1 jibo-30s.mp3
+          test "$(stat -c%s jibo-30s.mp3)" -gt 100000
 
       # --threads 4: el runner tiene 4 vCPU (la bateria de la VM usa 2).
       - name: B1-equivalent (--save-voice from 48 kHz 30 s MP3)
@@ -112,11 +109,11 @@ jobs:
             --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
             --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
             -v -1 --threads 4 --voice-dir voices \
-            --prompt-audio "$PWD/ref48.mp3" \
-            --prompt-text "This is a thirty second test tone used as a voice reference." \
-            --voice synth48 --save-voice 2>&1 | tee b1.log
+            --prompt-audio "$PWD/jibo-30s.mp3" \
+            --prompt-text "Oh, water! Water is the thing I'm probably most afraid of in the world. Alexa, do you like penguins? She's the talking assistant who answers questions and helps out. But just for the record, she can't do this. I think I'll leave the shopping to you. Feel free to buy a penguin. Oh, hello there! It's so good to see a friendly face. I've been hearing some very busy noises lately, like someone is working hard to help me learn new tricks. Thank you for not forgetting about me while we wait for my new brain to finish growing." \
+            --voice jibo --save-voice 2>&1 | tee b1.log
           echo "B1 rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a b1.log
-          test -s voices/synth48.s2voice
+          test -s voices/jibo.s2voice
           ls -la voices/
 
       - name: B2-equivalent (synthesize with the saved voice)
@@ -129,7 +126,7 @@ jobs:
             --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
             --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
             -v -1 --threads 4 --max-tokens 128 --voice-dir voices \
-            --voice synth48 --text "Hello from s2.cpp." \
+            --voice jibo --text "Hello from s2.cpp." \
             --output b2.wav 2>&1 | tee b2.log
           echo "B2 rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a b2.log
           test -s b2.wav
@@ -153,11 +150,11 @@ jobs:
           curl -sS "http://127.0.0.1:8081/health"; echo
           # C8: POST /v1/tts with reference_audio as a server-side path,
           # exactly like the battery's C8-direct-clone.
-          python3 - "$PWD/ref48.mp3" <<'PYEOF'
+          python3 - "$PWD/jibo-30s.mp3" <<'PYEOF'
           import json, sys
           payload = {"text": "Hello in the reference voice.", "format": "wav",
                      "max_tokens": 128, "reference_audio": sys.argv[1],
-                     "prompt_text": "This is a thirty second test tone used as a voice reference."}
+                     "prompt_text": "Oh, water! Water is the thing I'm probably most afraid of in the world. Alexa, do you like penguins? She's the talking assistant who answers questions and helps out. But just for the record, she can't do this. I think I'll leave the shopping to you. Feel free to buy a penguin. Oh, hello there! It's so good to see a friendly face. I've been hearing some very busy noises lately, like someone is working hard to help me learn new tricks. Thank you for not forgetting about me while we wait for my new brain to finish growing."}
           open("c8-payload.json", "w", encoding="utf-8").write(json.dumps(payload))
           PYEOF
           start=$(date +%s)
@@ -312,12 +309,12 @@ jobs:
           if __name__ == "__main__":
               main()
           PYEOF
-          python3 - "$PWD/ref48.mp3" <<'PYEOF'
+          python3 - "$PWD/jibo-30s.mp3" <<'PYEOF'
           import json, sys
           msg = {"text": "Hello in the reference voice.", "segment": True,
                  "stream_stride": 0, "max_tokens": 128,
                  "reference_audio": sys.argv[1],
-                 "prompt_text": "This is a thirty second test tone used as a voice reference."}
+                 "prompt_text": "Oh, water! Water is the thing I'm probably most afraid of in the world. Alexa, do you like penguins? She's the talking assistant who answers questions and helps out. But just for the record, she can't do this. I think I'll leave the shopping to you. Feel free to buy a penguin. Oh, hello there! It's so good to see a friendly face. I've been hearing some very busy noises lately, like someone is working hard to help me learn new tricks. Thank you for not forgetting about me while we wait for my new brain to finish growing."}
           open("d5-message.json", "w", encoding="utf-8").write(json.dumps(msg))
           PYEOF
           start=$(date +%s)
@@ -349,8 +346,8 @@ jobs:
           print(f"d5.pcm: {rep['pcm_bytes']} B, RMS {rep['rms']}, peak {rep['peak']}, done={bool(rep['final'])}")
           assert rep["pcm_bytes"] > 0 and rep["rms"] >= 50 and rep["final"], "D5 PCM empty/silent/no done"
           with open("voice-tests-results.txt", "w") as f:
-              f.write("Voice tests (Actions runner, synthetic 48 kHz 30 s MP3) — B1/B2/C8/D5\n")
-              f.write("B1 --save-voice: synth48.s2voice created\n")
+              f.write("Voice tests (Actions runner, real Jibo 48 kHz 30 s MP3) — B1/B2/C8/D5\n")
+              f.write("B1 --save-voice: jibo.s2voice created\n")
               f.write("B2 use saved voice: b2.wav valid\n")
               f.write("C8 HTTP direct-clone: c8.wav valid, HTTP 200\n")
               f.write("D5 WS reference_audio: d5.pcm valid, done=true\n")
@@ -369,7 +366,8 @@ jobs:
             voice-tests/*.log
             voice-tests/*.json
             voice-tests/voice-tests-results.txt
-            voice-tests/ref48.mp3
+            voice-tests/jibo-30s.mp3
+            voice-tests/voices/
             ci-logs/
           if-no-files-found: warn
           retention-days: 30
