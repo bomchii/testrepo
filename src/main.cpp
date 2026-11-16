@@ -621,6 +621,29 @@ static bool read_generated_wave(const std::string & path, bool pcm_only, std::st
     return true;
 }
 
+static std::vector<char *> filtered_child_envp() {
+    // The launcher exports LD_LIBRARY_PATH pointing at the runtime cache,
+    // whose bundled libstdc++/libgcc_s are older than the system ones. A
+    // child that is a system tool (ffmpeg) must NOT inherit that path, or
+    // it dies at startup with GLIBCXX_/CXXABI_/GCC_ version errors. Keep
+    // everything else (notably PATH, so posix_spawnp can still resolve the
+    // tool name); only the launcher's library-path variables are dropped.
+    // These variables are POSIX-only, so the Windows branch is unaffected.
+    std::vector<char *> env;
+#if defined(__APPLE__)
+    char ** cur = *_NSGetEnviron();
+#else
+    char ** cur = environ;
+#endif
+    for (char ** e = cur; e != nullptr && *e != nullptr; ++e) {
+        if (std::strncmp(*e, "LD_LIBRARY_PATH=", 16) == 0) continue;
+        if (std::strncmp(*e, "LD_PRELOAD=", 11) == 0) continue;
+        env.push_back(*e);
+    }
+    env.push_back(nullptr);
+    return env;
+}
+
 static int run_process(const std::vector<std::string> & args) {
     if (args.empty()) return -1;
 #ifdef _WIN32
@@ -647,12 +670,11 @@ static int run_process(const std::vector<std::string> & args) {
     for (const auto & a : args) argv.push_back(const_cast<char *>(a.c_str()));
     argv.push_back(nullptr);
     pid_t pid = -1;
-    #  if defined(__APPLE__)
-    char ** envp = *_NSGetEnviron();
-#  else
-    char ** envp = environ;
-#  endif
-    const int spawn_rc = posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), envp);
+    // Spawn without the launcher's bundled-library path (see
+    // filtered_child_envp): ffmpeg must load the system libstdc++, not the
+    // old one shipped in the runtime cache.
+    std::vector<char *> filtered_env = filtered_child_envp();
+    const int spawn_rc = posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(), filtered_env.data());
     if (spawn_rc != 0) { errno = spawn_rc; return -1; }
     int status = 0;
     while (waitpid(pid, &status, 0) < 0) {
