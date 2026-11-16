@@ -770,7 +770,11 @@ static bool validate_pipeline_params(const s2::PipelineParams & p,
     if (!std::isfinite(p.gen.early_stop_threshold) ||
         (p.gen.early_stop_threshold != -1.0f && p.gen.early_stop_threshold != 1.0f))
         return fail("early_stop_threshold values that change legacy Fish multi-sample early-stop semantics require tensor-batched generation; this single-sample engine accepts only -1 (disabled) or 1.0 (neutral/all-finished)");
-    if (p.gen.min_tokens_before_end >= p.gen.max_new_tokens)
+    // min_end_tokens == max_tokens is clamped to max_tokens - 1 by the
+    // generator (see s2_generate.cpp); only a strictly larger value is a
+    // contradictory request. This lets small --max-tokens values work with
+    // the default min_end_tokens (64) instead of erroring.
+    if (p.gen.min_tokens_before_end > p.gen.max_new_tokens)
         return fail("min_end_tokens must be smaller than max_tokens");
     if (p.gen.repetition_penalty < 1.0f || !std::isfinite(p.gen.repetition_penalty) || p.gen.repetition_penalty > 10.0f)
         return fail("repetition_penalty must be finite and between 1.0 and 10.0");
@@ -1408,8 +1412,9 @@ ALL COMMAND-LINE OPTIONS:
 OPTION INTERACTIONS:
   * --prompt-audio requires --prompt-text and takes precedence over --voice.
   * --codec-vulkan -2 inherits the transformer device after parsing.
-  * --min-end-tokens must be lower than --max-tokens; runtime additionally
-    clamps it below a smaller effective context/segment budget when necessary.
+  * --min-end-tokens must not exceed --max-tokens (when equal, the runtime
+    clamps it to max_tokens - 1); runtime additionally clamps it below a
+    smaller effective context/segment budget when necessary.
   * text/prompt_text must be valid UTF-8. --segment handles no-space CJK text,
     repeated CJK punctuation and Unicode sentence boundaries without inserting
     artificial ASCII spaces. Keep --min-seg-chars=0 when tiny CJK utterances
