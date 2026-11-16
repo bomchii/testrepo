@@ -1121,7 +1121,15 @@ jobs:
                 set -euo pipefail
                 cat /etc/os-release
                 ldd --version | sed -n '1p'
-                dnf -y install python39 python39-pip make file binutils gcc gcc-c++ >/dev/null
+                # The NVIDIA image ships only the ubi-8-appstream repo (its gcc
+                # 8.5.0-31 needs libgcc/libgomp/libstdc++ 8.5.0-31 from baseos,
+                # which the Rocky BaseOS mirrorlist may not have synced yet).
+                # Add the matching ubi-8-baseos repo so the toolchain resolves
+                # from the canonical UBI CDN instead of depending on mirror sync.
+                echo -e "[ubi-8-baseos]\nname=Red Hat Universal Base Image 8 (BaseOS)\nbaseurl=https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi8/8/x86_64/baseos/os\nenabled=1\ngpgcheck=1\ngpgkey=https://www.redhat.com/security/data/fd431d51.txt" > /etc/yum.repos.d/ubi-8-baseos.repo
+                dnf repolist
+                dnf clean all
+                dnf -y --refresh install python39 python39-pip make file binutils gcc gcc-c++ >/dev/null
                 python3.9 -m pip install --no-cache-dir "cmake==4.4.3" >/dev/null
                 export PATH="/usr/local/bin:$PATH"
                 gcc --version | sed -n '1p'
