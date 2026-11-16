@@ -1,0 +1,213 @@
+name: Long tests (Actions runner)
+
+# Pruebas largas de TEST-PLAN.md que NO caben en la vida de la VM (~1-2 h):
+#   A10-chunk / A10-chunk-nocond (CLI longform, cap 400, ~2.5-3 h en la VM)
+#   C7-longform (HTTP /v1/tts longform, max_new_tokens 600, ~1.5-2 h en la VM)
+# El runner de GitHub vive hasta 6 h por job, asi que aqui si caben.
+#
+# Solo manual (workflow_dispatch). NUNCA en push/PR: no debe dispararse con
+# cada arreglo del ciclo rapido. concurrency cancel-in-progress: false para
+# que un re-dispatch no mate una prueba de 3 h en curso.
+# No toca el workflow grande (build-all-backends.yml, desactivado) ni el
+# rapido (linux-cpu.yml): es un workflow aparte, solo para estas 3 pruebas.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: long-tests-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  long-tests:
+    name: A10 + C7 on ubuntu-24.04 runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Reclaim runner disk space
+        shell: bash
+        run: bash tools/ci/reclaim-linux-runner-space.sh
+
+      - name: Prepare Crow/Asio/tokenizer
+        shell: bash
+        run: bash tools/ci/prepare-linux-deps.sh common
+
+      # Mismos pasos de build que linux-cpu.yml: binario portable CPU
+      # (manylinux2014, glibc 2.17) desde el mismo commit.
+      - name: Build portable CPU in manylinux2014
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=quay.io/pypa/manylinux2014_x86_64
+          docker pull "$image"
+          python3 tools/ci/run-with-diagnostics.py --label "Linux CPU portable build" --log ci-logs/linux-cpu-build.log -- \
+            docker run --rm --platform linux/amd64 \
+              -e S2_BUILD_JOBS=3 \
+              -v "$PWD:/src" -w /src \
+              "$image" \
+              /bin/bash -lc 'cat /etc/os-release; ldd --version | sed -n '1p'; gcc --version | sed -n '1p'; tar --version | sed -n '1p'; bash tools/ci/build-linux-portable.sh cpu'
+          test -x s2-linux-cpu-x86-64
+          ./s2-linux-cpu-x86-64 --runtime-info
+
+      - name: Install ffmpeg (server --ffmpeg flag)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -hide_banner -version | head -1
+
+      - name: Download stock models (mach9243, HuggingFace)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p models long-tests
+          cd models
+          curl -sSL -o s2-pro-q4_k_m-transformer-only.gguf \
+            "https://huggingface.co/mach9243/s2-pro-gguf/resolve/main/s2-pro-q4_k_m-transformer-only.gguf"
+          curl -sSL -o s2-pro-q4_k_m-codec-only.gguf \
+            "https://huggingface.co/mach9243/s2-pro-gguf/resolve/main/s2-pro-q4_k_m-codec-only.gguf"
+          ls -la
+          test "$(stat -c%s s2-pro-q4_k_m-transformer-only.gguf)" -gt 1000000000
+          test "$(stat -c%s s2-pro-q4_k_m-codec-only.gguf)" -gt 100000000
+
+      - name: Write longform texts (exactos de TEST-PLAN / run_cli.py / run_http.py)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > long-tests/longform.txt <<'EOF'
+          El viejo faro se alzaba sobre el acantilado, mirando el mar gris de la mañana. Cada noche, su luz giraba lenta y constante, guiando a los barcos de vuelta a casa. Los pescadores del pueblo contaban historias del farero, un hombre silencioso que conocía cada roca de la costa. Dicen que una vez, durante una tormenta terrible, la luz no se apagó ni un solo instante. El mar rugía y el viento aullaba, pero el faro seguía allí, firme como una promesa. Cuando por fin amaneció, los barcos volvieron sanos y salvos al puerto, y el pueblo entero celebró. Desde entonces, cada año, en la misma fecha, encienden velas en la playa en honor al farero y su luz. La historia se cuenta de padres a hijos, y nunca se olvida. El faro sigue en pie todavía hoy. Los niños suben la colina para verlo de cerca, y sueñan con el mar. La luz sigue girando cada noche.
+          EOF
+          cat > long-tests/c7-text.txt <<'EOF'
+          El viejo faro se alzaba sobre el acantilado, mirando el mar gris de la mañana. Cada noche, su luz giraba lenta y constante, guiando a los barcos de vuelta a casa. Los pescadores del pueblo contaban historias del farero, un hombre silencioso que conocía cada roca de la costa. Dicen que una vez, durante una tormenta terrible, la luz no se apagó ni un solo instante. El mar rugía y el viento aullaba, pero el faro seguía allí, firme como una promesa. Cuando por fin amaneció, los barcos volvieron sanos y salvos al puerto, y el pueblo entero celebró.
+          EOF
+          wc -c long-tests/longform.txt long-tests/c7-text.txt
+
+      # --threads 4: el runner tiene 4 vCPU. La bateria de la VM usa 2, pero
+      # el comportamiento bajo prueba (chunking/condicion) no depende de los
+      # hilos (eso lo cubre A11); con 4 hilos las 3 pruebas caben en el
+      # limite de 6 h del job. Mismos caps y flags que en la VM en lo demas.
+      - name: A10-chunk (CLI longform, cap 400, condicionado)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd long-tests
+          echo "commit: $(git -C .. rev-parse HEAD)"
+          start=$(date +%s)
+          timeout 7200 ../s2-linux-cpu-x86-64 \
+            --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
+            --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
+            -v -1 --threads 4 --max-tokens 400 \
+            --chunk-length 300 --min-chunk-length 50 \
+            --output a10.wav < longform.txt 2>&1 | tee a10.log
+          echo "A10-chunk rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a a10.log
+
+      - name: A10-chunk-nocond (CLI longform, cap 400, sin condicion)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd long-tests
+          start=$(date +%s)
+          timeout 7200 ../s2-linux-cpu-x86-64 \
+            --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
+            --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
+            -v -1 --threads 4 --max-tokens 400 \
+            --chunk-length 300 --min-chunk-length 50 \
+            --no-condition-on-previous-chunks \
+            --output a10nc.wav < longform.txt 2>&1 | tee a10nc.log
+          echo "A10-chunk-nocond rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a a10nc.log
+
+      - name: C7-longform (HTTP /v1/tts, max_new_tokens 600)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd long-tests
+          mkdir -p voices
+          ../s2-linux-cpu-x86-64 \
+            --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
+            --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
+            -v -1 --threads 4 --ffmpeg /usr/bin/ffmpeg \
+            --port 8081 --voice-dir voices > server.log 2>&1 &
+          SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+          for i in $(seq 1 120); do
+            if curl -sS -o /dev/null "http://127.0.0.1:8081/health" 2>/dev/null; then break; fi
+            sleep 5
+          done
+          curl -sS "http://127.0.0.1:8081/health"; echo
+          python3 - "$PWD/c7-text.txt" <<'PYEOF'
+          import json, sys
+          text = open(sys.argv[1], encoding="utf-8").read().strip()
+          payload = {"text": text, "format": "wav", "segment": True,
+                     "chunk_length": 300, "min_chunk_length": 50,
+                     "condition_on_previous_chunks": True, "max_new_tokens": 600}
+          open("c7-payload.json", "w", encoding="utf-8").write(json.dumps(payload))
+          PYEOF
+          start=$(date +%s)
+          code=$(timeout 7200 curl -sS -X POST "http://127.0.0.1:8081/v1/tts" \
+            -H "Content-Type: application/json" \
+            -d @c7-payload.json -o c7.wav -w "%{http_code}")
+          echo "C7-longform http_code=$code elapsed_s=$(( $(date +%s) - start ))" | tee c7.log
+          test "$code" = "200"
+          kill $SRV 2>/dev/null || true
+          trap - EXIT
+
+      - name: Verify WAVs (duracion, RMS, peak; falla si vacio o silencioso)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd long-tests
+          python3 - <<'PYEOF'
+          import math, struct, wave
+          def check(path):
+              with wave.open(path, "rb") as w:
+                  n = w.getnframes(); rate = w.getframerate()
+                  ch = w.getnchannels(); sw = w.getsampwidth()
+                  frames = w.readframes(n)
+              assert sw == 2, f"{path}: sample width {sw} != 2"
+              vals = struct.unpack(f"<{len(frames)//2}h", frames)
+              rms = math.sqrt(sum(v*v for v in vals) / len(vals)) if vals else 0.0
+              peak = max(abs(v) for v in vals) if vals else 0
+              dur = n / rate
+              print(f"{path}: {n} frames, {dur:.3f} s, {rate} Hz, {ch} ch, RMS {rms:.1f}, peak {peak}")
+              assert n > 0 and rms > 0, f"{path}: empty or silent"
+              return dur
+          d = {}
+          d["a10.wav"] = check("a10.wav")
+          d["a10nc.wav"] = check("a10nc.wav")
+          d["c7.wav"] = check("c7.wav")
+          with open("long-tests-results.txt", "w") as f:
+              f.write("Long tests (Actions runner) — A10-chunk, A10-chunk-nocond, C7-longform\n")
+              for k, v in d.items():
+                  f.write(f"{k}: {v:.3f} s\n")
+              f.write("ALL THREE WAVS VALID, NON-SILENT\n")
+          PYEOF
+          cat long-tests-results.txt
+
+      - name: Upload long-test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: long-tests-results
+          path: |
+            long-tests/*.wav
+            long-tests/*.log
+            long-tests/long-tests-results.txt
+            long-tests/c7-payload.json
+            ci-logs/
+          if-no-files-found: warn
+          retention-days: 30
