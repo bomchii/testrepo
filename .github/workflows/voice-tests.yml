@@ -426,6 +426,18 @@ jobs:
           test "$(stat -c%s s2-pro-q4_k_m-transformer-only.gguf)" -gt 1000000000
           test "$(stat -c%s s2-pro-q4_k_m-codec-only.gguf)" -gt 100000000
 
+      # ffprobe viene con ffmpeg (no preinstalado en el runner): el paso
+      # de verificacion del MP3 lo necesita. Sin este paso fallaba.
+      - name: Install ffmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -hide_banner -version | head -1
+
       # Referencia REAL de Jibo: 30.000 s, MP3 mono 48 kHz, subida al repo
       # con autorizacion expresa del usuario. El pipeline limita la
       # referencia a 30 s; el audio original de 48.25 s se corto a 30 s.
