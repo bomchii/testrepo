@@ -1,0 +1,375 @@
+name: Voice tests (Actions runner)
+
+# Verifica en el runner (16 GB RAM) las pruebas de voz que NO caben en la
+# VM (6 GB): el encode de una referencia de 30 s + los dos modelos (3.5 GB)
+# supera el limite del cgroup y el OOM-killer mata el proceso (B1, B2, C8,
+# D5 con la referencia de 30 s). La causa del fallo original era otra: el
+# MP3 de 48 kHz no cargaba (ahora aceptado, fix f8b58db). Aqui se verifica
+# la cadena completa con una referencia equivalente: MP3 48 kHz mono 64 kbps
+# de 30.000 s, generada en el runner con ffmpeg (tono senoidal). El archivo
+# de Jibo del usuario NO se sube al repo; la referencia sintetica ejercita
+# el mismo codigo (drmp3 48 kHz al limite de 30 s -> resample a 44.1 kHz ->
+# encode del codec).
+#
+# Solo manual (workflow_dispatch). NUNCA en push/PR.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: voice-tests-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  voice-tests:
+    name: B1 + B2 + C8 + D5 on ubuntu-24.04 runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Reclaim runner disk space
+        shell: bash
+        run: bash tools/ci/reclaim-linux-runner-space.sh
+
+      - name: Prepare Crow/Asio/tokenizer
+        shell: bash
+        run: bash tools/ci/prepare-linux-deps.sh common
+
+      # Mismos pasos de build que linux-cpu.yml.
+      - name: Build portable CPU in manylinux2014
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=quay.io/pypa/manylinux2014_x86_64
+          docker pull "$image"
+          python3 tools/ci/run-with-diagnostics.py --label "Linux CPU portable build" --log ci-logs/linux-cpu-build.log -- \
+            docker run --rm --platform linux/amd64 \
+              -e S2_BUILD_JOBS=3 \
+              -v "$PWD:/src" -w /src \
+              "$image" \
+              /bin/bash -lc 'cat /etc/os-release; ldd --version | sed -n '1p'; gcc --version | sed -n '1p'; tar --version | sed -n '1p'; bash tools/ci/build-linux-portable.sh cpu'
+          test -x s2-linux-cpu-x86-64
+          ./s2-linux-cpu-x86-64 --runtime-info
+
+      - name: Install ffmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -hide_banner -version | head -1
+
+      - name: Download stock models (mach9243, HuggingFace)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p models voice-tests
+          cd models
+          curl -sSL -o s2-pro-q4_k_m-transformer-only.gguf \
+            "https://huggingface.co/mach9243/s2-pro-gguf/resolve/main/s2-pro-q4_k_m-transformer-only.gguf"
+          curl -sSL -o s2-pro-q4_k_m-codec-only.gguf \
+            "https://huggingface.co/mach9243/s2-pro-gguf/resolve/main/s2-pro-q4_k_m-codec-only.gguf"
+          test "$(stat -c%s s2-pro-q4_k_m-transformer-only.gguf)" -gt 1000000000
+          test "$(stat -c%s s2-pro-q4_k_m-codec-only.gguf)" -gt 100000000
+
+      # Referencia equivalente al MP3 de Jibo: 30.000 s, MP3 mono 48 kHz
+      # 64 kbps. El contenido (tono senoidal) no importa para la ruta bajo
+      # prueba (carga drmp3 -> resample -> encode); lo que importa es el
+      # formato, la tasa y la duracion al limite de 30 s.
+      - name: Create synthetic 48 kHz 30 s MP3 reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd voice-tests
+          ffmpeg -y -v error -f lavfi -i "sine=frequency=440:duration=30" \
+            -ar 48000 -ac 1 -b:a 64k ref48.mp3
+          ffprobe -v error -show_entries stream=codec_name,sample_rate,channels \
+            -show_entries format=duration -of default=noprint_wrappers=1 ref48.mp3
+          test "$(stat -c%s ref48.mp3)" -gt 100000
+
+      # --threads 4: el runner tiene 4 vCPU (la bateria de la VM usa 2).
+      - name: B1-equivalent (--save-voice from 48 kHz 30 s MP3)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd voice-tests
+          mkdir -p voices
+          start=$(date +%s)
+          ../s2-linux-cpu-x86-64 \
+            --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
+            --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
+            -v -1 --threads 4 --voice-dir voices \
+            --prompt-audio "$PWD/ref48.mp3" \
+            --prompt-text "This is a thirty second test tone used as a voice reference." \
+            --voice synth48 --save-voice 2>&1 | tee b1.log
+          echo "B1 rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a b1.log
+          test -s voices/synth48.s2voice
+          ls -la voices/
+
+      - name: B2-equivalent (synthesize with the saved voice)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd voice-tests
+          start=$(date +%s)
+          timeout 3600 ../s2-linux-cpu-x86-64 \
+            --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
+            --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
+            -v -1 --threads 4 --max-tokens 128 --voice-dir voices \
+            --voice synth48 --text "Hello from s2.cpp." \
+            --output b2.wav 2>&1 | tee b2.log
+          echo "B2 rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a b2.log
+          test -s b2.wav
+
+      - name: C8 + D5 equivalents (HTTP direct-clone + WS reference_audio)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd voice-tests
+          ../s2-linux-cpu-x86-64 \
+            --model ../models/s2-pro-q4_k_m-transformer-only.gguf \
+            --model-codec ../models/s2-pro-q4_k_m-codec-only.gguf \
+            -v -1 --threads 4 --ffmpeg /usr/bin/ffmpeg \
+            --port 8081 --voice-dir voices > server.log 2>&1 &
+          SRV=$!
+          trap 'kill $SRV 2>/dev/null || true' EXIT
+          for i in $(seq 1 120); do
+            if curl -sS -o /dev/null "http://127.0.0.1:8081/health" 2>/dev/null; then break; fi
+            sleep 5
+          done
+          curl -sS "http://127.0.0.1:8081/health"; echo
+          # C8: POST /v1/tts with reference_audio as a server-side path,
+          # exactly like the battery's C8-direct-clone.
+          python3 - "$PWD/ref48.mp3" <<'PYEOF'
+          import json, sys
+          payload = {"text": "Hello in the reference voice.", "format": "wav",
+                     "max_tokens": 128, "reference_audio": sys.argv[1],
+                     "prompt_text": "This is a thirty second test tone used as a voice reference."}
+          open("c8-payload.json", "w", encoding="utf-8").write(json.dumps(payload))
+          PYEOF
+          start=$(date +%s)
+          code=$(timeout 3600 curl -sS -X POST "http://127.0.0.1:8081/v1/tts" \
+            -H "Content-Type: application/json" \
+            -d @c8-payload.json -o c8.wav -w "%{http_code}")
+          echo "C8 http_code=$code elapsed_s=$(( $(date +%s) - start ))" | tee c8.log
+          test "$code" = "200"
+          test -s c8.wav
+          # D5: /ws/tts with reference_audio, via the battery's stdlib client.
+          cat > ws_client.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Minimal RFC 6455 WebSocket client using only the Python standard library."""
+          import base64, json, math, os, socket, struct, sys, time
+          from urllib.parse import urlparse
+          def ws_connect(url):
+              u = urlparse(url)
+              host, port = u.hostname, u.port or 80
+              path = u.path or "/"
+              key = base64.b64encode(os.urandom(16)).decode()
+              sock = socket.create_connection((host, port), timeout=15)
+              req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+                     f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                     f"Sec-WebSocket-Version: 13\r\n\r\n")
+              sock.sendall(req.encode())
+              buf = b""
+              while b"\r\n\r\n" not in buf:
+                  chunk = sock.recv(4096)
+                  if not chunk:
+                      raise RuntimeError("handshake: connection closed")
+                  buf += chunk
+              head = buf.split(b"\r\n\r\n", 1)[0].decode(errors="replace")
+              if "101" not in head.splitlines()[0]:
+                  raise RuntimeError("handshake failed: " + head.splitlines()[0])
+              return sock, buf.split(b"\r\n\r\n", 1)[1]
+          def send_text(sock, payload):
+              data = payload.encode()
+              header = bytearray([0x81])
+              n = len(data)
+              if n < 126:
+                  header.append(0x80 | n)
+              elif n < 65536:
+                  header.append(0x80 | 126)
+                  header += struct.pack(">H", n)
+              else:
+                  header.append(0x80 | 127)
+                  header += struct.pack(">Q", n)
+              mask = os.urandom(4)
+              header += mask
+              masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+              sock.sendall(bytes(header) + masked)
+          def recv_exact(sock, n, timeout):
+              sock.settimeout(timeout)
+              buf = b""
+              while len(buf) < n:
+                  chunk = sock.recv(n - len(buf))
+                  if not chunk:
+                      raise RuntimeError("connection closed mid-frame")
+                  buf += chunk
+              return buf
+          def recv_frames(sock, deadline):
+              while time.time() < deadline:
+                  remaining = deadline - time.time()
+                  hdr = recv_exact(sock, 2, remaining)
+                  fin = hdr[0] & 0x80
+                  opcode = hdr[0] & 0x0F
+                  masked = hdr[1] & 0x80
+                  ln = hdr[1] & 0x7F
+                  if ln == 126:
+                      ln = struct.unpack(">H", recv_exact(sock, 2, remaining))[0]
+                  elif ln == 127:
+                      ln = struct.unpack(">Q", recv_exact(sock, 8, remaining))[0]
+                  if masked:
+                      mask = recv_exact(sock, 4, remaining)
+                  payload = recv_exact(sock, ln, remaining) if ln else b""
+                  if masked:
+                      payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+                  if opcode == 9:
+                      sock.sendall(bytes([0x8A, 0x80]) + os.urandom(4))
+                      continue
+                  if opcode == 8:
+                      raise RuntimeError("server sent close frame")
+                  msg_opcode, msg = opcode, payload
+                  while not fin:
+                      hdr = recv_exact(sock, 2, remaining)
+                      fin = hdr[0] & 0x80
+                      opcode = hdr[0] & 0x0F
+                      masked = hdr[1] & 0x80
+                      ln = hdr[1] & 0x7F
+                      if ln == 126:
+                          ln = struct.unpack(">H", recv_exact(sock, 2, remaining))[0]
+                      elif ln == 127:
+                          ln = struct.unpack(">Q", recv_exact(sock, 8, remaining))[0]
+                      if masked:
+                          mask = recv_exact(sock, 4, remaining)
+                      part = recv_exact(sock, ln, remaining) if ln else b""
+                      if masked:
+                          part = bytes(b ^ mask[i % 4] for i, b in enumerate(part))
+                      msg += part
+                  yield msg_opcode, msg
+              raise TimeoutError("deadline reached waiting for frames")
+          def main():
+              url, message, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+              timeout = float(sys.argv[4]) if len(sys.argv) > 4 else 900
+              deadline = time.time() + timeout
+              pcm = bytearray()
+              n_bin = 0
+              final = None
+              texts = []
+              err = None
+              try:
+                  sock, _ = ws_connect(url)
+                  send_text(sock, message)
+                  for opcode, payload in recv_frames(sock, deadline):
+                      if opcode == 2:
+                          n_bin += 1
+                          if len(payload) < 2:
+                              continue
+                          pcm += payload[2:]
+                      elif opcode == 1:
+                          t = payload.decode(errors="replace")
+                          texts.append(t)
+                          try:
+                              j = json.loads(t)
+                          except Exception:
+                              j = None
+                          if j and j.get("done") is True:
+                              final = j
+                              break
+                          if j and ("error" in j or j.get("status") == "error"):
+                              err = t
+                              break
+                  sock.close()
+              except Exception as e:
+                  err = f"{type(e).__name__}: {e}"
+              with open(prefix + ".pcm", "wb") as f:
+                  f.write(bytes(pcm))
+              samples = struct.unpack("<%dh" % (len(pcm) // 2), bytes(pcm)) if len(pcm) >= 2 else ()
+              rms = math.sqrt(sum(s * s for s in samples) / len(samples)) if samples else 0.0
+              report = {"binary_frames": n_bin, "pcm_bytes": len(pcm),
+                        "pcm_samples": len(samples), "rms": round(rms, 1),
+                        "peak": max((abs(s) for s in samples), default=0),
+                        "final": final, "texts": texts, "error": err}
+              with open(prefix + ".json", "w") as f:
+                  json.dump(report, f, indent=1)
+              print(json.dumps(report, indent=1))
+              if err:
+                  sys.exit(1)
+              if final and final.get("done") and len(pcm) > 0 and rms >= 50:
+                  sys.exit(0)
+              sys.exit(2)
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 - "$PWD/ref48.mp3" <<'PYEOF'
+          import json, sys
+          msg = {"text": "Hello in the reference voice.", "segment": True,
+                 "stream_stride": 0, "max_tokens": 128,
+                 "reference_audio": sys.argv[1],
+                 "prompt_text": "This is a thirty second test tone used as a voice reference."}
+          open("d5-message.json", "w", encoding="utf-8").write(json.dumps(msg))
+          PYEOF
+          start=$(date +%s)
+          timeout 3600 python3 ws_client.py "ws://127.0.0.1:8081/ws/tts" \
+            "$(cat d5-message.json)" d5 3600 2>&1 | tee d5.log
+          echo "D5 rc=$? elapsed_s=$(( $(date +%s) - start ))" | tee -a d5.log
+          kill $SRV 2>/dev/null || true
+          trap - EXIT
+
+      - name: Verify outputs (WAV/PCM non-silent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd voice-tests
+          python3 - <<'PYEOF'
+          import json, math, struct, wave
+          def check_wav(path):
+              with wave.open(path, "rb") as w:
+                  n = w.getnframes(); rate = w.getframerate()
+                  frames = w.readframes(n)
+              vals = struct.unpack(f"<{len(frames)//2}h", frames)
+              rms = math.sqrt(sum(v*v for v in vals) / len(vals)) if vals else 0.0
+              peak = max(abs(v) for v in vals) if vals else 0
+              print(f"{path}: {n} frames, {n/rate:.3f} s, RMS {rms:.1f}, peak {peak}")
+              assert n > 0 and rms > 0, f"{path}: empty or silent"
+          check_wav("b2.wav")
+          check_wav("c8.wav")
+          rep = json.load(open("d5.json"))
+          print(f"d5.pcm: {rep['pcm_bytes']} B, RMS {rep['rms']}, peak {rep['peak']}, done={bool(rep['final'])}")
+          assert rep["pcm_bytes"] > 0 and rep["rms"] >= 50 and rep["final"], "D5 PCM empty/silent/no done"
+          with open("voice-tests-results.txt", "w") as f:
+              f.write("Voice tests (Actions runner, synthetic 48 kHz 30 s MP3) — B1/B2/C8/D5\n")
+              f.write("B1 --save-voice: synth48.s2voice created\n")
+              f.write("B2 use saved voice: b2.wav valid\n")
+              f.write("C8 HTTP direct-clone: c8.wav valid, HTTP 200\n")
+              f.write("D5 WS reference_audio: d5.pcm valid, done=true\n")
+              f.write("ALL FOUR VOICE TESTS PASS\n")
+          PYEOF
+          cat voice-tests-results.txt
+
+      - name: Upload voice-test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: voice-tests-results
+          path: |
+            voice-tests/*.wav
+            voice-tests/*.pcm
+            voice-tests/*.log
+            voice-tests/*.json
+            voice-tests/voice-tests-results.txt
+            voice-tests/ref48.mp3
+            ci-logs/
+          if-no-files-found: warn
+          retention-days: 30
